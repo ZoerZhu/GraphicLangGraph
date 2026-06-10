@@ -1,7 +1,7 @@
 import zipfile
 
 from app.compiler import export_project_zip, generate_project_files
-from app.ir.schemas import EdgeIR, NodeIR, NodeType, Position, StateField, create_default_project
+from app.ir.schemas import EdgeIR, EdgeKind, NodeIR, NodeType, Position, StateField, create_default_project
 
 
 def sample_project():
@@ -57,3 +57,53 @@ def test_export_zip_contains_required_files():
     assert "README.md" in names
     assert "flow/project.graph.json" in names
 
+
+def test_codegen_supports_mvp_nodes():
+    project = create_default_project("MVP Agent")
+    project.state.fields.extend(
+        [
+            StateField(name="route_key", type="str"),
+            StateField(name="retrieved_context", type="str"),
+            StateField(name="agent_result", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="router_1",
+                type=NodeType.AI_ROUTER,
+                label="路由",
+                config={"routeField": "route_key", "fallback": "other", "scenarios": "other:其他问题:"},
+            ),
+            NodeIR(
+                id="retriever_1",
+                type=NodeType.RETRIEVER,
+                label="检索",
+                config={"outputField": "retrieved_context", "path": "./knowledge"},
+            ),
+            NodeIR(
+                id="agent_1",
+                type=NodeType.AGENT,
+                label="Agent",
+                config={"outputField": "agent_result", "maxIterations": 2},
+            ),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复", config={"template": "{{ state.agent_result }}"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="router_1"),
+            EdgeIR(id="e2", source="router_1", sourceHandle="other", target="retriever_1", kind=EdgeKind.CONDITIONAL),
+            EdgeIR(id="e3", source="retriever_1", target="agent_1"),
+            EdgeIR(id="e4", source="agent_1", target="reply_1"),
+        ]
+    )
+
+    files = generate_project_files(project)
+    nodes_py = next(value for path, value in files.items() if path.endswith("/nodes.py"))
+    routers_py = next(value for path, value in files.items() if path.endswith("/routers.py"))
+
+    assert "def router_1" in nodes_py
+    assert "def retriever_1" in nodes_py
+    assert "def agent_1" in nodes_py
+    assert "def route_router_1" in routers_py

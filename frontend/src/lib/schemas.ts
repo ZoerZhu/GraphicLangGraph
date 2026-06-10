@@ -3,18 +3,27 @@ import { z } from "zod";
 export const NodeTypeSchema = z.enum([
   "start",
   "llm",
+  "agent",
+  "tool",
+  "retriever",
   "condition",
+  "ai_router",
+  "human_approval",
   "http",
   "direct_reply",
   "custom_function",
+  "skill_node",
+  "mcp_node",
+  "agent_ref",
 ]);
 
 export const ProjectSchema = z.object({
   project: z.object({
-    id: z.string(),
-    name: z.string(),
-    description: z.string(),
-    schemaVersion: z.string(),
+      id: z.string(),
+      name: z.string(),
+      description: z.string(),
+      kind: z.enum(["agent", "agents"]).default("agent"),
+      schemaVersion: z.string(),
   }),
   state: z.object({
     base: z.string(),
@@ -50,7 +59,59 @@ export const ProjectSchema = z.object({
     }),
   ),
   secrets: z.array(z.object({ name: z.string(), env: z.string() })),
+  tools: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      description: z.string(),
+      source: z.string(),
+      schemaJson: z.string(),
+    }),
+  ).default([]),
+  mcpServers: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      transport: z.string(),
+      command: z.string(),
+      url: z.string(),
+      description: z.string(),
+    }),
+  ).default([]),
+  importedAgents: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      projectId: z.string(),
+      role: z.string(),
+      description: z.string(),
+    }),
+  ).default([]),
+  agentLinks: z.array(
+    z.object({
+      id: z.string(),
+      fromAgent: z.string(),
+      toAgent: z.string(),
+      protocol: z.string(),
+      instruction: z.string(),
+    }),
+  ).default([]),
 });
+
+export const ProjectListSchema = z.array(
+  z.object({
+    id: z.string(),
+    name: z.string(),
+    description: z.string(),
+    kind: z.enum(["agent", "agents"]).default("agent"),
+    nodeCount: z.number(),
+    edgeCount: z.number(),
+    toolCount: z.number(),
+    mcpCount: z.number(),
+    importedAgentCount: z.number(),
+    updatedAt: z.string(),
+  }),
+);
 
 export const ValidationResultSchema = z.object({
   valid: z.boolean(),
@@ -72,3 +133,17 @@ export const ExportResponseSchema = z.object({
   files: z.array(z.string()),
 });
 
+export const RunPreviewResultSchema = z.object({
+  valid: z.boolean(),
+  issues: ValidationResultSchema.shape.issues,
+  trace: z.array(
+    z.object({
+      nodeId: z.string(),
+      type: NodeTypeSchema,
+      label: z.string(),
+      status: z.enum(["ok", "skipped", "error"]),
+      detail: z.string(),
+    }),
+  ),
+  outputState: z.record(z.unknown()),
+});

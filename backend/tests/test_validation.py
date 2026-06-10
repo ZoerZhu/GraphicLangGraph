@@ -101,3 +101,53 @@ def test_rejects_custom_function_syntax_error():
     assert not result.valid
     assert any(issue.code == "CUSTOM_FUNCTION_SYNTAX" for issue in result.issues)
 
+
+def test_rejects_ai_router_without_fallback_edge():
+    project = create_default_project()
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="router_1",
+                type=NodeType.AI_ROUTER,
+                label="路由",
+                config={"fallback": "other", "scenarios": "order:订单问题:订单\nother:其他问题:"},
+                outputs=[
+                    {"id": "order", "type": "condition", "label": "订单"},
+                    {"id": "other", "type": "condition", "label": "其他"},
+                ],
+            ),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复"),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="router_1"),
+            EdgeIR(id="e2", source="router_1", sourceHandle="order", target="reply_1", kind=EdgeKind.CONDITIONAL),
+        ]
+    )
+
+    result = validate_project(project)
+
+    assert not result.valid
+    assert any(issue.code == "ROUTER_FALLBACK_EDGE" for issue in result.issues)
+
+
+def test_rejects_invalid_tool_params_json():
+    project = create_default_project()
+    project.nodes.extend(
+        [
+            NodeIR(id="tool_1", type=NodeType.TOOL, label="工具", config={"paramsJson": "{"}),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复"),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="tool_1"),
+            EdgeIR(id="e2", source="tool_1", target="reply_1"),
+        ]
+    )
+
+    result = validate_project(project)
+
+    assert not result.valid
+    assert any(issue.code == "TOOL_PARAMS_JSON" for issue in result.issues)

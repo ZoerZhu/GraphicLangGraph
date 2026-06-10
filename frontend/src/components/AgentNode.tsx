@@ -1,11 +1,19 @@
 import { Handle, Position } from "@xyflow/react";
 import {
+  Bot,
   Braces,
+  BrainCircuit,
+  Database,
   GitBranch,
   Globe,
   MessageSquareReply,
   Play,
-  Sparkles
+  Plug,
+  Route,
+  Server,
+  Sparkles,
+  UserCheck,
+  Wrench
 } from "lucide-react";
 import { useProjectStore } from "../store/projectStore";
 import type { NodeType, Port } from "../types";
@@ -22,10 +30,18 @@ interface AgentNodeData {
 const ICONS = {
   start: Play,
   llm: Sparkles,
+  agent: BrainCircuit,
+  tool: Wrench,
+  retriever: Database,
   condition: GitBranch,
+  ai_router: Route,
+  human_approval: UserCheck,
   http: Globe,
   direct_reply: MessageSquareReply,
   custom_function: Braces,
+  skill_node: Plug,
+  mcp_node: Server,
+  agent_ref: Bot,
 };
 
 export function AgentNode({ id, data, selected }: { id: string; data: AgentNodeData; selected: boolean }) {
@@ -121,10 +137,35 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
         { label: "模型", value: text(config.model, "gpt-4.1-mini") },
         { label: "输出", value: text(config.outputField, "final_answer") },
       ];
+    case "agent":
+      return [
+        { label: "模型", value: text(config.model, "gpt-4.1-mini") },
+        { label: "工具", value: text(config.tools, "未绑定") },
+      ];
+    case "tool":
+      return [
+        { label: "工具", value: text(config.toolName, "business_tool") },
+        { label: "输出", value: text(config.outputField, "tool_result") },
+      ];
+    case "retriever":
+      return [
+        { label: "来源", value: text(config.path, "./knowledge") },
+        { label: "TopK", value: text(config.topK, "4") },
+      ];
     case "condition":
       return [
         { label: "字段", value: text(config.field, "intent") },
         { label: "规则", value: `${operatorLabel(text(config.operator, "equals"))} ${text(config.value, "")}`.trim() },
+      ];
+    case "ai_router":
+      return [
+        { label: "路由", value: text(config.routeField, "route_key") },
+        { label: "兜底", value: text(config.fallback, "other") },
+      ];
+    case "human_approval":
+      return [
+        { label: "动作", value: text(config.defaultAction, "approved") },
+        { label: "输出", value: text(config.outputField, "approval_result") },
       ];
     case "http":
       return [
@@ -140,6 +181,21 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
       return [
         { label: "语言", value: "Python" },
         { label: "输出", value: text(config.outputField, "custom_output") },
+      ];
+    case "skill_node":
+      return [
+        { label: "Skill", value: text(config.toolName, "未选择 Skill") },
+        { label: "输出", value: text(config.outputField, "skill_result") },
+      ];
+    case "mcp_node":
+      return [
+        { label: "MCP", value: text(config.serverName, "未选择 MCP") },
+        { label: "输出", value: text(config.outputField, "mcp_result") },
+      ];
+    case "agent_ref":
+      return [
+        { label: "Agent", value: text(config.agentName, "未选择 Agent") },
+        { label: "协议", value: text(config.protocol, "handoff") },
       ];
   }
 }
@@ -173,13 +229,29 @@ function nodeTypeLabel(type: NodeType): string {
       return "START";
     case "llm":
       return "LLM";
+    case "agent":
+      return "AGENT";
+    case "tool":
+      return "TOOL";
+    case "retriever":
+      return "RAG";
     case "condition":
       return "CONDITION";
+    case "ai_router":
+      return "ROUTER";
+    case "human_approval":
+      return "APPROVAL";
     case "http":
       return "HTTP";
     case "direct_reply":
       return "REPLY";
     case "custom_function":
       return "FUNCTION";
+    case "skill_node":
+      return "SKILL";
+    case "mcp_node":
+      return "MCP";
+    case "agent_ref":
+      return "AGENT";
   }
 }

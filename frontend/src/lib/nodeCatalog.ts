@@ -1,11 +1,18 @@
 import {
   Braces,
+  Bot,
+  BrainCircuit,
+  Database,
   GitBranch,
   Globe,
   type LucideIcon,
   MessageSquareReply,
+  Plug,
   Play,
-  Sparkles
+  Route,
+  Sparkles,
+  UserCheck,
+  Wrench
 } from "lucide-react";
 import type { NodeIR, NodeType, Port } from "../types";
 
@@ -19,10 +26,18 @@ export interface NodeCatalogItem {
 export const NODE_CATALOG: NodeCatalogItem[] = [
   { type: "start", title: "Start", description: "入口与初始状态", icon: Play },
   { type: "llm", title: "LLM", description: "调用模型生成或抽取", icon: Sparkles },
+  { type: "agent", title: "Agent", description: "可用工具的推理节点", icon: BrainCircuit },
+  { type: "tool", title: "Tool", description: "确定性执行工具", icon: Wrench },
+  { type: "retriever", title: "Retriever", description: "检索知识库上下文", icon: Database },
   { type: "condition", title: "Condition", description: "规则分支路由", icon: GitBranch },
+  { type: "ai_router", title: "AI Router", description: "按意图进行智能路由", icon: Route },
+  { type: "human_approval", title: "Human Approval", description: "人工审批与确认", icon: UserCheck },
   { type: "http", title: "HTTP", description: "请求外部接口", icon: Globe },
   { type: "direct_reply", title: "Direct Reply", description: "返回最终回复", icon: MessageSquareReply },
-  { type: "custom_function", title: "Custom Function", description: "导出 Python 函数", icon: Braces }
+  { type: "custom_function", title: "Custom Function", description: "导出 Python 函数", icon: Braces },
+  { type: "skill_node", title: "Skill Node", description: "调用已导入 Tool/Skill", icon: Plug },
+  { type: "mcp_node", title: "MCP Node", description: "调用已配置 MCP Server", icon: Plug },
+  { type: "agent_ref", title: "Agent Ref", description: "引用已实现 Agent 通信", icon: Bot }
 ];
 
 export function createNode(type: NodeType, index: number, position = { x: 180, y: 180 }): NodeIR {
@@ -51,6 +66,32 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         userPrompt: "{{ state.messages }}",
         outputField: "final_answer",
       };
+    case "agent":
+      return {
+        provider: "openai",
+        model: "gpt-4.1-mini",
+        systemPrompt: "你是一个可靠的业务 Agent，请基于上下文完成任务。",
+        tools: "",
+        maxIterations: 4,
+        outputField: "agent_result",
+      };
+    case "tool":
+      return {
+        toolName: "business_tool",
+        source: "python",
+        description: "执行一个确定性业务工具。",
+        paramsJson: "{}",
+        outputField: "tool_result",
+        requiresApproval: false,
+      };
+    case "retriever":
+      return {
+        source: "local",
+        path: "./knowledge",
+        query: "{{ state.messages }}",
+        topK: 4,
+        outputField: "retrieved_context",
+      };
     case "condition":
       return {
         field: "intent",
@@ -59,6 +100,25 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         trueBranch: "true",
         falseBranch: "false",
         fallback: "fallback",
+      };
+    case "ai_router":
+      return {
+        provider: "openai",
+        model: "gpt-4.1-mini",
+        instruction: "判断用户需求属于哪个场景，只输出路由 key。",
+        inputText: "{{ state.messages }}",
+        scenarios: "order:订单问题:订单,物流,发货\nrefund:退款问题:退款,退货,赔付\nother:其他问题:",
+        routeField: "route_key",
+        reasonField: "route_reason",
+        fallback: "other",
+      };
+    case "human_approval":
+      return {
+        prompt: "请审批本次操作是否可以继续。",
+        actionField: "approval_action",
+        outputField: "approval_result",
+        defaultAction: "approved",
+        fallback: "rejected",
       };
     case "http":
       return {
@@ -79,6 +139,24 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         code: "return {}",
         outputField: "custom_output",
       };
+    case "skill_node":
+      return {
+        toolId: "",
+        toolName: "未选择 Skill",
+        outputField: "skill_result",
+      };
+    case "mcp_node":
+      return {
+        serverId: "",
+        serverName: "未选择 MCP",
+        outputField: "mcp_result",
+      };
+    case "agent_ref":
+      return {
+        agentProjectId: "",
+        agentName: "未选择 Agent",
+        protocol: "handoff",
+      };
   }
 }
 
@@ -95,6 +173,20 @@ export function defaultOutputs(type: NodeType): Port[] {
       { id: "true", type: "condition", label: "true" },
       { id: "false", type: "condition", label: "false" },
       { id: "fallback", type: "condition", label: "fallback" },
+    ];
+  }
+  if (type === "ai_router") {
+    return [
+      { id: "order", type: "condition", label: "订单问题" },
+      { id: "refund", type: "condition", label: "退款问题" },
+      { id: "other", type: "condition", label: "其他问题" },
+    ];
+  }
+  if (type === "human_approval") {
+    return [
+      { id: "approved", type: "condition", label: "通过" },
+      { id: "rejected", type: "condition", label: "拒绝" },
+      { id: "edit", type: "condition", label: "修改" },
     ];
   }
   return [{ id: "out", type: "control", label: "输出" }];

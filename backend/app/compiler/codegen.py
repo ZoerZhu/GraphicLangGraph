@@ -178,6 +178,7 @@ def _nodes_py(project: ProjectIR) -> str:
         "from __future__ import annotations",
         "",
         "from typing import Any",
+        "from pathlib import Path",
         "import httpx",
         "from langchain.chat_models import init_chat_model",
         "from langchain_core.messages import AIMessage",
@@ -211,6 +212,62 @@ def _node_function(node: NodeIR) -> str:
     response = model.invoke(messages)
     return {{"{output_field}": getattr(response, "content", str(response))}}
 '''
+    if node.type == NodeType.AGENT:
+        provider = json.dumps(str(node.config.get("provider", "openai")))
+        model = json.dumps(str(node.config.get("model", "gpt-4.1-mini")))
+        system_prompt = json.dumps(str(node.config.get("systemPrompt", "")))
+        max_iterations = int(node.config.get("maxIterations", 4) or 4)
+        output_field = py_name(str(node.config.get("outputField", f"{function_name}_result")))
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    model = init_chat_model({model}, model_provider={provider})
+    messages = [
+        ("system", render_template({system_prompt}, state)),
+        ("user", str(state.get("messages", ""))),
+    ]
+    response = model.invoke(messages)
+    return {{
+        "{output_field}": getattr(response, "content", str(response)),
+        "{py_name(function_name)}_max_iterations": {max_iterations},
+    }}
+'''
+    if node.type == NodeType.TOOL:
+        tool_name = json.dumps(str(node.config.get("toolName", node.label or function_name)))
+        description = json.dumps(str(node.config.get("description", "")))
+        params_json = json.dumps(str(node.config.get("paramsJson", "{}")))
+        output_field = py_name(str(node.config.get("outputField", f"{function_name}_result")))
+        requires_approval = bool(node.config.get("requiresApproval", False))
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    return {{
+        "{output_field}": {{
+            "tool": {tool_name},
+            "description": {description},
+            "params_schema": {params_json},
+            "requires_approval": {requires_approval!r},
+            "status": "configured",
+        }}
+    }}
+'''
+    if node.type == NodeType.RETRIEVER:
+        path = json.dumps(str(node.config.get("path", "./knowledge")))
+        query = json.dumps(str(node.config.get("query", "{{ state.messages }}")))
+        top_k = int(node.config.get("topK", 4) or 4)
+        output_field = py_name(str(node.config.get("outputField", f"{function_name}_context")))
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    query = render_template({query}, state).lower()
+    root = Path({path})
+    documents: list[str] = []
+    if root.exists():
+        for file_path in list(root.rglob("*.md")) + list(root.rglob("*.txt")):
+            try:
+                text = file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if not query or any(part and part in text.lower() for part in query.split()):
+                documents.append(text[:1600])
+            if len(documents) >= {top_k}:
+                break
+    return {{"{output_field}": "\\n\\n---\\n\\n".join(documents)}}
+'''
     if node.type == NodeType.HTTP:
         method = json.dumps(str(node.config.get("method", "GET")).upper())
         url = json.dumps(str(node.config.get("url", "")))
@@ -239,6 +296,37 @@ def _node_function(node: NodeIR) -> str:
     if node.type == NodeType.CONDITION:
         return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
     return {{}}
+'''
+    if node.type == NodeType.AI_ROUTER:
+        input_text = json.dumps(str(node.config.get("inputText", "{{ state.messages }}")))
+        route_field = py_name(str(node.config.get("routeField", "route_key")))
+        reason_field = py_name(str(node.config.get("reasonField", "route_reason")))
+        fallback = json.dumps(str(node.config.get("fallback", "other")))
+        scenarios = json.dumps(_parse_scenarios(str(node.config.get("scenarios", ""))), ensure_ascii=False, indent=8)
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    text = render_template({input_text}, state).lower()
+    scenarios = {scenarios}
+    selected = {fallback}
+    reason = "fallback"
+    for scenario in scenarios:
+        keywords = [item.strip().lower() for item in scenario.get("keywords", []) if item.strip()]
+        if keywords and any(keyword in text for keyword in keywords):
+            selected = scenario["id"]
+            reason = f"matched keywords for {{scenario['label']}}"
+            break
+    return {{"{route_field}": selected, "{reason_field}": reason}}
+'''
+    if node.type == NodeType.HUMAN_APPROVAL:
+        action_field = py_name(str(node.config.get("actionField", "approval_action")))
+        output_field = py_name(str(node.config.get("outputField", "approval_result")))
+        default_action = json.dumps(str(node.config.get("defaultAction", "approved")))
+        prompt = json.dumps(str(node.config.get("prompt", "")))
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    action = str(state.get("{action_field}") or {default_action})
+    return {{
+        "{action_field}": action,
+        "{output_field}": {{"action": action, "prompt": render_template({prompt}, state)}},
+    }}
 '''
     if node.type == NodeType.DIRECT_REPLY:
         template = json.dumps(str(node.config.get("template", "{{ state.final_answer }}")))
@@ -269,7 +357,11 @@ def _{function_name}_impl(state: AgentState):
 
 
 def _routers_py(project: ProjectIR) -> str:
-    condition_nodes = [node for node in project.nodes if node.type == NodeType.CONDITION]
+    condition_nodes = [
+        node
+        for node in project.nodes
+        if node.type in {NodeType.CONDITION, NodeType.AI_ROUTER, NodeType.HUMAN_APPROVAL}
+    ]
     if not condition_nodes:
         return "from __future__ import annotations\n\n"
 
@@ -289,6 +381,18 @@ def _routers_py(project: ProjectIR) -> str:
 
 def _route_function(node: NodeIR) -> str:
     name = py_name(node.id)
+    if node.type == NodeType.AI_ROUTER:
+        route_field = py_name(str(node.config.get("routeField", "route_key")))
+        fallback = str(node.config.get("fallback", "other"))
+        return f'''def route_{name}(state: AgentState) -> str:
+    return str(state.get("{route_field}") or {fallback!r})
+'''
+    if node.type == NodeType.HUMAN_APPROVAL:
+        action_field = py_name(str(node.config.get("actionField", "approval_action")))
+        fallback = str(node.config.get("fallback", "rejected"))
+        return f'''def route_{name}(state: AgentState) -> str:
+    return str(state.get("{action_field}") or {fallback!r})
+'''
     field = py_name(str(node.config.get("field", "")))
     operator = str(node.config.get("operator", "equals"))
     value = str(node.config.get("value", ""))
@@ -329,7 +433,11 @@ def _graph_py(project: ProjectIR) -> str:
         condition_edge_map[edge.source][edge.sourceHandle or edge.label or "default"] = edge.target
 
     non_start_nodes = [node for node in project.nodes if node.type != NodeType.START]
-    condition_ids = {node.id for node in project.nodes if node.type == NodeType.CONDITION}
+    condition_ids = {
+        node.id
+        for node in project.nodes
+        if node.type in {NodeType.CONDITION, NodeType.AI_ROUTER, NodeType.HUMAN_APPROVAL}
+    }
 
     imports = ["from .nodes import " + ", ".join(py_name(node.id) for node in non_start_nodes)]
     condition_nodes = [node for node in non_start_nodes if node.id in condition_ids]
@@ -389,7 +497,26 @@ def _smoke_test(package: str) -> str:
 '''
 
 
+def _parse_scenarios(value: str) -> list[dict[str, Any]]:
+    scenarios: list[dict[str, Any]] = []
+    for line in value.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        scenario_id, label, keywords = (line.split(":", 2) + ["", ""])[:3]
+        scenario_id = scenario_id.strip()
+        if not scenario_id:
+            continue
+        scenarios.append(
+            {
+                "id": scenario_id,
+                "label": label.strip() or scenario_id,
+                "keywords": [item.strip() for item in keywords.split(",") if item.strip()],
+            }
+        )
+    return scenarios
+
+
 def _indent(code: str) -> str:
     lines = code.splitlines() or ["return {}"]
     return "\n".join(f"    {line}" if line.strip() else "" for line in lines)
-

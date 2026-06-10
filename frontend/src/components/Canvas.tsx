@@ -1,7 +1,6 @@
 import {
   Background,
   ConnectionMode,
-  Controls,
   MarkerType,
   MiniMap,
   ReactFlow,
@@ -14,6 +13,12 @@ import { useCallback, useEffect, useState } from "react";
 import { toReactFlowEdges, toReactFlowNodes, useProjectStore } from "../store/projectStore";
 import type { EdgeIR, NodeType } from "../types";
 import { AgentNode } from "./AgentNode";
+
+interface NodeDropPayload {
+  type: NodeType;
+  configPatch?: Record<string, unknown>;
+  label?: string;
+}
 
 const nodeTypes: NodeTypes = {
   agentNode: AgentNode,
@@ -32,6 +37,8 @@ function CanvasInner() {
   const selectedNodeId = useProjectStore((state) => state.selectedNodeId);
   const selectNode = useProjectStore((state) => state.selectNode);
   const addNode = useProjectStore((state) => state.addNode);
+  const save = useProjectStore((state) => state.save);
+  const openSplitAgent = useProjectStore((state) => state.openSplitAgent);
   const onNodesChange = useProjectStore((state) => state.onNodesChange);
   const onEdgesChange = useProjectStore((state) => state.onEdgesChange);
   const onConnect = useProjectStore((state) => state.onConnect);
@@ -40,9 +47,10 @@ function CanvasInner() {
   const handleDrop = useCallback(
     (event: React.DragEvent) => {
       event.preventDefault();
-      const type = event.dataTransfer.getData("application/graphic-langgraph-node") as NodeType;
+      const payload = readDropPayload(event);
+      const type = payload?.type ?? (event.dataTransfer.getData("application/graphic-langgraph-node") as NodeType);
       if (!type) return;
-      addNode(type, screenToFlowPosition({ x: event.clientX, y: event.clientY }));
+      addNode(type, screenToFlowPosition({ x: event.clientX, y: event.clientY }), payload?.configPatch, payload?.label);
     },
     [addNode, screenToFlowPosition],
   );
@@ -70,7 +78,16 @@ function CanvasInner() {
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
-        onNodeClick={(_, node) => selectNode(node.id)}
+        onNodeClick={(event, node) => {
+          const config = node.data?.config as Record<string, unknown> | undefined;
+          const nodeType = node.data?.nodeType as NodeType | undefined;
+          if (event.shiftKey && project.project.kind === "agents" && nodeType === "agent_ref") {
+            void openSplitAgent(String(config?.agentProjectId ?? ""));
+            return;
+          }
+          selectNode(node.id);
+        }}
+        onNodeDragStop={() => void save()}
         onPaneClick={() => selectNode(null)}
         connectionMode={ConnectionMode.Loose}
         connectOnClick
@@ -86,11 +103,26 @@ function CanvasInner() {
       >
         <Background gap={18} size={1} color="#d8d8dc" />
         <MiniMap pannable zoomable nodeColor="#ffffff" maskColor="rgba(255,255,255,0.55)" />
-        <Controls position="bottom-center" />
       </ReactFlow>
       <ConnectionOverlay edges={project.edges} />
     </main>
   );
+}
+
+function readDropPayload(event: React.DragEvent): NodeDropPayload | null {
+  const raw = event.dataTransfer.getData("application/graphic-langgraph-node-config");
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<NodeDropPayload>;
+    if (!parsed.type) return null;
+    return {
+      type: parsed.type,
+      configPatch: parsed.configPatch,
+      label: parsed.label,
+    };
+  } catch {
+    return null;
+  }
 }
 
 interface OverlayLine {

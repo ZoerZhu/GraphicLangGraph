@@ -10,10 +10,18 @@ from pydantic import BaseModel, ConfigDict, Field
 class NodeType(StrEnum):
     START = "start"
     LLM = "llm"
+    AGENT = "agent"
+    TOOL = "tool"
+    RETRIEVER = "retriever"
     CONDITION = "condition"
+    AI_ROUTER = "ai_router"
+    HUMAN_APPROVAL = "human_approval"
     HTTP = "http"
     DIRECT_REPLY = "direct_reply"
     CUSTOM_FUNCTION = "custom_function"
+    SKILL_NODE = "skill_node"
+    MCP_NODE = "mcp_node"
+    AGENT_REF = "agent_ref"
 
 
 class EdgeKind(StrEnum):
@@ -51,6 +59,7 @@ class ProjectMeta(BaseModel):
     id: str = Field(default_factory=lambda: f"agent_{uuid4().hex[:8]}")
     name: str = "Untitled Agent"
     description: str = ""
+    kind: str = "agent"
     schema_version: str = Field("0.1.0", alias="schemaVersion")
 
 
@@ -79,12 +88,49 @@ class SecretRef(BaseModel):
     env: str
 
 
+class ToolConfig(BaseModel):
+    id: str = Field(default_factory=lambda: f"tool_{uuid4().hex[:8]}")
+    name: str = "未命名工具"
+    description: str = ""
+    source: str = "python"
+    tool_schema: str = Field("{}", alias="schemaJson")
+
+
+class MCPServerConfig(BaseModel):
+    id: str = Field(default_factory=lambda: f"mcp_{uuid4().hex[:8]}")
+    name: str = "未命名 MCP"
+    transport: str = "stdio"
+    command: str = ""
+    url: str = ""
+    description: str = ""
+
+
+class ImportedAgentConfig(BaseModel):
+    id: str = Field(default_factory=lambda: f"agent_ref_{uuid4().hex[:8]}")
+    name: str = "导入的 Agent"
+    project_id: str = Field("", alias="projectId")
+    role: str = "sub_agent"
+    description: str = ""
+
+
+class AgentLinkConfig(BaseModel):
+    id: str = Field(default_factory=lambda: f"agent_link_{uuid4().hex[:8]}")
+    from_agent: str = Field("", alias="fromAgent")
+    to_agent: str = Field("", alias="toAgent")
+    protocol: str = "handoff"
+    instruction: str = ""
+
+
 class ProjectIR(BaseModel):
     project: ProjectMeta = Field(default_factory=ProjectMeta)
     state: StateSpec = Field(default_factory=StateSpec)
     nodes: list[NodeIR] = Field(default_factory=list)
     edges: list[EdgeIR] = Field(default_factory=list)
     secrets: list[SecretRef] = Field(default_factory=list)
+    tools: list[ToolConfig] = Field(default_factory=list)
+    mcpServers: list[MCPServerConfig] = Field(default_factory=list)
+    importedAgents: list[ImportedAgentConfig] = Field(default_factory=list)
+    agentLinks: list[AgentLinkConfig] = Field(default_factory=list)
 
 
 class ValidationIssue(BaseModel):
@@ -101,8 +147,8 @@ class ValidationResult(BaseModel):
     issues: list[ValidationIssue] = Field(default_factory=list)
 
 
-def create_default_project(name: str = "Untitled Agent") -> ProjectIR:
-    project = ProjectIR(project=ProjectMeta(name=name))
+def create_default_project(name: str = "Untitled Agent", kind: str = "agent") -> ProjectIR:
+    project = ProjectIR(project=ProjectMeta(name=name, kind=kind))
     project.nodes.append(
         NodeIR(
             id="start",
@@ -114,4 +160,3 @@ def create_default_project(name: str = "Untitled Agent") -> ProjectIR:
         )
     )
     return project
-

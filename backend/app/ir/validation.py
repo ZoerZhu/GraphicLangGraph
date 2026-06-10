@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 from collections import defaultdict, deque
 
@@ -61,6 +62,14 @@ def validate_project(project: ProjectIR) -> ValidationResult:
     for node in project.nodes:
         if node.type == NodeType.CONDITION:
             _validate_condition(node.id, node.config, outgoing[node.id], issues)
+        if node.type == NodeType.AI_ROUTER:
+            _validate_router(node.id, node.config, outgoing[node.id], issues, "AI Router")
+        if node.type == NodeType.HUMAN_APPROVAL:
+            _validate_router(node.id, node.config, outgoing[node.id], issues, "Human Approval")
+        if node.type == NodeType.AGENT:
+            _validate_agent(node.id, node.config, issues)
+        if node.type == NodeType.TOOL:
+            _validate_tool(node.id, node.config, issues)
         if node.type == NodeType.HTTP:
             _validate_http(node.id, node.config, issues)
         if node.type == NodeType.CUSTOM_FUNCTION:
@@ -117,6 +126,49 @@ def _validate_http(node_id: str, config: dict, issues: list[ValidationIssue]) ->
         )
 
 
+def _validate_router(
+    node_id: str,
+    config: dict,
+    outgoing_edges: list,
+    issues: list[ValidationIssue],
+    label: str,
+) -> None:
+    fallback = str(config.get("fallback", "")).strip()
+    if not fallback:
+        issues.append(_issue("ROUTER_FALLBACK", f"{label} 节点必须配置 fallback。", nodeId=node_id, field="fallback"))
+        return
+    handles = {edge.sourceHandle for edge in outgoing_edges}
+    if fallback not in handles:
+        issues.append(
+            _issue(
+                "ROUTER_FALLBACK_EDGE",
+                f"{label} 的 fallback 分支必须连接到后续节点。",
+                nodeId=node_id,
+                field="fallback",
+            )
+        )
+
+
+def _validate_agent(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
+    try:
+        max_iterations = int(config.get("maxIterations", 1))
+    except (TypeError, ValueError):
+        max_iterations = 0
+    if max_iterations < 1:
+        issues.append(_issue("AGENT_MAX_ITERATIONS", "Agent 最大迭代次数必须大于 0。", nodeId=node_id, field="maxIterations"))
+
+
+def _validate_tool(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
+    params_json = str(config.get("paramsJson", "{}")).strip() or "{}"
+    try:
+        parsed = json.loads(params_json)
+    except ValueError as exc:
+        issues.append(_issue("TOOL_PARAMS_JSON", f"Tool 参数 Schema JSON 格式错误：{exc}。", nodeId=node_id, field="paramsJson"))
+        return
+    if not isinstance(parsed, dict):
+        issues.append(_issue("TOOL_PARAMS_OBJECT", "Tool 参数 Schema 必须是 JSON object。", nodeId=node_id, field="paramsJson"))
+
+
 def _validate_custom_function(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
     code = str(config.get("code", "return {}"))
     try:
@@ -154,4 +206,3 @@ def _issue(
         edgeId=edgeId,
         field=field,
     )
-

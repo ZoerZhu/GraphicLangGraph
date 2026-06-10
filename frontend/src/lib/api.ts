@@ -1,5 +1,5 @@
-import type { ExportResponse, ProjectIR, ValidationResult } from "../types";
-import { ExportResponseSchema, ProjectSchema, ValidationResultSchema } from "./schemas";
+import type { ExportResponse, ProjectIR, ProjectListItem, RunPreviewResult, ValidationResult } from "../types";
+import { ExportResponseSchema, ProjectListSchema, ProjectSchema, RunPreviewResultSchema, ValidationResultSchema } from "./schemas";
 
 const API_BASE = "";
 
@@ -15,17 +15,30 @@ async function request(path: string, init?: RequestInit): Promise<unknown> {
   return response.json();
 }
 
-export async function createProject(name = "Untitled Agent"): Promise<ProjectIR> {
+export async function createProject(name = "Untitled Agent", kind: "agent" | "agents" = "agent"): Promise<ProjectIR> {
   const data = await request("/api/projects", {
     method: "POST",
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, kind }),
   });
   return ProjectSchema.parse(data) as ProjectIR;
+}
+
+export async function listProjects(): Promise<ProjectListItem[]> {
+  const data = await request("/api/projects");
+  return ProjectListSchema.parse(data) as ProjectListItem[];
 }
 
 export async function getProject(projectId: string): Promise<ProjectIR> {
   const data = await request(`/api/projects/${projectId}`);
   return ProjectSchema.parse(data) as ProjectIR;
+}
+
+export async function deleteProject(projectId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}`, { method: "DELETE" });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || response.statusText);
+  }
 }
 
 export async function saveProject(project: ProjectIR): Promise<ProjectIR> {
@@ -36,6 +49,16 @@ export async function saveProject(project: ProjectIR): Promise<ProjectIR> {
   return ProjectSchema.parse(data) as ProjectIR;
 }
 
+export function autosaveProject(project: ProjectIR): void {
+  const body = JSON.stringify(project);
+  void fetch(`${API_BASE}/api/projects/${project.project.id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body,
+    keepalive: true,
+  }).catch(() => undefined);
+}
+
 export async function validateProject(projectId: string): Promise<ValidationResult> {
   const data = await request(`/api/projects/${projectId}/validate`, { method: "POST" });
   return ValidationResultSchema.parse(data) as ValidationResult;
@@ -44,4 +67,12 @@ export async function validateProject(projectId: string): Promise<ValidationResu
 export async function exportProject(projectId: string): Promise<ExportResponse> {
   const data = await request(`/api/projects/${projectId}/export`, { method: "POST" });
   return ExportResponseSchema.parse(data) as ExportResponse;
+}
+
+export async function runProjectPreview(projectId: string, input: Record<string, unknown>): Promise<RunPreviewResult> {
+  const data = await request(`/api/projects/${projectId}/run`, {
+    method: "POST",
+    body: JSON.stringify({ input }),
+  });
+  return RunPreviewResultSchema.parse(data) as RunPreviewResult;
 }

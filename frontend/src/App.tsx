@@ -1,26 +1,57 @@
 import { useEffect } from "react";
-import { BottomPanel } from "./components/BottomPanel";
 import { Canvas } from "./components/Canvas";
+import { AssistantPanel } from "./components/AssistantPanel";
 import { Inspector } from "./components/Inspector";
+import { ManagementPage } from "./components/ManagementPage";
 import { NodePalette } from "./components/NodePalette";
+import { RunPreviewPanel } from "./components/RunPreviewPanel";
+import { SplitAgentWorkspace } from "./components/SplitAgentWorkspace";
+import { TemplatePanel } from "./components/TemplatePanel";
 import { TopBar } from "./components/TopBar";
 import { useProjectStore } from "./store/projectStore";
 import "./styles.css";
 
 export default function App() {
   const initialize = useProjectStore((state) => state.initialize);
+  const mode = useProjectStore((state) => state.mode);
+  const splitAgentProject = useProjectStore((state) => state.splitAgentProject);
 
   useEffect(() => {
     void initialize();
   }, [initialize]);
 
-  return (
+  useEffect(() => {
+    function handlePageExit() {
+      useProjectStore.getState().saveBeforeUnload();
+    }
+
+    window.addEventListener("pagehide", handlePageExit);
+    window.addEventListener("beforeunload", handlePageExit);
+    return () => {
+      window.removeEventListener("pagehide", handlePageExit);
+      window.removeEventListener("beforeunload", handlePageExit);
+    };
+  }, []);
+
+  if (mode === "manager") {
+    return <ManagementPage />;
+  }
+
+  const editor = (
     <div className="app-shell">
       <Canvas />
       <TopBar />
+      <TemplatePanel />
+      <AssistantPanel />
+      <RunPreviewPanel />
       <NodePalette />
       <Inspector />
-      <BottomPanel />
     </div>
   );
+
+  if (splitAgentProject) {
+    return <SplitAgentWorkspace>{editor}</SplitAgentWorkspace>;
+  }
+
+  return editor;
 }

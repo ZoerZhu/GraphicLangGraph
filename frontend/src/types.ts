@@ -1,10 +1,18 @@
 export type NodeType =
   | "start"
   | "llm"
+  | "agent"
+  | "tool"
+  | "retriever"
   | "condition"
+  | "ai_router"
+  | "human_approval"
   | "http"
   | "direct_reply"
-  | "custom_function";
+  | "custom_function"
+  | "skill_node"
+  | "mcp_node"
+  | "agent_ref";
 
 export type EdgeKind = "normal" | "conditional" | "error";
 
@@ -46,11 +54,45 @@ export interface EdgeIR {
   label?: string | null;
 }
 
+export interface ToolConfig {
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+  schemaJson: string;
+}
+
+export interface MCPServerConfig {
+  id: string;
+  name: string;
+  transport: string;
+  command: string;
+  url: string;
+  description: string;
+}
+
+export interface ImportedAgentConfig {
+  id: string;
+  name: string;
+  projectId: string;
+  role: string;
+  description: string;
+}
+
+export interface AgentLinkConfig {
+  id: string;
+  fromAgent: string;
+  toAgent: string;
+  protocol: string;
+  instruction: string;
+}
+
 export interface ProjectIR {
   project: {
     id: string;
     name: string;
     description: string;
+    kind: "agent" | "agents";
     schemaVersion: string;
   };
   state: {
@@ -60,6 +102,35 @@ export interface ProjectIR {
   nodes: NodeIR[];
   edges: EdgeIR[];
   secrets: Array<{ name: string; env: string }>;
+  tools: ToolConfig[];
+  mcpServers: MCPServerConfig[];
+  importedAgents: ImportedAgentConfig[];
+  agentLinks: AgentLinkConfig[];
+}
+
+export interface ProjectListItem {
+  id: string;
+  name: string;
+  description: string;
+  kind: "agent" | "agents";
+  nodeCount: number;
+  edgeCount: number;
+  toolCount: number;
+  mcpCount: number;
+  importedAgentCount: number;
+  updatedAt: string;
+}
+
+export interface ProjectHistoryRecord {
+  id: string;
+  projectId: string;
+  name: string;
+  description: string;
+  kind: "agent" | "agents";
+  createdAt: string;
+  nodeCount: number;
+  edgeCount: number;
+  snapshot: ProjectIR;
 }
 
 export interface ValidationIssue {
@@ -82,3 +153,17 @@ export interface ExportResponse {
   files: string[];
 }
 
+export interface RunTraceItem {
+  nodeId: string;
+  type: NodeType;
+  label: string;
+  status: "ok" | "skipped" | "error";
+  detail: string;
+}
+
+export interface RunPreviewResult {
+  valid: boolean;
+  issues: ValidationIssue[];
+  trace: RunTraceItem[];
+  outputState: Record<string, unknown>;
+}
