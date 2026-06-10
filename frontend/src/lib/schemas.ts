@@ -134,6 +134,7 @@ export const ExportResponseSchema = z.object({
 });
 
 export const RunPreviewResultSchema = z.object({
+  mode: z.enum(["dry", "live"]),
   valid: z.boolean(),
   issues: ValidationResultSchema.shape.issues,
   trace: z.array(
@@ -143,6 +144,9 @@ export const RunPreviewResultSchema = z.object({
       label: z.string(),
       status: z.enum(["ok", "skipped", "error"]),
       detail: z.string(),
+      durationMs: z.number(),
+      inputState: z.record(z.unknown()),
+      outputDelta: z.record(z.unknown()),
     }),
   ),
   outputState: z.record(z.unknown()),

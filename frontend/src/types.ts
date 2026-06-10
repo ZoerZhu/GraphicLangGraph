@@ -15,6 +15,7 @@ export type NodeType =
   | "agent_ref";
 
 export type EdgeKind = "normal" | "conditional" | "error";
+export type RunMode = "dry" | "live";
 
 export interface Position {
   x: number;
@@ -159,9 +160,13 @@ export interface RunTraceItem {
   label: string;
   status: "ok" | "skipped" | "error";
   detail: string;
+  durationMs: number;
+  inputState: Record<string, unknown>;
+  outputDelta: Record<string, unknown>;
 }
 
 export interface RunPreviewResult {
+  mode: RunMode;
   valid: boolean;
   issues: ValidationIssue[];
   trace: RunTraceItem[];

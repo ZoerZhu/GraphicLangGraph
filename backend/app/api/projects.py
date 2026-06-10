@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.compiler import build_project, export_project_zip
 from app.config import EXPORTS_DIR, STORAGE_DIR, ensure_runtime_dirs
 from app.ir.schemas import ProjectIR, create_default_project
 from app.ir.validation import validate_project
+from app.runner import run_project_preview as run_project_preview_engine
 
 
 router = APIRouter(prefix="/api", tags=["projects"])
@@ -35,7 +35,8 @@ class ExportResponse(BaseModel):
 
 
 class RunPreviewRequest(BaseModel):
-    input: dict[str, Any] = {}
+    input: dict[str, Any] = Field(default_factory=dict)
+    mode: Literal["dry", "live"] = "dry"
 
 
 class RunTraceItem(BaseModel):
@@ -44,9 +45,13 @@ class RunTraceItem(BaseModel):
     label: str
     status: str = "ok"
     detail: str = ""
+    durationMs: float = 0
+    inputState: dict[str, Any] = Field(default_factory=dict)
+    outputDelta: dict[str, Any] = Field(default_factory=dict)
 
 
 class RunPreviewResponse(BaseModel):
+    mode: Literal["dry", "live"]
     valid: bool
     issues: list[dict[str, Any]]
     trace: list[RunTraceItem]
@@ -144,9 +149,15 @@ def compile_saved_project(project_id: str) -> CompileResponse:
 @router.post("/projects/{project_id}/run", response_model=RunPreviewResponse)
 def run_project_preview(project_id: str, payload: RunPreviewRequest | None = None) -> RunPreviewResponse:
     project = _read_project(project_id)
+    request = payload or RunPreviewRequest()
     result = validate_project(project)
-    trace, output_state = _dry_run_project(project, (payload.input if payload else {}) or {})
+    if request.mode == "live" and not result.valid:
+        trace: list[dict[str, Any]] = []
+        output_state = dict(request.input)
+    else:
+        trace, output_state = run_project_preview_engine(project, request.input, request.mode)
     return RunPreviewResponse(
+        mode=request.mode,
         valid=result.valid,
         issues=[issue.model_dump() for issue in result.issues],
         trace=trace,
@@ -190,136 +201,3 @@ def _read_project(project_id: str) -> ProjectIR:
 def _write_project(project: ProjectIR) -> None:
     path = _project_path(project.project.id)
     path.write_text(project.model_dump_json(by_alias=True, indent=2), encoding="utf-8")
-
-
-def _dry_run_project(project: ProjectIR, input_state: dict[str, Any]) -> tuple[list[RunTraceItem], dict[str, Any]]:
-    nodes = {node.id: node for node in project.nodes}
-    outgoing: dict[str, list] = {}
-    for edge in project.edges:
-        outgoing.setdefault(edge.source, []).append(edge)
-
-    start = next((node for node in project.nodes if node.type == "start"), None)
-    if not start:
-        return [], dict(input_state)
-
-    state = dict(input_state)
-    trace: list[RunTraceItem] = []
-    current = _first_target(outgoing.get(start.id, []))
-    visited = 0
-    while current and current in nodes and visited < 80:
-        visited += 1
-        node = nodes[current]
-        detail = _simulate_node(node, state)
-        trace.append(RunTraceItem(nodeId=node.id, type=str(node.type), label=node.label, detail=detail))
-        if str(node.type) == "direct_reply":
-            break
-        edges = outgoing.get(node.id, [])
-        if not edges:
-            break
-        conditional_edges = [edge for edge in edges if str(edge.kind) == "conditional"]
-        if conditional_edges:
-            handle = _choose_handle(node, state)
-            current = _target_for_handle(conditional_edges, handle) or _first_target(conditional_edges)
-        else:
-            current = _first_target(edges)
-
-    if visited >= 80:
-        trace.append(RunTraceItem(nodeId="__runtime__", type="custom_function", label="运行预览", status="error", detail="路径超过 80 步，可能存在循环。"))
-    return trace, state
-
-
-def _simulate_node(node, state: dict[str, Any]) -> str:
-    config = node.config
-    node_type = str(node.type)
-    if node_type == "llm":
-        field = str(config.get("outputField", "final_answer"))
-        state[field] = f"[dry-run] {node.label} 将调用模型 {config.get('model', 'gpt-4.1-mini')}"
-        return f"模拟 LLM 输出到 state.{field}"
-    if node_type == "agent":
-        field = str(config.get("outputField", "agent_result"))
-        state[field] = f"[dry-run] {node.label} 将作为 Agent 执行"
-        return f"模拟 Agent 输出到 state.{field}"
-    if node_type == "tool":
-        field = str(config.get("outputField", "tool_result"))
-        state[field] = {"tool": config.get("toolName", node.label), "status": "dry-run"}
-        return f"模拟 Tool 输出到 state.{field}"
-    if node_type == "retriever":
-        field = str(config.get("outputField", "retrieved_context"))
-        state[field] = f"[dry-run] 从 {config.get('path', './knowledge')} 检索 top_k={config.get('topK', 4)}"
-        return f"模拟 Retriever 输出到 state.{field}"
-    if node_type == "condition":
-        return f"按 state.{config.get('field', 'intent')} 选择分支"
-    if node_type == "ai_router":
-        field = str(config.get("routeField", "route_key"))
-        fallback = str(config.get("fallback", "other"))
-        state[field] = _infer_router_key(config, state) or fallback
-        reason_field = str(config.get("reasonField", "route_reason"))
-        state[reason_field] = "dry-run router decision"
-        return f"模拟 AI Router 选择 {state[field]}"
-    if node_type == "human_approval":
-        action_field = str(config.get("actionField", "approval_action"))
-        state[action_field] = str(state.get(action_field) or config.get("defaultAction", "approved"))
-        output_field = str(config.get("outputField", "approval_result"))
-        state[output_field] = {"action": state[action_field], "status": "dry-run"}
-        return f"模拟人工审批动作 {state[action_field]}"
-    if node_type == "http":
-        field = str(config.get("outputField", "http_response"))
-        state[field] = {"url": config.get("url", ""), "status": "dry-run"}
-        return f"模拟 HTTP 输出到 state.{field}"
-    if node_type == "direct_reply":
-        field = str(config.get("outputField", "final_answer"))
-        state[field] = state.get(field) or "[dry-run] Direct Reply"
-        return f"终止并返回 state.{field}"
-    if node_type in {"skill_node", "mcp_node", "agent_ref", "custom_function"}:
-        field = str(config.get("outputField", f"{node_type}_result"))
-        state[field] = f"[dry-run] {node.label}"
-        return f"模拟输出到 state.{field}"
-    return "跳过未知节点"
-
-
-def _choose_handle(node, state: dict[str, Any]) -> str:
-    config = node.config
-    node_type = str(node.type)
-    if node_type == "condition":
-        field = str(config.get("field", ""))
-        current = state.get(field)
-        expected = str(config.get("value", ""))
-        current_text = "" if current is None else str(current)
-        operator = str(config.get("operator", "equals"))
-        matched = (
-            current_text == expected
-            if operator == "equals"
-            else expected in current_text
-            if operator == "contains"
-            else current_text != expected
-            if operator == "not_equals"
-            else False
-        )
-        return str(config.get("trueBranch" if matched else "falseBranch", config.get("fallback", "fallback")))
-    if node_type == "ai_router":
-        return str(state.get(str(config.get("routeField", "route_key"))) or config.get("fallback", "other"))
-    if node_type == "human_approval":
-        return str(state.get(str(config.get("actionField", "approval_action"))) or config.get("fallback", "rejected"))
-    return str(config.get("fallback", "fallback"))
-
-
-def _infer_router_key(config: dict[str, Any], state: dict[str, Any]) -> str | None:
-    text = json.dumps(state, ensure_ascii=False).lower()
-    for line in str(config.get("scenarios", "")).splitlines():
-        parts = (line.split(":", 2) + ["", ""])[:3]
-        key = parts[0].strip()
-        keywords = [item.strip().lower() for item in parts[2].split(",") if item.strip()]
-        if key and keywords and any(keyword in text for keyword in keywords):
-            return key
-    return None
-
-
-def _first_target(edges: list) -> str | None:
-    return edges[0].target if edges else None
-
-
-def _target_for_handle(edges: list, handle: str) -> str | None:
-    for edge in edges:
-        if edge.sourceHandle == handle:
-            return edge.target
-    return None

@@ -1,4 +1,4 @@
-import type { ExportResponse, ProjectIR, ProjectListItem, RunPreviewResult, ValidationResult } from "../types";
+import type { ExportResponse, ProjectIR, ProjectListItem, RunMode, RunPreviewResult, ValidationResult } from "../types";
 import { ExportResponseSchema, ProjectListSchema, ProjectSchema, RunPreviewResultSchema, ValidationResultSchema } from "./schemas";
 
 const API_BASE = "";
@@ -69,10 +69,10 @@ export async function exportProject(projectId: string): Promise<ExportResponse> 
   return ExportResponseSchema.parse(data) as ExportResponse;
 }
 
-export async function runProjectPreview(projectId: string, input: Record<string, unknown>): Promise<RunPreviewResult> {
+export async function runProjectPreview(projectId: string, input: Record<string, unknown>, mode: RunMode): Promise<RunPreviewResult> {
   const data = await request(`/api/projects/${projectId}/run`, {
     method: "POST",
-    body: JSON.stringify({ input }),
+    body: JSON.stringify({ input, mode }),
   });
   return RunPreviewResultSchema.parse(data) as RunPreviewResult;
 }

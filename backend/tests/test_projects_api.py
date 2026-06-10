@@ -59,6 +59,7 @@ def test_project_run_preview():
     preview = client.post(f"/api/projects/{project_id}/run", json={"input": {"messages": "你好"}})
     assert preview.status_code == 200
     body = preview.json()
+    assert body["mode"] == "dry"
     assert body["valid"] is True
     assert [item["nodeId"] for item in body["trace"]] == ["llm_1", "reply_1"]
     assert "final_answer" in body["outputState"]

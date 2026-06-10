@@ -34,6 +34,7 @@ import type {
   ProjectHistoryRecord,
   ProjectIR,
   ProjectListItem,
+  RunMode,
   RunPreviewResult,
   StateField,
   ToolConfig,
@@ -64,6 +65,7 @@ interface ProjectStore {
   templatesOpen: boolean;
   assistantOpen: boolean;
   runOpen: boolean;
+  runMode: RunMode;
   runInput: string;
   runResult: RunPreviewResult | null;
   status: string;
@@ -113,6 +115,7 @@ interface ProjectStore {
   applyAssistantPrompt: (prompt: string) => Promise<void>;
   toggleRunPanel: () => void;
   closeRunPanel: () => void;
+  setRunMode: (mode: RunMode) => void;
   setRunInput: (value: string) => void;
   runPreview: () => Promise<void>;
   openSplitAgent: (projectId: string) => Promise<void>;
@@ -149,6 +152,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   templatesOpen: false,
   assistantOpen: false,
   runOpen: false,
+  runMode: "dry",
   runInput: "{\n  \"messages\": \"我想查询订单物流\"\n}",
   runResult: null,
   status: "未连接后端",
@@ -648,6 +652,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     set({ runOpen: false });
   },
 
+  setRunMode(runMode) {
+    set({ runMode, runResult: null });
+  },
+
   setRunInput(runInput) {
     set({ runInput });
   },
@@ -662,16 +670,21 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       set({ status: "运行输入必须是合法 JSON" });
       return;
     }
-    set({ status: "正在运行预览", runResult: null });
+    const runMode = get().runMode;
+    set({ status: runMode === "live" ? "正在真实运行" : "正在模拟运行", runResult: null });
     const saved = await saveProject(project);
     const historyRecords = recordProjectHistory(saved, "运行预览前保存");
-    const runResult = await runProjectPreview(saved.project.id, input);
+    const runResult = await runProjectPreview(saved.project.id, input, runMode);
     set({
       project: saved,
       historyRecords,
       runResult,
       runOpen: true,
-      status: runResult.valid ? "运行预览完成" : "运行预览完成，但图校验未通过",
+      status: runResult.valid
+        ? runResult.mode === "live"
+          ? "真实运行完成"
+          : "模拟运行完成"
+        : "运行预览完成，但图校验未通过",
     });
   },
 

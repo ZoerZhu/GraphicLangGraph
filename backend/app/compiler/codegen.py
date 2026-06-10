@@ -84,6 +84,7 @@ dependencies = [
   "langgraph>=0.2.70",
   "langchain>=0.3.0",
   "langchain-core>=0.3.0",
+  "langchain-openai>=0.2.0",
   "httpx>=0.27.0"
 ]
 
