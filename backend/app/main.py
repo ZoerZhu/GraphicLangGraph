@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.projects import router as projects_router
+from app.api.workspace import router as workspace_router
 from app.config import ensure_runtime_dirs
 
 
@@ -18,6 +19,7 @@ app.add_middleware(
 )
 
 app.include_router(projects_router)
+app.include_router(workspace_router)
 
 
 @app.on_event("startup")
@@ -28,4 +30,3 @@ def on_startup() -> None:
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
-

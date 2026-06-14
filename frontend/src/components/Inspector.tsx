@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { useProjectStore } from "../store/projectStore";
-import type { MCPServerConfig, StateField, ToolConfig } from "../types";
+import type { MCPServerConfig, ModelConfig, RagKnowledgeBaseConfig, StateField, ToolConfig } from "../types";
 
 export function Inspector() {
   const project = useProjectStore((state) => state.project);
@@ -8,6 +8,8 @@ export function Inspector() {
   const projects = useProjectStore((state) => state.projects);
   const workspaceTools = useProjectStore((state) => state.workspaceTools);
   const workspaceMcpServers = useProjectStore((state) => state.workspaceMcpServers);
+  const workspaceModelConfigs = useProjectStore((state) => state.workspaceModelConfigs);
+  const workspaceRagKnowledgeBases = useProjectStore((state) => state.workspaceRagKnowledgeBases);
   const updateNode = useProjectStore((state) => state.updateNode);
   const updateNodeConfig = useProjectStore((state) => state.updateNodeConfig);
   const setStateFields = useProjectStore((state) => state.setStateFields);
@@ -25,6 +27,8 @@ export function Inspector() {
     () => projects.filter((item) => item.kind === "agent" && item.id !== project?.project.id),
     [project?.project.id, projects],
   );
+  const availableModelConfigs = useMemo(() => buildModelConfigOptions(workspaceModelConfigs), [workspaceModelConfigs]);
+  const availableRagKnowledgeBases = useMemo(() => workspaceRagKnowledgeBases.filter((item) => item.enabled), [workspaceRagKnowledgeBases]);
 
   if (!project) {
     return null;
@@ -75,18 +79,14 @@ export function Inspector() {
       )}
       {node.type === "llm" && (
         <>
-          <Field label="供应商">
-            <input
-              value={String(node.config.provider ?? "openai")}
-              onChange={(event) => updateNodeConfig(node.id, { provider: event.target.value })}
-            />
-          </Field>
-          <Field label="模型">
-            <input
-              value={String(node.config.model ?? "gpt-4.1-mini")}
-              onChange={(event) => updateNodeConfig(node.id, { model: event.target.value })}
-            />
-          </Field>
+          <ModelSelectionFields
+            config={node.config}
+            defaultModel="gpt-4.1-mini"
+            defaultProvider="openai"
+            modelConfigs={availableModelConfigs}
+            nodeId={node.id}
+            updateNodeConfig={updateNodeConfig}
+          />
           <Field label="System Prompt">
             <textarea
               rows={5}
@@ -111,18 +111,14 @@ export function Inspector() {
       )}
       {node.type === "agent" && (
         <>
-          <Field label="供应商">
-            <input
-              value={String(node.config.provider ?? "openai")}
-              onChange={(event) => updateNodeConfig(node.id, { provider: event.target.value })}
-            />
-          </Field>
-          <Field label="模型">
-            <input
-              value={String(node.config.model ?? "gpt-4.1-mini")}
-              onChange={(event) => updateNodeConfig(node.id, { model: event.target.value })}
-            />
-          </Field>
+          <ModelSelectionFields
+            config={node.config}
+            defaultModel="gpt-4.1-mini"
+            defaultProvider="openai"
+            modelConfigs={availableModelConfigs}
+            nodeId={node.id}
+            updateNodeConfig={updateNodeConfig}
+          />
           <Field label="Agent 指令">
             <textarea
               rows={5}
@@ -203,11 +199,46 @@ export function Inspector() {
       )}
       {node.type === "retriever" && (
         <>
+          <Field label="绑定 RAG 知识库">
+            <select
+              value={String(node.config.knowledgeBaseId ?? "")}
+              onChange={(event) => {
+                const knowledgeBase = availableRagKnowledgeBases.find((item) => item.id === event.target.value);
+                if (!knowledgeBase) {
+                  updateNodeConfig(node.id, { knowledgeBaseId: "", knowledgeBaseName: "" });
+                  return;
+                }
+                updateNodeConfig(node.id, {
+                  knowledgeBaseId: knowledgeBase.id,
+                  knowledgeBaseName: knowledgeBase.name,
+                  source: retrieverSourceFromKnowledgeBase(knowledgeBase),
+                  path: retrieverPathFromKnowledgeBase(knowledgeBase),
+                  endpoint: knowledgeBase.url,
+                  collection: knowledgeBase.collection,
+                  topK: knowledgeBase.topK,
+                  knowledgeBaseDescription: knowledgeBase.description,
+                  embeddingModel: knowledgeBase.embeddingModel,
+                  metadataJson: knowledgeBase.metadataJson,
+                });
+                updateNode(node.id, { label: knowledgeBase.name });
+              }}
+            >
+              <option value="">未绑定，手动配置</option>
+              {availableRagKnowledgeBases.map((knowledgeBase) => (
+                <option key={knowledgeBase.id} value={knowledgeBase.id}>
+                  {knowledgeBase.name} · {ragSourceLabel(knowledgeBase.sourceType)}
+                </option>
+              ))}
+            </select>
+            <small className="model-config-note">从管理页「节点资源 / RAG」导入的知识库中选择。</small>
+          </Field>
           <Field label="数据源类型">
             <select value={String(node.config.source ?? "local")} onChange={(event) => updateNodeConfig(node.id, { source: event.target.value })}>
               <option value="local">本地目录</option>
+              <option value="files">本地文件集合</option>
               <option value="vectorstore">已有向量库</option>
               <option value="http">HTTP 检索 API</option>
+              <option value="database">数据库 / 表</option>
             </select>
           </Field>
           <Field label="知识库路径 / Endpoint">
@@ -292,12 +323,14 @@ export function Inspector() {
       )}
       {node.type === "ai_router" && (
         <>
-          <Field label="模型">
-            <input
-              value={String(node.config.model ?? "gpt-4.1-mini")}
-              onChange={(event) => updateNodeConfig(node.id, { model: event.target.value })}
-            />
-          </Field>
+          <ModelSelectionFields
+            config={node.config}
+            defaultModel="gpt-4.1-mini"
+            defaultProvider="openai"
+            modelConfigs={availableModelConfigs}
+            nodeId={node.id}
+            updateNodeConfig={updateNodeConfig}
+          />
           <Field label="路由说明">
             <textarea
               rows={4}
@@ -598,6 +631,124 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+interface ModelOption {
+  id: string;
+  name: string;
+}
+
+interface ModelConfigOption {
+  id: string;
+  name: string;
+  provider: string;
+  model: string;
+  enabled: boolean;
+  models: ModelOption[];
+}
+
+function ModelSelectionFields({
+  config,
+  defaultProvider,
+  defaultModel,
+  modelConfigs,
+  nodeId,
+  updateNodeConfig,
+}: {
+  config: Record<string, unknown>;
+  defaultProvider: string;
+  defaultModel: string;
+  modelConfigs: ModelConfigOption[];
+  nodeId: string;
+  updateNodeConfig: (nodeId: string, patch: Record<string, unknown>) => void;
+}) {
+  const provider = String(config.provider ?? defaultProvider);
+  const model = String(config.model ?? defaultModel);
+  const modelConfigId = String(config.modelConfigId ?? "");
+  const selectedConfig =
+    modelConfigs.find((item) => item.id === modelConfigId) ??
+    modelConfigs.find((item) => item.provider === provider && item.models.some((option) => option.id === model)) ??
+    modelConfigs.find((item) => item.provider === provider) ??
+    null;
+  const modelOptions = selectedConfig ? ensureModelOption(selectedConfig.models, model) : [];
+
+  if (modelConfigs.length === 0) {
+    return (
+      <>
+        <Field label="供应商">
+          <input value={provider} onChange={(event) => updateNodeConfig(nodeId, { provider: event.target.value, modelConfigId: "", modelConfigName: "" })} />
+          <small className="model-config-note">还没有本地模型配置，暂时使用手动输入。可在管理页「模型」中添加。</small>
+        </Field>
+        <Field label="模型">
+          <input value={model} onChange={(event) => updateNodeConfig(nodeId, { model: event.target.value })} />
+        </Field>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <Field label="供应商">
+        <select
+          value={selectedConfig?.id ?? ""}
+          onChange={(event) => {
+            const nextConfig = modelConfigs.find((item) => item.id === event.target.value);
+            if (!nextConfig) {
+              updateNodeConfig(nodeId, { modelConfigId: "", modelConfigName: "" });
+              return;
+            }
+            const nextModel = nextConfig.models.find((option) => option.id === model)?.id ?? nextConfig.model ?? nextConfig.models[0]?.id ?? model;
+            updateNodeConfig(nodeId, {
+              provider: nextConfig.provider,
+              model: nextModel,
+              modelConfigId: nextConfig.id,
+              modelConfigName: nextConfig.name,
+            });
+          }}
+        >
+          <option value="">手动输入 / 未绑定</option>
+          {modelConfigs.map((item) => (
+            <option key={item.id} value={item.id}>
+              {item.name} · {item.provider}{item.enabled ? "" : "（已停用）"}
+            </option>
+          ))}
+        </select>
+        <small className="model-config-note">从管理页已保存的模型配置中选择；保存后会写入节点的供应商和模型。</small>
+      </Field>
+      {selectedConfig ? (
+        <Field label="模型">
+          <select
+            value={model}
+            onChange={(event) => {
+              const option = modelOptions.find((item) => item.id === event.target.value);
+              updateNodeConfig(nodeId, {
+                model: event.target.value,
+                modelDisplayName: option?.name ?? "",
+                modelConfigId: selectedConfig.id,
+                modelConfigName: selectedConfig.name,
+                provider: selectedConfig.provider,
+              });
+            }}
+          >
+            {modelOptions.map((option) => (
+              <option key={option.id} value={option.id}>
+                {option.name === option.id ? option.id : `${option.name} · ${option.id}`}
+              </option>
+            ))}
+          </select>
+        </Field>
+      ) : (
+        <div className="inline-grid">
+          <Field label="供应商标识">
+            <input value={provider} onChange={(event) => updateNodeConfig(nodeId, { provider: event.target.value })} />
+          </Field>
+          <Field label="模型">
+            <input value={model} onChange={(event) => updateNodeConfig(nodeId, { model: event.target.value })} />
+          </Field>
+        </div>
+      )}
+    </>
+  );
+}
+
 function stateFieldsToText(fields: StateField[]): string {
   return fields.map((field) => `${field.name}:${field.type}`).join("\n");
 }
@@ -620,4 +771,101 @@ function mergeById<T extends ToolConfig | MCPServerConfig>(items: T[]): T[] {
     map.set(item.id, item);
   }
   return Array.from(map.values());
+}
+
+function buildModelConfigOptions(configs: ModelConfig[]): ModelConfigOption[] {
+  return configs
+    .filter((config) => config && config.id)
+    .map((config) => {
+      const models = readConfiguredModels(config);
+      return {
+        id: config.id,
+        name: config.name || "未命名模型配置",
+        provider: String(config.provider || "openai"),
+        model: config.model || models[0]?.id || "",
+        enabled: config.enabled !== false,
+        models: ensureModelOption(models, config.model),
+      };
+    });
+}
+
+function readConfiguredModels(config: Pick<ModelConfig, "modelRowsJson" | "modelsJson" | "model">): ModelOption[] {
+  const rows = parseModelRows(config.modelRowsJson);
+  if (rows.length > 0) return rows;
+  const modelsJson = parseJsonObject(config.modelsJson);
+  const migrated = Object.entries(modelsJson)
+    .map(([id, value]) => ({
+      id: id.trim(),
+      name: value && typeof value === "object" && "name" in value ? String((value as { name?: unknown }).name || id).trim() : id.trim(),
+    }))
+    .filter((item) => item.id && item.name);
+  if (migrated.length > 0) return migrated;
+  const model = config.model.trim();
+  return model ? [{ id: model, name: model }] : [];
+}
+
+function parseModelRows(value: string): ModelOption[] {
+  try {
+    const parsed = JSON.parse(value || "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((row) => ({
+        id: String(row?.id || "").trim(),
+        name: String(row?.name || "").trim(),
+      }))
+      .filter((row) => row.id && row.name);
+  } catch {
+    return [];
+  }
+}
+
+function parseJsonObject(value: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function ensureModelOption(models: ModelOption[], currentModel: string): ModelOption[] {
+  const normalized = currentModel.trim();
+  if (!normalized || models.some((item) => item.id === normalized)) return models;
+  return [{ id: normalized, name: `${normalized}（当前值）` }, ...models];
+}
+
+function retrieverSourceFromKnowledgeBase(knowledgeBase: RagKnowledgeBaseConfig) {
+  switch (knowledgeBase.sourceType) {
+    case "local_files":
+      return "files";
+    case "vectorstore":
+      return "vectorstore";
+    case "http_api":
+      return "http";
+    case "database":
+      return "database";
+    case "local_directory":
+    default:
+      return "local";
+  }
+}
+
+function retrieverPathFromKnowledgeBase(knowledgeBase: RagKnowledgeBaseConfig) {
+  return knowledgeBase.path || knowledgeBase.url || knowledgeBase.collection || "./knowledge";
+}
+
+function ragSourceLabel(sourceType: string) {
+  switch (sourceType) {
+    case "local_files":
+      return "本地文件";
+    case "vectorstore":
+      return "向量库";
+    case "http_api":
+      return "HTTP API";
+    case "database":
+      return "数据库";
+    case "local_directory":
+    default:
+      return "本地目录";
+  }
 }

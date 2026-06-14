@@ -1,16 +1,21 @@
 import { Play, X } from "lucide-react";
 import { useProjectStore } from "../store/projectStore";
-import type { RunMode } from "../types";
+import type { ModelConfig, RunMode } from "../types";
 
 export function RunPreviewPanel() {
   const open = useProjectStore((state) => state.runOpen);
   const runMode = useProjectStore((state) => state.runMode);
   const runInput = useProjectStore((state) => state.runInput);
+  const workspaceModelConfigs = useProjectStore((state) => state.workspaceModelConfigs);
+  const selectedRunModelConfigId = useProjectStore((state) => state.selectedRunModelConfigId);
   const runResult = useProjectStore((state) => state.runResult);
   const closeRunPanel = useProjectStore((state) => state.closeRunPanel);
   const setRunMode = useProjectStore((state) => state.setRunMode);
   const setRunInput = useProjectStore((state) => state.setRunInput);
+  const setSelectedRunModelConfigId = useProjectStore((state) => state.setSelectedRunModelConfigId);
   const runPreview = useProjectStore((state) => state.runPreview);
+  const enabledModels = workspaceModelConfigs.filter((config) => config.enabled);
+  const selectedModel = pickSelectedModel(enabledModels, selectedRunModelConfigId);
 
   if (!open) return null;
 
@@ -26,6 +31,24 @@ export function RunPreviewPanel() {
         <ModeButton active={runMode === "dry"} mode="dry" onClick={setRunMode} />
         <ModeButton active={runMode === "live"} mode="live" onClick={setRunMode} />
       </div>
+      <label className="field compact-field">
+        <span>真实运行模型</span>
+        <select
+          disabled={enabledModels.length === 0}
+          value={selectedModel?.id ?? ""}
+          onChange={(event) => setSelectedRunModelConfigId(event.target.value || null)}
+        >
+          {enabledModels.length === 0 ? <option value="">未配置启用模型</option> : null}
+          {enabledModels.map((config) => (
+            <option key={config.id} value={config.id}>
+              {config.name} · {config.provider}/{config.model || "未填写模型"}
+            </option>
+          ))}
+        </select>
+        <small className="run-model-hint">
+          {selectedModel ? formatModelHint(selectedModel) : "在管理页左侧「模型」中添加配置；这里只保存环境变量名，不保存密钥。"}
+        </small>
+      </label>
       <label className="field compact-field">
         <span>输入 JSON</span>
         <textarea className="code-area" rows={7} value={runInput} onChange={(event) => setRunInput(event.target.value)} />
@@ -85,4 +108,14 @@ function ModeButton({ active, mode, onClick }: { active: boolean; mode: RunMode;
 
 function formatJson(value: Record<string, unknown>) {
   return JSON.stringify(value, null, 2);
+}
+
+function pickSelectedModel(models: ModelConfig[], selectedId: string | null): ModelConfig | null {
+  return models.find((config) => config.id === selectedId) ?? models.find((config) => config.isDefault) ?? models[0] ?? null;
+}
+
+function formatModelHint(config: ModelConfig) {
+  const apiKeyText = config.apiKey ? "API Key 已配置" : config.apiKeyEnv ? `环境变量 ${config.apiKeyEnv}` : "无需或自定义密钥";
+  const baseUrlText = config.baseUrl ? ` · ${config.baseUrl}` : "";
+  return `${apiKeyText}${baseUrlText}`;
 }

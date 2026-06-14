@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.compiler import build_project, export_project_zip
 from app.config import EXPORTS_DIR, STORAGE_DIR, ensure_runtime_dirs
@@ -34,9 +34,27 @@ class ExportResponse(BaseModel):
     files: list[str]
 
 
+class RunModelConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    id: str = ""
+    name: str = ""
+    provider: str = "openai"
+    model: str = ""
+    base_url: str = Field("", alias="baseUrl")
+    api_key: str = Field("", alias="apiKey")
+    api_key_env: str = Field("", alias="apiKeyEnv")
+    api_version: str = Field("", alias="apiVersion")
+    organization: str = ""
+    enabled: bool = True
+    is_default: bool = Field(False, alias="isDefault")
+    notes: str = ""
+
+
 class RunPreviewRequest(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     mode: Literal["dry", "live"] = "dry"
+    modelConfig: RunModelConfig | None = None
 
 
 class RunTraceItem(BaseModel):
@@ -155,7 +173,12 @@ def run_project_preview(project_id: str, payload: RunPreviewRequest | None = Non
         trace: list[dict[str, Any]] = []
         output_state = dict(request.input)
     else:
-        trace, output_state = run_project_preview_engine(project, request.input, request.mode)
+        trace, output_state = run_project_preview_engine(
+            project,
+            request.input,
+            request.mode,
+            request.modelConfig.model_dump(by_alias=True) if request.modelConfig else None,
+        )
     return RunPreviewResponse(
         mode=request.mode,
         valid=result.valid,

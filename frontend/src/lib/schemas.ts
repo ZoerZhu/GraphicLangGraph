@@ -133,6 +133,65 @@ export const ExportResponseSchema = z.object({
   files: z.array(z.string()),
 });
 
+export const ModelConfigSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  provider: z.string(),
+  model: z.string(),
+  baseUrl: z.string(),
+  apiKey: z.string(),
+  apiKeyEnv: z.string(),
+  apiVersion: z.string(),
+  organization: z.string(),
+  homepage: z.string(),
+  apiFormat: z.string(),
+  extraOptionsJson: z.string(),
+  modelRowsJson: z.string(),
+  modelsJson: z.string(),
+  enabled: z.boolean(),
+  isDefault: z.boolean(),
+  notes: z.string(),
+});
+
+export const ModelConfigListSchema = z.array(ModelConfigSchema);
+
+export const ToolConfigSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  source: z.string(),
+  schemaJson: z.string(),
+});
+
+export const ToolConfigListSchema = z.array(ToolConfigSchema);
+
+export const McpServerConfigSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  transport: z.string(),
+  command: z.string(),
+  url: z.string(),
+  description: z.string(),
+});
+
+export const McpServerConfigListSchema = z.array(McpServerConfigSchema);
+
+export const RagKnowledgeBaseSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  sourceType: z.string(),
+  path: z.string(),
+  url: z.string(),
+  collection: z.string(),
+  description: z.string(),
+  embeddingModel: z.string(),
+  topK: z.number(),
+  metadataJson: z.string(),
+  enabled: z.boolean(),
+});
+
+export const RagKnowledgeBaseListSchema = z.array(RagKnowledgeBaseSchema);
+
 export const RunPreviewResultSchema = z.object({
   mode: z.enum(["dry", "live"]),
   valid: z.boolean(),

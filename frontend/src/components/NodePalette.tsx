@@ -1,8 +1,8 @@
 import { useMemo, useRef, useState } from "react";
-import { Bot, ChevronDown, ChevronRight, PanelLeftClose, PanelLeftOpen, Plug, Server } from "lucide-react";
+import { Bot, ChevronDown, ChevronRight, Database, PanelLeftClose, PanelLeftOpen, Plug, Server } from "lucide-react";
 import { NODE_CATALOG } from "../lib/nodeCatalog";
 import { useProjectStore } from "../store/projectStore";
-import type { NodeType } from "../types";
+import type { NodeType, RagKnowledgeBaseConfig } from "../types";
 
 interface DragPayload {
   type: NodeType;
@@ -10,7 +10,7 @@ interface DragPayload {
   label?: string;
 }
 
-type GroupKey = "skills" | "mcp" | "agents";
+type GroupKey = "skills" | "mcp" | "rag" | "agents";
 
 export function NodePalette() {
   const addNode = useProjectStore((state) => state.addNode);
@@ -18,11 +18,13 @@ export function NodePalette() {
   const projects = useProjectStore((state) => state.projects);
   const workspaceTools = useProjectStore((state) => state.workspaceTools);
   const workspaceMcpServers = useProjectStore((state) => state.workspaceMcpServers);
+  const workspaceRagKnowledgeBases = useProjectStore((state) => state.workspaceRagKnowledgeBases);
   const hasStart = project?.nodes.some((node) => node.type === "start") ?? false;
   const pointerStart = useRef<Record<string, { x: number; y: number }>>({});
   const [openGroups, setOpenGroups] = useState<Record<GroupKey, boolean>>({
     skills: false,
     mcp: false,
+    rag: false,
     agents: true,
   });
   const [collapsed, setCollapsed] = useState(false);
@@ -31,6 +33,10 @@ export function NodePalette() {
   const mcpServers = useMemo(
     () => mergeById([...(project?.mcpServers ?? []), ...workspaceMcpServers]),
     [project?.mcpServers, workspaceMcpServers],
+  );
+  const ragKnowledgeBases = useMemo(
+    () => workspaceRagKnowledgeBases.filter((item) => item.enabled),
+    [workspaceRagKnowledgeBases],
   );
   const availableAgents = useMemo(
     () => projects.filter((item) => item.kind === "agent" && item.id !== project?.project.id),
@@ -212,6 +218,63 @@ export function NodePalette() {
           />
         )}
 
+        <PaletteGroup
+          title="RAG"
+          description="展开选择已导入知识库"
+          icon={<Database size={18} />}
+          count={ragKnowledgeBases.length}
+          open={openGroups.rag}
+          onClick={() => toggleGroup("rag")}
+        />
+        {openGroups.rag && (
+          <ConfiguredList
+            emptyText="先在管理页侧边栏导入 RAG 知识库。"
+            items={ragKnowledgeBases}
+            render={(knowledgeBase) => {
+              const key = `rag_${knowledgeBase.id}`;
+              const payload: DragPayload = {
+                type: "retriever",
+                label: knowledgeBase.name,
+                configPatch: {
+                  knowledgeBaseId: knowledgeBase.id,
+                  knowledgeBaseName: knowledgeBase.name,
+                  source: retrieverSourceFromKnowledgeBase(knowledgeBase),
+                  path: retrieverPathFromKnowledgeBase(knowledgeBase),
+                  endpoint: knowledgeBase.url,
+                  collection: knowledgeBase.collection,
+                  topK: knowledgeBase.topK,
+                  knowledgeBaseDescription: knowledgeBase.description,
+                  embeddingModel: knowledgeBase.embeddingModel,
+                  metadataJson: knowledgeBase.metadataJson,
+                  outputField: `${toFieldName(knowledgeBase.name)}_context`,
+                },
+              };
+              return (
+                <PaletteButton
+                  key={key}
+                  id={key}
+                  className="configured-node"
+                  title="点击添加已绑定知识库的 Retriever，或拖拽到画布"
+                  onPointerDown={(event) => {
+                    pointerStart.current[key] = { x: event.clientX, y: event.clientY };
+                  }}
+                  onPointerUp={(event) => handlePointerUp(event, key, payload)}
+                  onDragStart={(event) => handleDragStart(event, payload)}
+                  onKeyAdd={() => addNode(payload.type, undefined, payload.configPatch, payload.label)}
+                >
+                  <span className="node-palette-item__icon">
+                    <Database size={16} />
+                  </span>
+                  <span>
+                    <strong>{knowledgeBase.name}</strong>
+                    <small>{ragSourceLabel(knowledgeBase.sourceType)} · {knowledgeBase.path || knowledgeBase.url || knowledgeBase.collection || "未配置入口"}</small>
+                  </span>
+                </PaletteButton>
+              );
+            }}
+          />
+        )}
+
         {project?.project.kind === "agents" && (
           <>
             <PaletteGroup
@@ -369,4 +432,40 @@ function mergeById<T extends { id: string }>(items: T[]): T[] {
 function toFieldName(value: string) {
   const cleaned = value.trim().toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "");
   return cleaned || "node";
+}
+
+function retrieverSourceFromKnowledgeBase(knowledgeBase: RagKnowledgeBaseConfig) {
+  switch (knowledgeBase.sourceType) {
+    case "local_files":
+      return "files";
+    case "vectorstore":
+      return "vectorstore";
+    case "http_api":
+      return "http";
+    case "database":
+      return "database";
+    case "local_directory":
+    default:
+      return "local";
+  }
+}
+
+function retrieverPathFromKnowledgeBase(knowledgeBase: RagKnowledgeBaseConfig) {
+  return knowledgeBase.path || knowledgeBase.url || knowledgeBase.collection || "./knowledge";
+}
+
+function ragSourceLabel(sourceType: string) {
+  switch (sourceType) {
+    case "local_files":
+      return "本地文件";
+    case "vectorstore":
+      return "向量库";
+    case "http_api":
+      return "HTTP API";
+    case "database":
+      return "数据库";
+    case "local_directory":
+    default:
+      return "本地目录";
+  }
 }

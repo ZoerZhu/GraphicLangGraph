@@ -12,6 +12,7 @@ __pycache__/
 .env.*
 !/.env.example
 storage/projects/*.json
+storage/workspace/*.json
 exports/*.zip
 exports/*.png
 exports/builds/

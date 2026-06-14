@@ -16,8 +16,16 @@ import {
   deleteProject,
   exportProject,
   getProject,
+  listWorkspaceMcpServers,
+  listWorkspaceRagKnowledgeBases,
+  listWorkspaceModelConfigs,
+  listWorkspaceTools,
   listProjects,
   runProjectPreview,
+  saveWorkspaceMcpServers,
+  saveWorkspaceRagKnowledgeBases,
+  saveWorkspaceModelConfigs,
+  saveWorkspaceTools,
   saveProject,
   validateProject,
 } from "../lib/api";
@@ -29,11 +37,13 @@ import type {
   ExportResponse,
   ImportedAgentConfig,
   MCPServerConfig,
+  ModelConfig,
   NodeIR,
   NodeType,
   ProjectHistoryRecord,
   ProjectIR,
   ProjectListItem,
+  RagKnowledgeBaseConfig,
   RunMode,
   RunPreviewResult,
   StateField,
@@ -46,13 +56,17 @@ interface PendingConnection {
   sourceHandle: string | null;
 }
 
+type ManagerView = "agent" | "agents" | "tools" | "mcp" | "rag" | "models";
+
 interface ProjectStore {
   mode: "manager" | "editor";
-  managerView: "agent" | "agents";
+  managerView: ManagerView;
   project: ProjectIR | null;
   projects: ProjectListItem[];
   workspaceTools: ToolConfig[];
   workspaceMcpServers: MCPServerConfig[];
+  workspaceModelConfigs: ModelConfig[];
+  workspaceRagKnowledgeBases: RagKnowledgeBaseConfig[];
   selectedNodeId: string | null;
   pendingConnection: PendingConnection | null;
   splitAgentProject: ProjectIR | null;
@@ -67,12 +81,13 @@ interface ProjectStore {
   runOpen: boolean;
   runMode: RunMode;
   runInput: string;
+  selectedRunModelConfigId: string | null;
   runResult: RunPreviewResult | null;
   status: string;
   loading: boolean;
   initialize: () => Promise<void>;
   loadProjectList: () => Promise<void>;
-  setManagerView: (view: "agent" | "agents") => void;
+  setManagerView: (view: ManagerView) => void;
   openProject: (projectId: string) => Promise<void>;
   createNewProject: (name: string, kind?: "agent" | "agents") => Promise<void>;
   renameProjectById: (projectId: string, patch: Partial<ProjectIR["project"]>) => Promise<void>;
@@ -80,8 +95,10 @@ interface ProjectStore {
   backToManager: () => Promise<void>;
   selectNode: (nodeId: string | null) => void;
   updateProjectMeta: (patch: Partial<ProjectIR["project"]>) => void;
-  updateWorkspaceTools: (tools: ToolConfig[]) => void;
-  updateWorkspaceMcpServers: (servers: MCPServerConfig[]) => void;
+  updateWorkspaceTools: (tools: ToolConfig[]) => Promise<void>;
+  updateWorkspaceMcpServers: (servers: MCPServerConfig[]) => Promise<void>;
+  updateWorkspaceModelConfigs: (configs: ModelConfig[]) => Promise<void>;
+  updateWorkspaceRagKnowledgeBases: (configs: RagKnowledgeBaseConfig[]) => Promise<void>;
   updateTools: (tools: ToolConfig[]) => void;
   updateMcpServers: (servers: MCPServerConfig[]) => void;
   updateImportedAgents: (agents: ImportedAgentConfig[]) => void;
@@ -117,6 +134,7 @@ interface ProjectStore {
   closeRunPanel: () => void;
   setRunMode: (mode: RunMode) => void;
   setRunInput: (value: string) => void;
+  setSelectedRunModelConfigId: (id: string | null) => void;
   runPreview: () => Promise<void>;
   openSplitAgent: (projectId: string) => Promise<void>;
   closeSplitAgent: () => void;
@@ -131,6 +149,7 @@ interface ProjectStore {
 const PROJECT_KEY = "graphic-langgraph-project-id";
 const WORKSPACE_TOOLS_KEY = "graphic-langgraph-workspace-tools";
 const WORKSPACE_MCP_KEY = "graphic-langgraph-workspace-mcp";
+const WORKSPACE_MODELS_KEY = "graphic-langgraph-workspace-models";
 const HISTORY_LIMIT = 80;
 
 export const useProjectStore = create<ProjectStore>((set, get) => ({
@@ -140,6 +159,8 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   projects: [],
   workspaceTools: [],
   workspaceMcpServers: [],
+  workspaceModelConfigs: [],
+  workspaceRagKnowledgeBases: [],
   selectedNodeId: null,
   pendingConnection: null,
   splitAgentProject: null,
@@ -154,6 +175,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   runOpen: false,
   runMode: "dry",
   runInput: "{\n  \"messages\": \"我想查询订单物流\"\n}",
+  selectedRunModelConfigId: null,
   runResult: null,
   status: "未连接后端",
   loading: false,
@@ -161,14 +183,66 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   async initialize() {
     set({ loading: true, status: "正在加载历史 Agent" });
     try {
-      const projects = await listProjects();
+      const [projects, storedTools, storedMcpServers, storedModelConfigs, storedRagKnowledgeBases] = await Promise.all([
+        listProjects(),
+        listWorkspaceTools(),
+        listWorkspaceMcpServers(),
+        listWorkspaceModelConfigs(),
+        listWorkspaceRagKnowledgeBases(),
+      ]);
+      let workspaceTools = normalizeTools(storedTools);
+      let workspaceMcpServers = normalizeMcpServers(storedMcpServers);
+      let workspaceModelConfigs = normalizeModelConfigs(storedModelConfigs);
+      const workspaceRagKnowledgeBases = normalizeRagKnowledgeBases(storedRagKnowledgeBases);
+      let migratedResources = false;
+      if (workspaceTools.length === 0) {
+        const localTools = normalizeTools(readLocalArray<ToolConfig>(WORKSPACE_TOOLS_KEY));
+        if (localTools.length > 0) {
+          try {
+            workspaceTools = normalizeTools(await saveWorkspaceTools(localTools));
+            removeLocalItem(WORKSPACE_TOOLS_KEY);
+            migratedResources = true;
+          } catch {
+            workspaceTools = localTools;
+          }
+        }
+      }
+      if (workspaceMcpServers.length === 0) {
+        const localMcpServers = normalizeMcpServers(readLocalArray<MCPServerConfig>(WORKSPACE_MCP_KEY));
+        if (localMcpServers.length > 0) {
+          try {
+            workspaceMcpServers = normalizeMcpServers(await saveWorkspaceMcpServers(localMcpServers));
+            removeLocalItem(WORKSPACE_MCP_KEY);
+            migratedResources = true;
+          } catch {
+            workspaceMcpServers = localMcpServers;
+          }
+        }
+      }
+      let migratedModels = false;
+      if (workspaceModelConfigs.length === 0) {
+        const localModelConfigs = readLocalModelConfigs();
+        if (localModelConfigs.length > 0) {
+          workspaceModelConfigs = localModelConfigs;
+          try {
+            workspaceModelConfigs = normalizeModelConfigs(await saveWorkspaceModelConfigs(workspaceModelConfigs));
+            removeLocalItem(WORKSPACE_MODELS_KEY);
+            migratedModels = true;
+          } catch {
+            // Keep loading the app even if the compatibility migration fails.
+          }
+        }
+      }
       set({
         projects,
         mode: "manager",
         project: null,
-        workspaceTools: readLocalArray<ToolConfig>(WORKSPACE_TOOLS_KEY),
-        workspaceMcpServers: readLocalArray<MCPServerConfig>(WORKSPACE_MCP_KEY),
-        status: "历史 Agent 已加载",
+        workspaceTools,
+        workspaceMcpServers,
+        workspaceModelConfigs,
+        workspaceRagKnowledgeBases,
+        selectedRunModelConfigId: pickModelConfigId(workspaceModelConfigs, null),
+        status: migratedModels || migratedResources ? "历史 Agent 已加载，资源配置已迁移到后端" : "历史 Agent 已加载",
         loading: false,
       });
     } catch (error) {
@@ -209,10 +283,11 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     });
   },
 
-  async createNewProject(name, kind = get().managerView) {
+  async createNewProject(name, kind) {
     set({ loading: true, status: "正在创建 Agent" });
-    const fallbackName = kind === "agents" ? "新建 Agents" : "新建 Agent";
-    const project = await createProject(name.trim() || fallbackName, kind);
+    const projectKind = kind ?? (get().managerView === "agents" ? "agents" : "agent");
+    const fallbackName = projectKind === "agents" ? "新建 Agents" : "新建 Agent";
+    const project = await createProject(name.trim() || fallbackName, projectKind);
     localStorage.setItem(PROJECT_KEY, project.project.id);
     const projects = await listProjects();
     set({
@@ -293,14 +368,63 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     set({ project: { ...project, project: { ...project.project, ...patch } }, status: "已更新 Agent 信息" });
   },
 
-  updateWorkspaceTools(tools) {
-    writeLocalArray(WORKSPACE_TOOLS_KEY, tools);
-    set({ workspaceTools: tools, status: "已更新全局 Tools" });
+  async updateWorkspaceTools(tools) {
+    const workspaceTools = normalizeTools(tools);
+    set({ workspaceTools, status: "正在保存全局 Tools" });
+    try {
+      const savedTools = normalizeTools(await saveWorkspaceTools(workspaceTools));
+      set({ workspaceTools: savedTools, status: "全局 Tools 已保存到后端" });
+    } catch (error) {
+      set({ status: error instanceof Error ? error.message : "全局 Tools 保存失败" });
+    }
   },
 
-  updateWorkspaceMcpServers(workspaceMcpServers) {
-    writeLocalArray(WORKSPACE_MCP_KEY, workspaceMcpServers);
-    set({ workspaceMcpServers, status: "已更新全局 MCP" });
+  async updateWorkspaceMcpServers(workspaceMcpServers) {
+    const normalizedMcpServers = normalizeMcpServers(workspaceMcpServers);
+    set({ workspaceMcpServers: normalizedMcpServers, status: "正在保存全局 MCP" });
+    try {
+      const savedMcpServers = normalizeMcpServers(await saveWorkspaceMcpServers(normalizedMcpServers));
+      set({ workspaceMcpServers: savedMcpServers, status: "全局 MCP 已保存到后端" });
+    } catch (error) {
+      set({ status: error instanceof Error ? error.message : "全局 MCP 保存失败" });
+    }
+  },
+
+  async updateWorkspaceModelConfigs(configs) {
+    const workspaceModelConfigs = normalizeModelConfigs(configs);
+    const selectedRunModelConfigId = pickModelConfigId(workspaceModelConfigs, get().selectedRunModelConfigId);
+    set({
+      workspaceModelConfigs,
+      selectedRunModelConfigId,
+      status: "正在保存运行模型配置",
+    });
+    try {
+      const savedModelConfigs = normalizeModelConfigs(await saveWorkspaceModelConfigs(workspaceModelConfigs));
+      set({
+        workspaceModelConfigs: savedModelConfigs,
+        selectedRunModelConfigId: pickModelConfigId(savedModelConfigs, selectedRunModelConfigId),
+        status: "运行模型配置已保存到后端",
+      });
+    } catch (error) {
+      set({ status: error instanceof Error ? error.message : "运行模型配置保存失败" });
+    }
+  },
+
+  async updateWorkspaceRagKnowledgeBases(configs) {
+    const workspaceRagKnowledgeBases = normalizeRagKnowledgeBases(configs);
+    set({
+      workspaceRagKnowledgeBases,
+      status: "正在保存 RAG 知识库配置",
+    });
+    try {
+      const savedRagKnowledgeBases = normalizeRagKnowledgeBases(await saveWorkspaceRagKnowledgeBases(workspaceRagKnowledgeBases));
+      set({
+        workspaceRagKnowledgeBases: savedRagKnowledgeBases,
+        status: "RAG 知识库配置已保存到后端",
+      });
+    } catch (error) {
+      set({ status: error instanceof Error ? error.message : "RAG 知识库配置保存失败" });
+    }
   },
 
   updateTools(tools) {
@@ -660,6 +784,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     set({ runInput });
   },
 
+  setSelectedRunModelConfigId(selectedRunModelConfigId) {
+    set({ selectedRunModelConfigId, runResult: null, status: "已切换运行模型" });
+  },
+
   async runPreview() {
     const project = get().project;
     if (!project) return;
@@ -671,15 +799,26 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       return;
     }
     const runMode = get().runMode;
+    const workspaceModelConfigs = normalizeModelConfigs(get().workspaceModelConfigs);
+    const selectedRunModelConfigId = pickModelConfigId(workspaceModelConfigs, get().selectedRunModelConfigId);
+    const selectedModelConfig =
+      runMode === "live"
+        ? workspaceModelConfigs.find((config) => config.id === selectedRunModelConfigId && config.enabled)
+        : undefined;
+    if (runMode === "live" && !selectedModelConfig) {
+      set({ status: "请先在管理页添加并启用一个模型配置" });
+      return;
+    }
     set({ status: runMode === "live" ? "正在真实运行" : "正在模拟运行", runResult: null });
     const saved = await saveProject(project);
     const historyRecords = recordProjectHistory(saved, "运行预览前保存");
-    const runResult = await runProjectPreview(saved.project.id, input, runMode);
+    const runResult = await runProjectPreview(saved.project.id, input, runMode, selectedModelConfig);
     set({
       project: saved,
       historyRecords,
       runResult,
       runOpen: true,
+      selectedRunModelConfigId,
       status: runResult.valid
         ? runResult.mode === "live"
           ? "真实运行完成"
@@ -805,6 +944,129 @@ function readLocalArray<T>(key: string): T[] {
 function writeLocalArray<T>(key: string, value: T[]) {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(key, JSON.stringify(value));
+}
+
+function removeLocalItem(key: string) {
+  if (typeof window === "undefined") return;
+  window.localStorage.removeItem(key);
+}
+
+function readLocalModelConfigs(): ModelConfig[] {
+  return normalizeModelConfigs(readLocalArray<ModelConfig>(WORKSPACE_MODELS_KEY));
+}
+
+function normalizeTools(tools: ToolConfig[]): ToolConfig[] {
+  return tools
+    .filter((tool) => tool && typeof tool.id === "string")
+    .map((tool) => ({
+      id: tool.id,
+      name: String(tool.name || "未命名工具"),
+      description: String(tool.description || ""),
+      source: String(tool.source || "python"),
+      schemaJson: String(tool.schemaJson || "{}"),
+    }));
+}
+
+function normalizeMcpServers(servers: MCPServerConfig[]): MCPServerConfig[] {
+  return servers
+    .filter((server) => server && typeof server.id === "string")
+    .map((server) => ({
+      id: server.id,
+      name: String(server.name || "未命名 MCP"),
+      transport: String(server.transport || "stdio"),
+      command: String(server.command || ""),
+      url: String(server.url || ""),
+      description: String(server.description || ""),
+    }));
+}
+
+function normalizeRagKnowledgeBases(configs: RagKnowledgeBaseConfig[]): RagKnowledgeBaseConfig[] {
+  return configs
+    .filter((config) => config && typeof config.id === "string")
+    .map((config) => ({
+      id: config.id,
+      name: String(config.name || "未命名知识库"),
+      sourceType: String(config.sourceType || "local_directory"),
+      path: String(config.path || ""),
+      url: String(config.url || ""),
+      collection: String(config.collection || ""),
+      description: String(config.description || ""),
+      embeddingModel: String(config.embeddingModel || ""),
+      topK: Math.max(1, Number(config.topK || 4)),
+      metadataJson: String(config.metadataJson || "{}"),
+      enabled: config.enabled !== false,
+    }));
+}
+
+function normalizeModelConfigs(configs: ModelConfig[]): ModelConfig[] {
+  const normalized = configs
+    .filter((config) => config && typeof config.id === "string")
+    .map((config) => ({
+      id: config.id,
+      name: String(config.name || "未命名模型配置"),
+      provider: String(config.provider || "openai"),
+      model: String(config.model || "gpt-4.1-mini"),
+      baseUrl: String(config.baseUrl || ""),
+      apiKey: String(config.apiKey || ""),
+      apiKeyEnv: String(config.apiKeyEnv || ""),
+      apiVersion: String(config.apiVersion || ""),
+      organization: String(config.organization || ""),
+      homepage: String(config.homepage || ""),
+      apiFormat: String(config.apiFormat || inferApiFormat(String(config.provider || "openai"))),
+      extraOptionsJson: String(config.extraOptionsJson || "{}"),
+      modelRowsJson: String(config.modelRowsJson || migrateModelRows(config.modelsJson, config.model)),
+      modelsJson: String(config.modelsJson || "{}"),
+      enabled: config.enabled !== false,
+      isDefault: Boolean(config.isDefault),
+      notes: String(config.notes || ""),
+    }));
+  if (normalized.length === 0) return normalized;
+
+  let defaultAssigned = false;
+  const withSingleDefault = normalized.map((config, index) => {
+    const shouldBeDefault = !defaultAssigned && (config.isDefault || !normalized.some((item) => item.isDefault) && index === 0);
+    if (shouldBeDefault) {
+      defaultAssigned = true;
+    }
+    return { ...config, isDefault: shouldBeDefault };
+  });
+  return withSingleDefault;
+}
+
+function migrateModelRows(modelsJson: unknown, defaultModel: unknown) {
+  const rows: Array<{ id: string; name: string }> = [];
+  try {
+    const parsed = JSON.parse(String(modelsJson || "{}"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [id, value] of Object.entries(parsed as Record<string, unknown>)) {
+        const name = value && typeof value === "object" && "name" in value ? String((value as { name?: unknown }).name || "") : "";
+        rows.push({ id, name });
+      }
+    }
+  } catch {
+    // Fall through to the default model row.
+  }
+  if (rows.length === 0 && defaultModel) {
+    const model = String(defaultModel);
+    rows.push({ id: model, name: model });
+  }
+  return JSON.stringify(rows.length > 0 ? rows : [{ id: "", name: "" }]);
+}
+
+function inferApiFormat(provider: string) {
+  if (provider === "anthropic") return "anthropic";
+  if (provider === "google") return "google";
+  if (provider === "azure_openai") return "azure_openai";
+  if (provider === "ollama") return "ollama";
+  return "openai_compatible";
+}
+
+function pickModelConfigId(configs: ModelConfig[], currentId: string | null): string | null {
+  const enabledConfigs = configs.filter((config) => config.enabled);
+  if (currentId && enabledConfigs.some((config) => config.id === currentId)) {
+    return currentId;
+  }
+  return enabledConfigs.find((config) => config.isDefault)?.id ?? enabledConfigs[0]?.id ?? configs[0]?.id ?? null;
 }
 
 function routerOutputsFromConfig(config: Record<string, unknown>) {

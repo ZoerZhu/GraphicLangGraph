@@ -1,5 +1,26 @@
-import type { ExportResponse, ProjectIR, ProjectListItem, RunMode, RunPreviewResult, ValidationResult } from "../types";
-import { ExportResponseSchema, ProjectListSchema, ProjectSchema, RunPreviewResultSchema, ValidationResultSchema } from "./schemas";
+import type {
+  ExportResponse,
+  MCPServerConfig,
+  ModelConfig,
+  ProjectIR,
+  ProjectListItem,
+  RagKnowledgeBaseConfig,
+  RunMode,
+  RunPreviewResult,
+  ToolConfig,
+  ValidationResult,
+} from "../types";
+import {
+  ExportResponseSchema,
+  McpServerConfigListSchema,
+  ModelConfigListSchema,
+  ProjectListSchema,
+  ProjectSchema,
+  RagKnowledgeBaseListSchema,
+  RunPreviewResultSchema,
+  ToolConfigListSchema,
+  ValidationResultSchema,
+} from "./schemas";
 
 const API_BASE = "";
 
@@ -69,10 +90,67 @@ export async function exportProject(projectId: string): Promise<ExportResponse> 
   return ExportResponseSchema.parse(data) as ExportResponse;
 }
 
-export async function runProjectPreview(projectId: string, input: Record<string, unknown>, mode: RunMode): Promise<RunPreviewResult> {
+export async function listWorkspaceTools(): Promise<ToolConfig[]> {
+  const data = await request("/api/workspace/tools");
+  return ToolConfigListSchema.parse(data) as ToolConfig[];
+}
+
+export async function saveWorkspaceTools(configs: ToolConfig[]): Promise<ToolConfig[]> {
+  const data = await request("/api/workspace/tools", {
+    method: "PUT",
+    body: JSON.stringify(configs),
+  });
+  return ToolConfigListSchema.parse(data) as ToolConfig[];
+}
+
+export async function listWorkspaceMcpServers(): Promise<MCPServerConfig[]> {
+  const data = await request("/api/workspace/mcp");
+  return McpServerConfigListSchema.parse(data) as MCPServerConfig[];
+}
+
+export async function saveWorkspaceMcpServers(configs: MCPServerConfig[]): Promise<MCPServerConfig[]> {
+  const data = await request("/api/workspace/mcp", {
+    method: "PUT",
+    body: JSON.stringify(configs),
+  });
+  return McpServerConfigListSchema.parse(data) as MCPServerConfig[];
+}
+
+export async function listWorkspaceModelConfigs(): Promise<ModelConfig[]> {
+  const data = await request("/api/workspace/models");
+  return ModelConfigListSchema.parse(data) as ModelConfig[];
+}
+
+export async function saveWorkspaceModelConfigs(configs: ModelConfig[]): Promise<ModelConfig[]> {
+  const data = await request("/api/workspace/models", {
+    method: "PUT",
+    body: JSON.stringify(configs),
+  });
+  return ModelConfigListSchema.parse(data) as ModelConfig[];
+}
+
+export async function listWorkspaceRagKnowledgeBases(): Promise<RagKnowledgeBaseConfig[]> {
+  const data = await request("/api/workspace/rag");
+  return RagKnowledgeBaseListSchema.parse(data) as RagKnowledgeBaseConfig[];
+}
+
+export async function saveWorkspaceRagKnowledgeBases(configs: RagKnowledgeBaseConfig[]): Promise<RagKnowledgeBaseConfig[]> {
+  const data = await request("/api/workspace/rag", {
+    method: "PUT",
+    body: JSON.stringify(configs),
+  });
+  return RagKnowledgeBaseListSchema.parse(data) as RagKnowledgeBaseConfig[];
+}
+
+export async function runProjectPreview(
+  projectId: string,
+  input: Record<string, unknown>,
+  mode: RunMode,
+  modelConfig?: ModelConfig,
+): Promise<RunPreviewResult> {
   const data = await request(`/api/projects/${projectId}/run`, {
     method: "POST",
-    body: JSON.stringify({ input, mode }),
+    body: JSON.stringify({ input, mode, modelConfig }),
   });
   return RunPreviewResultSchema.parse(data) as RunPreviewResult;
 }

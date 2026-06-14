@@ -16,6 +16,26 @@ export type NodeType =
 
 export type EdgeKind = "normal" | "conditional" | "error";
 export type RunMode = "dry" | "live";
+export type ModelProvider =
+  | "openai"
+  | "anthropic"
+  | "azure_openai"
+  | "google"
+  | "deepseek"
+  | "moonshot"
+  | "qwen"
+  | "zhipu"
+  | "minimax"
+  | "baichuan"
+  | "mistral"
+  | "cohere"
+  | "groq"
+  | "ollama"
+  | "doubao"
+  | "hunyuan"
+  | "baidu_qianfan"
+  | "openai_compatible"
+  | "custom";
 
 export interface Position {
   x: number;
@@ -70,6 +90,40 @@ export interface MCPServerConfig {
   command: string;
   url: string;
   description: string;
+}
+
+export interface ModelConfig {
+  id: string;
+  name: string;
+  provider: ModelProvider | string;
+  model: string;
+  baseUrl: string;
+  apiKey: string;
+  apiKeyEnv: string;
+  apiVersion: string;
+  organization: string;
+  homepage: string;
+  apiFormat: string;
+  extraOptionsJson: string;
+  modelRowsJson: string;
+  modelsJson: string;
+  enabled: boolean;
+  isDefault: boolean;
+  notes: string;
+}
+
+export interface RagKnowledgeBaseConfig {
+  id: string;
+  name: string;
+  sourceType: string;
+  path: string;
+  url: string;
+  collection: string;
+  description: string;
+  embeddingModel: string;
+  topK: number;
+  metadataJson: string;
+  enabled: boolean;
 }
 
 export interface ImportedAgentConfig {
