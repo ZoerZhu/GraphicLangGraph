@@ -1,3 +1,5 @@
+import json
+
 from fastapi.testclient import TestClient
 
 import app.api.workspace as workspace_api
@@ -26,6 +28,7 @@ def test_project_run_preview():
     assert created.status_code == 200
     project = created.json()
     project_id = project["project"]["id"]
+    project["state"]["fields"].append({"name": "final_answer", "type": "str", "description": ""})
     project["nodes"].extend(
         [
             {
@@ -81,6 +84,116 @@ def test_project_run_preview():
     assert deleted.status_code == 204
 
 
+def test_project_run_stream_emits_node_events():
+    client = TestClient(app)
+
+    created = client.post("/api/projects", json={"name": "流式运行测试 Agent"})
+    assert created.status_code == 200
+    project = created.json()
+    project_id = project["project"]["id"]
+    project["state"]["fields"].append({"name": "final_answer", "type": "str", "description": ""})
+    project["nodes"].extend(
+        [
+            {
+                "id": "llm_1",
+                "type": "llm",
+                "label": "生成回答",
+                "position": {"x": 320, "y": 220},
+                "config": {"outputField": "final_answer"},
+                "inputs": [{"id": "in", "type": "control", "label": "输入"}],
+                "outputs": [{"id": "out", "type": "control", "label": "输出"}],
+            },
+            {
+                "id": "reply_1",
+                "type": "direct_reply",
+                "label": "回复",
+                "position": {"x": 560, "y": 220},
+                "config": {"template": "{{ state.final_answer }}", "outputField": "final_answer"},
+                "inputs": [{"id": "in", "type": "control", "label": "输入"}],
+                "outputs": [],
+            },
+        ]
+    )
+    project["edges"].extend(
+        [
+            {"id": "e1", "source": "start", "sourceHandle": "out", "target": "llm_1", "kind": "normal"},
+            {"id": "e2", "source": "llm_1", "sourceHandle": "out", "target": "reply_1", "kind": "normal"},
+        ]
+    )
+    assert client.put(f"/api/projects/{project_id}", json=project).status_code == 200
+
+    with client.stream(
+        "POST",
+        f"/api/projects/{project_id}/run/stream",
+        json={"input": {"messages": "你好"}, "mode": "dry"},
+    ) as response:
+        assert response.status_code == 200
+        events = [json.loads(line) for line in response.iter_lines() if line]
+
+    assert [event["event"] for event in events] == [
+        "run_start",
+        "node_start",
+        "node_end",
+        "node_start",
+        "node_end",
+        "run_end",
+    ]
+    assert events[1]["nodeId"] == "llm_1"
+    assert events[2]["traceItem"]["outputDelta"]["final_answer"].startswith("[dry-run]")
+    assert events[-1]["outputState"]["final_answer"]
+
+    deleted = client.delete(f"/api/projects/{project_id}")
+    assert deleted.status_code == 204
+
+
+def test_project_export_returns_smoke_test_result():
+    client = TestClient(app)
+
+    created = client.post("/api/projects", json={"name": "导出测试 Agent"})
+    assert created.status_code == 200
+    project = created.json()
+    project_id = project["project"]["id"]
+    project["state"]["fields"].append({"name": "final_answer", "type": "str", "description": ""})
+    project["nodes"].extend(
+        [
+            {
+                "id": "llm_1",
+                "type": "llm",
+                "label": "生成回答",
+                "position": {"x": 320, "y": 220},
+                "config": {"outputField": "final_answer"},
+                "inputs": [{"id": "in", "type": "control", "label": "输入"}],
+                "outputs": [{"id": "out", "type": "control", "label": "输出"}],
+            },
+            {
+                "id": "reply_1",
+                "type": "direct_reply",
+                "label": "回复",
+                "position": {"x": 560, "y": 220},
+                "config": {"template": "{{ state.final_answer }}", "outputField": "final_answer"},
+                "inputs": [{"id": "in", "type": "control", "label": "输入"}],
+                "outputs": [],
+            },
+        ]
+    )
+    project["edges"].extend(
+        [
+            {"id": "e1", "source": "start", "sourceHandle": "out", "target": "llm_1", "kind": "normal"},
+            {"id": "e2", "source": "llm_1", "sourceHandle": "out", "target": "reply_1", "kind": "normal"},
+        ]
+    )
+    assert client.put(f"/api/projects/{project_id}", json=project).status_code == 200
+
+    exported = client.post(f"/api/projects/{project_id}/export")
+    assert exported.status_code == 200
+    body = exported.json()
+    assert body["smokeTest"]["passed"] is True
+    assert "tests/test_graph_smoke.py" in body["files"]
+
+    deleted = client.delete(f"/api/projects/{project_id}")
+    assert deleted.status_code == 204
+
+
 def test_workspace_model_configs_are_persisted(tmp_path, monkeypatch):
     models_file = tmp_path / "models.json"
     monkeypatch.setattr(workspace_api, "WORKSPACE_MODELS_FILE", models_file)
@@ -94,7 +207,7 @@ def test_workspace_model_configs_are_persisted(tmp_path, monkeypatch):
             "model": "deepseek-chat",
             "baseUrl": "https://api.deepseek.com",
             "apiKey": "sk-test",
-            "apiKeyEnv": "",
+            "apiKeyEnv": "sk-test",
             "apiVersion": "",
             "organization": "",
             "homepage": "https://www.deepseek.com",
@@ -133,6 +246,9 @@ def test_workspace_model_configs_are_persisted(tmp_path, monkeypatch):
     assert models_file.exists()
     assert [item["id"] for item in body] == ["model_test_1", "model_test_2"]
     assert [item["isDefault"] for item in body] == [False, True]
+    assert body[0]["apiKey"] == ""
+    assert body[0]["apiKeyEnv"] == ""
+    assert "sk-test" not in models_file.read_text(encoding="utf-8")
 
     listed = client.get("/api/workspace/models")
     assert listed.status_code == 200
@@ -224,3 +340,38 @@ def test_workspace_rag_knowledge_bases_are_persisted(tmp_path, monkeypatch):
     listed = client.get("/api/workspace/rag")
     assert listed.status_code == 200
     assert listed.json() == body
+
+
+def test_workspace_rag_inspect_detects_chroma_sidecar(tmp_path):
+    data_dir = tmp_path / "rag_data"
+    chroma_dir = data_dir / "chroma"
+    chroma_dir.mkdir(parents=True)
+    (chroma_dir / "chroma.sqlite3").write_bytes(b"")
+    (data_dir / "runtime_config.json").write_text(
+        """
+        {
+          "COLLECTION_NAME": "national_formulary_v2",
+          "EMBEDDING_MODEL": "text-embedding-v4",
+          "EMBEDDING_API_BASE": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          "EMBEDDING_API_KEY": "sk-do-not-copy",
+          "TOP_K": 8
+        }
+        """,
+        encoding="utf-8",
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/workspace/rag/inspect", json={"path": str(data_dir)})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["exists"] is True
+    assert body["sourceType"] == "vectorstore"
+    assert body["path"] == str(chroma_dir)
+    assert body["collection"] == "national_formulary_v2"
+    assert body["embeddingModel"] == "text-embedding-v4"
+    assert body["topK"] == 8
+    assert "chroma.sqlite3" in "\n".join(body["detectedFiles"])
+    assert "runtime_config.json" in "\n".join(body["detectedFiles"])
+    assert "sk-do-not-copy" not in body["metadataJson"]
+    assert '"embeddingApiKeyEnv": "EMBEDDING_API_KEY"' in body["metadataJson"]

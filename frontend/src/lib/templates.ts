@@ -65,6 +65,7 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     fields: [
       { name: "route_key", type: "str", description: "意图路由" },
       { name: "route_reason", type: "str", description: "路由原因" },
+      { name: "order_id", type: "str", description: "订单号，可从运行输入中提供" },
       { name: "order_info", type: "dict", description: "订单查询结果" },
       { name: "approval_action", type: "str", description: "审批动作" },
       { name: "approval_result", type: "dict", description: "审批结果" },
@@ -76,6 +77,7 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
       node("route_intent", "ai_router", "识别问题类型", 360, 300, {
         provider: "openai",
         model: "gpt-4.1-mini",
+        routeMode: "keyword",
         instruction: "判断用户问题属于订单、退款还是其他。",
         inputText: "{{ state.messages }}",
         scenarios: "order:订单问题:订单,物流,发货,快递\nrefund:退款问题:退款,退货,赔付,取消\nother:其他问题:",
@@ -92,6 +94,8 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
         url: "https://api.example.com/orders/{{ state.order_id }}",
         body: "",
         authSecret: "ORDER_API_TOKEN",
+        mockEnabled: true,
+        mockResponseJson: "{\n  \"order_id\": \"{{ state.order_id }}\",\n  \"status\": \"已发货\",\n  \"shipping_company\": \"顺丰速运\",\n  \"tracking_no\": \"SF1234567890\",\n  \"estimated_delivery\": \"明天 18:00 前\",\n  \"refundable\": true\n}",
         outputField: "order_info",
       }),
       node("refund_approval", "human_approval", "退款人工审批", 650, 390, {
@@ -109,7 +113,8 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
         provider: "openai",
         model: "gpt-4.1-mini",
         systemPrompt: "你是售后客服 Agent，请结合意图、订单信息和审批结果，生成专业、明确、友好的中文回复。",
-        tools: "query_order,refund_policy",
+        userPrompt: "用户输入：{{ state.messages }}\n\n意图：{{ state.route_key }}\n路由原因：{{ state.route_reason }}\n订单信息：{{ state.order_info }}\n审批结果：{{ state.approval_result }}\n\n请给出最终客服回复。",
+        tools: "",
         maxIterations: 4,
         outputField: "agent_result",
       }),

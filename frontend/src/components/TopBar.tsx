@@ -5,6 +5,7 @@ import {
   Download,
   History,
   LayoutTemplate,
+  Map,
   Play,
   RotateCcw,
   Save,
@@ -22,6 +23,7 @@ export function TopBar() {
   const templatesOpen = useProjectStore((state) => state.templatesOpen);
   const assistantOpen = useProjectStore((state) => state.assistantOpen);
   const runOpen = useProjectStore((state) => state.runOpen);
+  const miniMapOpen = useProjectStore((state) => state.miniMapOpen);
   const backToManager = useProjectStore((state) => state.backToManager);
   const updateProjectMeta = useProjectStore((state) => state.updateProjectMeta);
   const save = useProjectStore((state) => state.save);
@@ -31,10 +33,11 @@ export function TopBar() {
   const toggleTemplates = useProjectStore((state) => state.toggleTemplates);
   const toggleAssistant = useProjectStore((state) => state.toggleAssistant);
   const toggleRunPanel = useProjectStore((state) => state.toggleRunPanel);
+  const toggleMiniMap = useProjectStore((state) => state.toggleMiniMap);
 
   return (
     <>
-      <header className="topbar glass-panel">
+      <header className="topbar glass-panel interactive-surface">
         <div className="brand">
           <div className="brand-mark">GL</div>
           <div className="brand-fields">
@@ -73,6 +76,10 @@ export function TopBar() {
           <button className={runOpen ? "is-active" : ""} onClick={toggleRunPanel} title="运行预览">
             <Play size={16} />
             <span>运行</span>
+          </button>
+          <button className={miniMapOpen ? "is-active" : ""} onClick={toggleMiniMap} title="显示或隐藏小地图">
+            <Map size={16} />
+            <span>地图</span>
           </button>
           <button className={templatesOpen ? "is-active" : ""} onClick={toggleTemplates} title="模板库">
             <LayoutTemplate size={16} />

@@ -1,10 +1,13 @@
 import { useMemo } from "react";
+import { X } from "lucide-react";
 import { useProjectStore } from "../store/projectStore";
 import type { MCPServerConfig, ModelConfig, RagKnowledgeBaseConfig, StateField, ToolConfig } from "../types";
+import { FloatingPanel } from "./FloatingPanel";
 
 export function Inspector() {
   const project = useProjectStore((state) => state.project);
   const selectedNodeId = useProjectStore((state) => state.selectedNodeId);
+  const selectNode = useProjectStore((state) => state.selectNode);
   const projects = useProjectStore((state) => state.projects);
   const workspaceTools = useProjectStore((state) => state.workspaceTools);
   const workspaceMcpServers = useProjectStore((state) => state.workspaceMcpServers);
@@ -30,28 +33,26 @@ export function Inspector() {
   const availableModelConfigs = useMemo(() => buildModelConfigOptions(workspaceModelConfigs), [workspaceModelConfigs]);
   const availableRagKnowledgeBases = useMemo(() => workspaceRagKnowledgeBases.filter((item) => item.enabled), [workspaceRagKnowledgeBases]);
 
-  if (!project) {
+  if (!project || !node) {
     return null;
   }
 
-  if (!node) {
-    return (
-      <aside className="right-panel glass-panel">
-        <div className="panel-title">
-          <span>检查器</span>
-          <small>未选中</small>
-        </div>
-        <div className="empty-state">选择一个节点后编辑配置。</div>
-      </aside>
-    );
-  }
-
   return (
-    <aside className="right-panel glass-panel">
-      <div className="panel-title">
-        <span>检查器</span>
-        <small>{node.type}</small>
-      </div>
+    <FloatingPanel
+      title="检查器"
+      subtitle={node.type}
+      className="inspector-panel"
+      initialRect={inspectorInitialRect}
+      minWidth={320}
+      minHeight={320}
+      maxWidth={560}
+      actions={
+        <button className="icon-only panel-close" onClick={() => selectNode(null)} title="关闭检查器" type="button">
+          <X size={15} />
+        </button>
+      }
+    >
+      <div className="inspector-panel__scroll">
       <Field label="节点名称">
         <input value={node.label} onChange={(event) => updateNode(node.id, { label: event.target.value })} />
       </Field>
@@ -331,6 +332,15 @@ export function Inspector() {
             nodeId={node.id}
             updateNodeConfig={updateNodeConfig}
           />
+          <Field label="路由模式">
+            <select
+              value={String(node.config.routeMode ?? "keyword")}
+              onChange={(event) => updateNodeConfig(node.id, { routeMode: event.target.value })}
+            >
+              <option value="keyword">关键词 fallback</option>
+              <option value="llm">LLM 路由</option>
+            </select>
+          </Field>
           <Field label="路由说明">
             <textarea
               rows={4}
@@ -440,6 +450,24 @@ export function Inspector() {
               value={String(node.config.authSecret ?? "")}
               onChange={(event) => updateNodeConfig(node.id, { authSecret: event.target.value })}
               placeholder="ORDER_API_TOKEN"
+            />
+          </Field>
+          <Field label="预览 Mock 响应">
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={Boolean(node.config.mockEnabled)}
+                onChange={(event) => updateNodeConfig(node.id, { mockEnabled: event.target.checked })}
+              />
+              <span>启用 mock，live preview 和导出样板会使用下方 JSON，不请求真实接口</span>
+            </label>
+          </Field>
+          <Field label="Mock JSON">
+            <textarea
+              className="code-area"
+              rows={6}
+              value={String(node.config.mockResponseJson ?? "")}
+              onChange={(event) => updateNodeConfig(node.id, { mockResponseJson: event.target.value })}
             />
           </Field>
           <Field label="Body">
@@ -618,7 +646,8 @@ export function Inspector() {
           </Field>
         </>
       )}
-    </aside>
+      </div>
+    </FloatingPanel>
   );
 }
 
@@ -631,6 +660,17 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+function inspectorInitialRect() {
+  const viewportWidth = typeof window === "undefined" ? 1440 : window.innerWidth;
+  const viewportHeight = typeof window === "undefined" ? 900 : window.innerHeight;
+  return {
+    x: Math.max(16, viewportWidth - 380),
+    y: 98,
+    width: 360,
+    height: Math.min(720, Math.max(420, viewportHeight - 118)),
+  };
+}
+
 interface ModelOption {
   id: string;
   name: string;
@@ -641,6 +681,11 @@ interface ModelConfigOption {
   name: string;
   provider: string;
   model: string;
+  baseUrl: string;
+  apiKeyEnv: string;
+  apiVersion: string;
+  organization: string;
+  apiFormat: string;
   enabled: boolean;
   models: ModelOption[];
 }
@@ -701,6 +746,11 @@ function ModelSelectionFields({
               model: nextModel,
               modelConfigId: nextConfig.id,
               modelConfigName: nextConfig.name,
+              baseUrl: nextConfig.baseUrl,
+              apiKeyEnv: nextConfig.apiKeyEnv,
+              apiVersion: nextConfig.apiVersion,
+              organization: nextConfig.organization,
+              apiFormat: nextConfig.apiFormat,
             });
           }}
         >
@@ -725,6 +775,11 @@ function ModelSelectionFields({
                 modelConfigId: selectedConfig.id,
                 modelConfigName: selectedConfig.name,
                 provider: selectedConfig.provider,
+                baseUrl: selectedConfig.baseUrl,
+                apiKeyEnv: selectedConfig.apiKeyEnv,
+                apiVersion: selectedConfig.apiVersion,
+                organization: selectedConfig.organization,
+                apiFormat: selectedConfig.apiFormat,
               });
             }}
           >
@@ -783,6 +838,11 @@ function buildModelConfigOptions(configs: ModelConfig[]): ModelConfigOption[] {
         name: config.name || "未命名模型配置",
         provider: String(config.provider || "openai"),
         model: config.model || models[0]?.id || "",
+        baseUrl: config.baseUrl,
+        apiKeyEnv: config.apiKeyEnv,
+        apiVersion: config.apiVersion,
+        organization: config.organization,
+        apiFormat: config.apiFormat,
         enabled: config.enabled !== false,
         models: ensureModelOption(models, config.model),
       };

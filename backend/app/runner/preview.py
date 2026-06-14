@@ -9,6 +9,8 @@ from typing import Any, Literal
 from urllib import request as urllib_request
 from urllib.error import URLError
 
+import httpx
+
 from app.config import ROOT_DIR
 from app.ir.schemas import EdgeKind, NodeIR, NodeType, ProjectIR
 
@@ -57,6 +59,15 @@ def run_project_preview(
     model_config: ModelRuntimeConfig = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     return _walk_project(project, _normalize_input(input_state), mode, _normalize_model_config(model_config))
+
+
+def iter_project_preview_events(
+    project: ProjectIR,
+    input_state: dict[str, Any],
+    mode: RunMode = "dry",
+    model_config: ModelRuntimeConfig = None,
+):
+    yield from _walk_project_events(project, _normalize_input(input_state), mode, _normalize_model_config(model_config))
 
 
 def _walk_project(
@@ -133,6 +144,105 @@ def _walk_project(
     return trace, state
 
 
+def _walk_project_events(
+    project: ProjectIR,
+    input_state: dict[str, Any],
+    mode: RunMode,
+    model_config: ModelRuntimeConfig,
+):
+    nodes = {node.id: node for node in project.nodes}
+    outgoing: dict[str, list] = {}
+    for edge in project.edges:
+        outgoing.setdefault(edge.source, []).append(edge)
+
+    start = next((node for node in project.nodes if node.type == NodeType.START), None)
+    state = dict(input_state)
+    trace: list[dict[str, Any]] = []
+    if not start:
+        yield {
+            "event": "run_end",
+            "trace": trace,
+            "outputState": _compact_state(state),
+        }
+        return
+
+    current = _first_target(outgoing.get(start.id, []))
+    visited = 0
+    while current and current in nodes and visited < MAX_STEPS:
+        visited += 1
+        node = nodes[current]
+        before = dict(state)
+        yield {
+            "event": "node_start",
+            "nodeId": node.id,
+            "type": str(node.type),
+            "label": node.label,
+            "inputState": _compact_state(before),
+        }
+        started = time.perf_counter()
+        try:
+            delta, detail = _execute_node(node, state, mode, model_config)
+            state.update(delta)
+            status = "ok"
+        except Exception as exc:  # Keep streamed events structured instead of surfacing a 500.
+            delta = {}
+            detail = _format_error(exc)
+            status = "error"
+
+        trace_item = {
+            "nodeId": node.id,
+            "type": str(node.type),
+            "label": node.label,
+            "status": status,
+            "detail": detail,
+            "durationMs": round((time.perf_counter() - started) * 1000, 2),
+            "inputState": _compact_state(before),
+            "outputDelta": _compact_state(delta),
+        }
+        trace.append(trace_item)
+        yield {
+            "event": "node_end",
+            "traceItem": trace_item,
+            "outputState": _compact_state(state),
+        }
+        if status == "error" or node.type == NodeType.DIRECT_REPLY:
+            break
+
+        edges = outgoing.get(node.id, [])
+        if not edges:
+            break
+        conditional_edges = [edge for edge in edges if edge.kind == EdgeKind.CONDITIONAL]
+        if conditional_edges:
+            handle = _choose_handle(node, state)
+            current = _target_for_handle(conditional_edges, handle) or _first_target(conditional_edges)
+        else:
+            current = _first_target(edges)
+
+    if visited >= MAX_STEPS:
+        trace_item = {
+            "nodeId": "__runtime__",
+            "type": "custom_function",
+            "label": "运行预览",
+            "status": "error",
+            "detail": f"路径超过 {MAX_STEPS} 步，可能存在循环。",
+            "durationMs": 0,
+            "inputState": _compact_state(state),
+            "outputDelta": {},
+        }
+        trace.append(trace_item)
+        yield {
+            "event": "node_end",
+            "traceItem": trace_item,
+            "outputState": _compact_state(state),
+        }
+
+    yield {
+        "event": "run_end",
+        "trace": trace,
+        "outputState": _compact_state(state),
+    }
+
+
 def _execute_node(
     node: NodeIR,
     state: dict[str, Any],
@@ -198,16 +308,20 @@ def _execute_live_node(
     config = node.config
     if node.type == NodeType.LLM:
         return _execute_live_llm(node, state, model_config)
+    if node.type == NodeType.AGENT:
+        return _execute_live_agent(node, state, model_config)
+    if node.type == NodeType.TOOL:
+        return _execute_live_tool(node, state)
     if node.type == NodeType.RETRIEVER:
         return _execute_live_retriever(node, state)
     if node.type == NodeType.CONDITION:
         return {}, f"按 state.{config.get('field', 'intent')} 选择分支"
     if node.type == NodeType.AI_ROUTER:
-        field = str(config.get("routeField", "route_key"))
-        fallback = str(config.get("fallback", "other"))
-        route = _infer_router_key(config, state) or fallback
-        reason_field = str(config.get("reasonField", "route_reason"))
-        return {field: route, reason_field: "live-run v1 keyword router"}, f"v1 使用关键词路由，选择 {route}"
+        return _execute_live_ai_router(node, state, model_config)
+    if node.type == NodeType.HUMAN_APPROVAL:
+        return _execute_live_human_approval(node, state)
+    if node.type == NodeType.HTTP:
+        return _execute_live_http(node, state)
     if node.type == NodeType.DIRECT_REPLY:
         field = str(config.get("outputField", "final_answer"))
         content = render_template(str(config.get("template", "{{ state.final_answer }}")), state)
@@ -217,8 +331,7 @@ def _execute_live_node(
 
 def _execute_live_llm(node: NodeIR, state: dict[str, Any], model_config: ModelRuntimeConfig) -> tuple[dict[str, Any], str]:
     config = node.config
-    provider = _runtime_value(model_config, "provider") or str(config.get("provider", "openai")).strip() or "openai"
-    model = _runtime_value(model_config, "model") or str(config.get("model", "gpt-4.1-mini")).strip() or "gpt-4.1-mini"
+    provider, model = _resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
     system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip()
     user_prompt = render_template(str(config.get("userPrompt", "{{ state.messages }}")), state).strip()
     messages: list[tuple[str, str]] = []
@@ -231,6 +344,110 @@ def _execute_live_llm(node: NodeIR, state: dict[str, Any], model_config: ModelRu
     config_name = _runtime_value(model_config, "name")
     suffix = f"（{config_name}）" if config_name else ""
     return {output_field: content}, f"真实调用 {provider}/{model}{suffix}，输出到 state.{output_field}"
+
+
+def _execute_live_agent(node: NodeIR, state: dict[str, Any], model_config: ModelRuntimeConfig) -> tuple[dict[str, Any], str]:
+    config = node.config
+    provider, model = _resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
+    system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip()
+    user_prompt = str(config.get("userPrompt", "")).strip()
+    if user_prompt:
+        user_text = render_template(user_prompt, state)
+    else:
+        user_text = _agent_state_prompt(state)
+    messages: list[tuple[str, str]] = []
+    if system_prompt:
+        messages.append(("system", system_prompt))
+    messages.append(("user", user_text))
+    response = _call_chat_model(provider, model, messages, model_config)
+    content = getattr(response, "content", str(response))
+    output_field = str(config.get("outputField", f"{node.id}_result"))
+    tools = str(config.get("tools", "")).strip()
+    tool_hint = f"，参考工具/前置结果：{tools}" if tools else ""
+    return {output_field: content}, f"真实调用 Agent 模型 {provider}/{model}{tool_hint}，输出到 state.{output_field}"
+
+
+def _execute_live_ai_router(node: NodeIR, state: dict[str, Any], model_config: ModelRuntimeConfig) -> tuple[dict[str, Any], str]:
+    config = node.config
+    field = str(config.get("routeField", "route_key"))
+    fallback = str(config.get("fallback", "other"))
+    reason_field = str(config.get("reasonField", "route_reason"))
+    keyword_route = _infer_router_key(config, state) or fallback
+    if str(config.get("routeMode", "keyword")) != "llm":
+        return {field: keyword_route, reason_field: "live-run keyword router"}, f"关键词路由选择 {keyword_route}"
+
+    provider, model = _resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
+    text = render_template(str(config.get("inputText", "{{ state.messages }}")), state)
+    prompt = _router_prompt(str(config.get("instruction", "")), text, _parse_router_scenarios(str(config.get("scenarios", ""))), fallback)
+    try:
+        response = _call_chat_model(provider, model, [("user", prompt)], model_config)
+    except Exception as exc:
+        return {field: keyword_route, reason_field: f"llm router failed, fallback to keyword: {exc}"}, f"LLM 路由失败，回退到 {keyword_route}"
+    route = _normalize_route_key(getattr(response, "content", str(response)), config, fallback)
+    return {field: route, reason_field: "live-run llm router"}, f"LLM 路由选择 {route}"
+
+
+def _execute_live_human_approval(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    config = node.config
+    action_field = str(config.get("actionField", "approval_action"))
+    output_field = str(config.get("outputField", "approval_result"))
+    action = str(state.get(action_field) or config.get("previewAction") or config.get("defaultAction", "approved"))
+    prompt = render_template(str(config.get("prompt", "")), state)
+    result = {
+        "action": action,
+        "prompt": prompt,
+        "status": "live-preview",
+    }
+    return {action_field: action, output_field: result}, f"使用预览审批动作 {action}，继续流程"
+
+
+def _execute_live_http(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    config = node.config
+    output_field = str(config.get("outputField", f"{node.id}_response"))
+    if _truthy(config.get("mockEnabled")) or str(config.get("mockResponseJson", "")).strip():
+        value = _render_mock_response(str(config.get("mockResponseJson", "")), state)
+        return {output_field: value}, f"使用 HTTP mock 响应写入 state.{output_field}"
+
+    method = str(config.get("method", "GET")).upper()
+    url = render_template(str(config.get("url", "")), state).strip()
+    if not url:
+        raise RuntimeError("HTTP 节点缺少 URL。")
+    headers: dict[str, str] = {}
+    auth_secret = str(config.get("authSecret", "")).strip()
+    if auth_secret:
+        token = os.getenv(auth_secret, "").strip()
+        if not token:
+            raise RuntimeError(f"HTTP 节点引用的环境变量 {auth_secret} 未设置。")
+        headers["Authorization"] = f"Bearer {token}"
+    body = str(config.get("body", ""))
+    response = httpx.request(
+        method,
+        url,
+        headers=headers,
+        content=render_template(body, state) if body else None,
+        timeout=_positive_float(config.get("timeoutSeconds", 30), 30),
+    )
+    response.raise_for_status()
+    try:
+        value = response.json()
+    except ValueError:
+        value = response.text
+    return {output_field: value}, f"真实 HTTP {method} {url}，写入 state.{output_field}"
+
+
+def _execute_live_tool(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    config = node.config
+    source = str(config.get("source", "")).strip().lower()
+    if source == "http" or str(config.get("url", "")).strip() or str(config.get("mockResponseJson", "")).strip():
+        return _execute_live_http(node, state)
+    output_field = str(config.get("outputField", f"{node.id}_result"))
+    return {
+        output_field: {
+            "tool": config.get("toolName", node.label),
+            "source": source or "declarative",
+            "status": "configured",
+        }
+    }, f"声明式 Tool 已记录到 state.{output_field}"
 
 
 def _execute_live_retriever(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -480,7 +697,7 @@ def _call_chat_model(
 ) -> Any:
     provider_key = _normalize_provider(provider)
     base_url = _runtime_value(runtime_config, "baseUrl", "base_url")
-    api_key_env = _runtime_value(runtime_config, "apiKeyEnv", "api_key_env")
+    api_key_env = _safe_api_key_env(_runtime_value(runtime_config, "apiKeyEnv", "api_key_env"))
     api_key = _runtime_value(runtime_config, "apiKey", "api_key") or _read_api_key(api_key_env)
     organization = _runtime_value(runtime_config, "organization")
     api_version = _runtime_value(runtime_config, "apiVersion", "api_version")
@@ -521,6 +738,8 @@ def _call_openai_compatible(
 
     resolved_base_url = base_url or OPENAI_COMPATIBLE_BASE_URLS.get(provider, "")
     resolved_api_key = api_key or ("ollama" if provider == "ollama" else "")
+    if not resolved_api_key and resolved_base_url and not api_key_env:
+        resolved_api_key = "not-needed"
     if not resolved_api_key and api_key_env:
         raise RuntimeError(f"模型配置引用的环境变量 {api_key_env} 未设置。")
 
@@ -584,10 +803,32 @@ def _runtime_value(config: ModelRuntimeConfig, *keys: str) -> str:
     return ""
 
 
+def _resolve_node_model(
+    config: dict[str, Any],
+    runtime_config: ModelRuntimeConfig,
+    default_provider: str,
+    default_model: str,
+) -> tuple[str, str]:
+    node_provider = str(config.get("provider", "")).strip()
+    node_model = str(config.get("model", "")).strip()
+    runtime_provider = _runtime_value(runtime_config, "provider")
+    runtime_model = _runtime_value(runtime_config, "model")
+    has_explicit_node_model = bool(config.get("modelConfigId") or config.get("modelConfigName")) or (
+        bool(node_model) and node_model != default_model
+    )
+    if has_explicit_node_model:
+        return node_provider or runtime_provider or default_provider, node_model or runtime_model or default_model
+    return runtime_provider or node_provider or default_provider, runtime_model or node_model or default_model
+
+
 def _read_api_key(api_key_env: str) -> str:
     if not api_key_env:
         return ""
     return os.getenv(api_key_env, "").strip()
+
+
+def _safe_api_key_env(value: str) -> str:
+    return value if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value or "") else ""
 
 
 def _normalize_provider(provider: str) -> str:
@@ -679,6 +920,73 @@ def _infer_router_key(config: dict[str, Any], state: dict[str, Any]) -> str | No
     return None
 
 
+def _parse_router_scenarios(value: str) -> list[dict[str, Any]]:
+    scenarios: list[dict[str, Any]] = []
+    for line in value.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        scenario_id, label, keywords = (line.split(":", 2) + ["", ""])[:3]
+        scenario_id = scenario_id.strip()
+        if not scenario_id:
+            continue
+        scenarios.append(
+            {
+                "id": scenario_id,
+                "label": label.strip() or scenario_id,
+                "keywords": [item.strip() for item in keywords.split(",") if item.strip()],
+            }
+        )
+    return scenarios
+
+
+def _router_prompt(instruction: str, text: str, scenarios: list[dict[str, Any]], fallback: str) -> str:
+    lines = [instruction.strip() or "请判断输入属于哪个路由场景，只输出 route key。"]
+    lines.append("可选场景：")
+    for scenario in scenarios:
+        lines.append(f"- {scenario['id']}: {scenario.get('label') or scenario['id']}")
+    lines.append(f"fallback: {fallback}")
+    lines.append("输入：")
+    lines.append(text)
+    return "\n".join(lines)
+
+
+def _normalize_route_key(value: str, config: dict[str, Any], fallback: str) -> str:
+    allowed = {fallback}
+    allowed.update(scenario["id"] for scenario in _parse_router_scenarios(str(config.get("scenarios", ""))))
+    text = value.strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            text = str(parsed.get("route") or parsed.get("route_key") or parsed.get("key") or "")
+    except json.JSONDecodeError:
+        pass
+    for key in sorted(allowed, key=len, reverse=True):
+        if key and key in text:
+            return key
+    return fallback
+
+
+def _agent_state_prompt(state: dict[str, Any]) -> str:
+    user_text = _state_value_to_text(state.get("messages", ""))
+    compact = json.dumps(_compact_state(state), ensure_ascii=False, indent=2)
+    return f"用户输入：\n{user_text}\n\n当前流程 state：\n{compact}"
+
+
+def _render_mock_response(raw: str, state: dict[str, Any]) -> Any:
+    rendered = render_template(raw.strip() or "{}", state)
+    try:
+        return json.loads(rendered)
+    except json.JSONDecodeError:
+        return rendered
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
 def _normalize_input(input_state: dict[str, Any]) -> dict[str, Any]:
     state = dict(input_state)
     if "messages" not in state:
@@ -731,6 +1039,14 @@ def _resolve_path(value: str) -> Path:
 def _positive_int(value: Any, fallback: int) -> int:
     try:
         parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+def _positive_float(value: Any, fallback: float) -> float:
+    try:
+        parsed = float(value)
     except (TypeError, ValueError):
         return fallback
     return parsed if parsed > 0 else fallback

@@ -66,7 +66,7 @@ export function NodePalette() {
 
   if (collapsed) {
     return (
-      <aside className="left-panel left-panel--collapsed glass-panel">
+      <aside className="left-panel left-panel--collapsed glass-panel interactive-surface">
         <button className="palette-collapse-button" onClick={() => setCollapsed(false)} title="展开节点库" type="button">
           <PanelLeftOpen size={17} />
           <span>节点库</span>
@@ -76,7 +76,7 @@ export function NodePalette() {
   }
 
   return (
-    <aside className="left-panel glass-panel">
+    <aside className="left-panel glass-panel interactive-surface">
       <div className="panel-title">
         <span>节点库</span>
         <span className="panel-title__actions">

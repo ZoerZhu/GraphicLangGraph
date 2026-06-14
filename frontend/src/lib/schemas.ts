@@ -123,6 +123,7 @@ export const ValidationResultSchema = z.object({
       nodeId: z.string().nullable().optional(),
       edgeId: z.string().nullable().optional(),
       field: z.string().nullable().optional(),
+      suggestion: z.string().nullable().optional(),
     }),
   ),
 });
@@ -131,6 +132,14 @@ export const ExportResponseSchema = z.object({
   exportId: z.string(),
   downloadUrl: z.string(),
   files: z.array(z.string()),
+  smokeTest: z.object({
+    passed: z.boolean(),
+    command: z.array(z.string()),
+    exitCode: z.number(),
+    durationMs: z.number(),
+    stdout: z.string(),
+    stderr: z.string(),
+  }),
 });
 
 export const ModelConfigSchema = z.object({
@@ -191,6 +200,20 @@ export const RagKnowledgeBaseSchema = z.object({
 });
 
 export const RagKnowledgeBaseListSchema = z.array(RagKnowledgeBaseSchema);
+
+export const RagKnowledgeBaseInspectionSchema = z.object({
+  exists: z.boolean(),
+  sourceType: z.string(),
+  path: z.string(),
+  url: z.string(),
+  collection: z.string(),
+  description: z.string(),
+  embeddingModel: z.string(),
+  topK: z.number(),
+  metadataJson: z.string(),
+  detectedFiles: z.array(z.string()),
+  warnings: z.array(z.string()),
+});
 
 export const RunPreviewResultSchema = z.object({
   mode: z.enum(["dry", "live"]),

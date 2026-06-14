@@ -1,10 +1,12 @@
 import { AlertCircle, CheckCircle2, Download, FileArchive } from "lucide-react";
 import { useProjectStore } from "../store/projectStore";
+import type { ValidationIssue } from "../types";
 
 export function BottomPanel() {
   const validation = useProjectStore((state) => state.validation);
   const exportResult = useProjectStore((state) => state.exportResult);
   const status = useProjectStore((state) => state.status);
+  const selectNode = useProjectStore((state) => state.selectNode);
 
   return (
     <section className="bottom-panel glass-panel">
@@ -14,10 +16,16 @@ export function BottomPanel() {
       </div>
       <div className="issues">
         {validation?.issues.slice(0, 4).map((issue) => (
-          <span key={`${issue.code}-${issue.nodeId ?? issue.edgeId ?? issue.field}`} className={`issue ${issue.severity}`}>
-            {issue.nodeId ? `${issue.nodeId}: ` : ""}
-            {issue.message}
-          </span>
+          <button
+            key={`${issue.code}-${issue.nodeId ?? issue.edgeId ?? issue.field}`}
+            className={`issue ${issue.severity}`}
+            disabled={!issue.nodeId}
+            onClick={() => issue.nodeId && selectNode(issue.nodeId)}
+            title={formatIssue(issue)}
+            type="button"
+          >
+            {formatIssue(issue)}
+          </button>
         ))}
       </div>
       {exportResult && (
@@ -31,3 +39,8 @@ export function BottomPanel() {
   );
 }
 
+function formatIssue(issue: ValidationIssue) {
+  const location = issue.nodeId ? `${issue.nodeId}: ` : "";
+  const suggestion = issue.suggestion ? ` · ${issue.suggestion}` : "";
+  return `${location}${issue.message}${suggestion}`;
+}

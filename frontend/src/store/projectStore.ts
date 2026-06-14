@@ -21,12 +21,12 @@ import {
   listWorkspaceModelConfigs,
   listWorkspaceTools,
   listProjects,
-  runProjectPreview,
   saveWorkspaceMcpServers,
   saveWorkspaceRagKnowledgeBases,
   saveWorkspaceModelConfigs,
   saveWorkspaceTools,
   saveProject,
+  streamProjectPreview,
   validateProject,
 } from "../lib/api";
 import { createNode, defaultOutputs } from "../lib/nodeCatalog";
@@ -38,6 +38,7 @@ import type {
   ImportedAgentConfig,
   MCPServerConfig,
   ModelConfig,
+  NodeRuntimeState,
   NodeIR,
   NodeType,
   ProjectHistoryRecord,
@@ -46,6 +47,8 @@ import type {
   RagKnowledgeBaseConfig,
   RunMode,
   RunPreviewResult,
+  RunStreamEvent,
+  RunTraceItem,
   StateField,
   ToolConfig,
   ValidationResult,
@@ -74,6 +77,7 @@ interface ProjectStore {
   validation: ValidationResult | null;
   exportResult: ExportResponse | null;
   historyOpen: boolean;
+  miniMapOpen: boolean;
   historyRecords: ProjectHistoryRecord[];
   selectedHistoryId: string | null;
   templatesOpen: boolean;
@@ -83,6 +87,7 @@ interface ProjectStore {
   runInput: string;
   selectedRunModelConfigId: string | null;
   runResult: RunPreviewResult | null;
+  runtimeNodes: Record<string, NodeRuntimeState>;
   status: string;
   loading: boolean;
   initialize: () => Promise<void>;
@@ -119,6 +124,7 @@ interface ProjectStore {
   save: () => Promise<void>;
   saveBeforeUnload: () => void;
   toggleHistory: () => void;
+  toggleMiniMap: () => void;
   closeHistory: () => void;
   selectHistoryRecord: (recordId: string) => void;
   restoreHistoryRecord: (recordId: string) => Promise<void>;
@@ -168,15 +174,17 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   validation: null,
   exportResult: null,
   historyOpen: false,
+  miniMapOpen: true,
   historyRecords: [],
   selectedHistoryId: null,
   templatesOpen: false,
   assistantOpen: false,
   runOpen: false,
-  runMode: "dry",
-  runInput: "{\n  \"messages\": \"我想查询订单物流\"\n}",
+  runMode: "live",
+  runInput: "{\n  \"messages\": \"请在这里输入测试问题\"\n}",
   selectedRunModelConfigId: null,
   runResult: null,
+  runtimeNodes: {},
   status: "未连接后端",
   loading: false,
 
@@ -274,6 +282,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       historyRecords: readHistory(project.project.id),
       selectedHistoryId: null,
       historyOpen: false,
+      miniMapOpen: true,
       templatesOpen: false,
       assistantOpen: false,
       runOpen: false,
@@ -302,6 +311,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       historyRecords: recordProjectHistory(project, "创建项目"),
       selectedHistoryId: null,
       historyOpen: false,
+      miniMapOpen: true,
       templatesOpen: false,
       assistantOpen: false,
       runOpen: false,
@@ -348,6 +358,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       validation: null,
       exportResult: null,
       historyOpen: false,
+      miniMapOpen: true,
       historyRecords: [],
       selectedHistoryId: null,
       templatesOpen: false,
@@ -627,6 +638,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     }));
   },
 
+  toggleMiniMap() {
+    set((state) => ({ miniMapOpen: !state.miniMapOpen }));
+  },
+
   closeHistory() {
     set({ historyOpen: false });
   },
@@ -798,33 +813,37 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       set({ status: "运行输入必须是合法 JSON" });
       return;
     }
-    const runMode = get().runMode;
+    const runMode: RunMode = "live";
     const workspaceModelConfigs = normalizeModelConfigs(get().workspaceModelConfigs);
     const selectedRunModelConfigId = pickModelConfigId(workspaceModelConfigs, get().selectedRunModelConfigId);
-    const selectedModelConfig =
-      runMode === "live"
-        ? workspaceModelConfigs.find((config) => config.id === selectedRunModelConfigId && config.enabled)
-        : undefined;
-    if (runMode === "live" && !selectedModelConfig) {
+    const selectedModelConfig = workspaceModelConfigs.find((config) => config.id === selectedRunModelConfigId && config.enabled);
+    if (!selectedModelConfig) {
       set({ status: "请先在管理页添加并启用一个模型配置" });
       return;
     }
-    set({ status: runMode === "live" ? "正在真实运行" : "正在模拟运行", runResult: null });
+    set({
+      runMode,
+      status: "正在真实运行",
+      runResult: null,
+      runtimeNodes: initializeRuntimeNodes(project),
+    });
     const saved = await saveProject(project);
     const historyRecords = recordProjectHistory(saved, "运行预览前保存");
-    const runResult = await runProjectPreview(saved.project.id, input, runMode, selectedModelConfig);
     set({
       project: saved,
       historyRecords,
-      runResult,
       runOpen: true,
       selectedRunModelConfigId,
-      status: runResult.valid
-        ? runResult.mode === "live"
-          ? "真实运行完成"
-          : "模拟运行完成"
-        : "运行预览完成，但图校验未通过",
     });
+    try {
+      await streamProjectPreview(saved.project.id, input, runMode, selectedModelConfig, (event) => {
+        set((state) => applyRunStreamEvent(state, event));
+      });
+    } catch (error) {
+      set({
+        status: error instanceof Error ? error.message : "真实运行失败",
+      });
+    }
   },
 
   async openSplitAgent(projectId) {
@@ -905,7 +924,12 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       link.click();
       link.remove();
     }
-    set({ project: saved, historyRecords, exportResult: result, status: "ZIP 已导出" });
+    set({
+      project: saved,
+      historyRecords,
+      exportResult: result,
+      status: result.smokeTest.passed ? `ZIP 已导出，smoke test 通过（${result.smokeTest.durationMs}ms）` : "ZIP 已导出，但 smoke test 未通过",
+    });
   },
 }));
 
@@ -1007,7 +1031,7 @@ function normalizeModelConfigs(configs: ModelConfig[]): ModelConfig[] {
       provider: String(config.provider || "openai"),
       model: String(config.model || "gpt-4.1-mini"),
       baseUrl: String(config.baseUrl || ""),
-      apiKey: String(config.apiKey || ""),
+      apiKey: "",
       apiKeyEnv: String(config.apiKeyEnv || ""),
       apiVersion: String(config.apiVersion || ""),
       organization: String(config.organization || ""),
@@ -1149,6 +1173,104 @@ function cloneProject(project: ProjectIR): ProjectIR {
   return JSON.parse(JSON.stringify(project)) as ProjectIR;
 }
 
+function initializeRuntimeNodes(project: ProjectIR): Record<string, NodeRuntimeState> {
+  const now = new Date().toISOString();
+  const nodes: Record<string, NodeRuntimeState> = {};
+  for (const node of project.nodes) {
+    if (node.type === "start") continue;
+    nodes[node.id] = {
+      status: "queued",
+      label: node.label,
+      detail: "等待运行",
+      durationMs: 0,
+      inputState: {},
+      outputDelta: {},
+      updatedAt: now,
+    };
+  }
+  return nodes;
+}
+
+function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partial<ProjectStore> {
+  const now = new Date().toISOString();
+  if (event.event === "run_start") {
+    return {
+      runResult: {
+        mode: event.mode,
+        valid: event.valid,
+        issues: event.issues,
+        trace: [],
+        outputState: event.inputState,
+      },
+      status: event.valid ? "真实运行开始" : "图校验未通过，未开始真实运行",
+    };
+  }
+  if (event.event === "node_start") {
+    return {
+      runtimeNodes: {
+        ...state.runtimeNodes,
+        [event.nodeId]: {
+          status: "running",
+          label: event.label,
+          detail: "运行中",
+          durationMs: 0,
+          inputState: event.inputState,
+          outputDelta: {},
+          updatedAt: now,
+        },
+      },
+      runResult: state.runResult
+        ? { ...state.runResult, valid: event.valid, issues: event.issues }
+        : { mode: event.mode, valid: event.valid, issues: event.issues, trace: [], outputState: event.inputState },
+      status: `正在运行：${event.label}`,
+      selectedNodeId: event.nodeId,
+    };
+  }
+  if (event.event === "node_end") {
+    const trace = upsertTraceItem(state.runResult?.trace ?? [], event.traceItem);
+    const nodeRuntime: NodeRuntimeState = {
+      status: event.traceItem.status,
+      label: event.traceItem.label,
+      detail: event.traceItem.detail,
+      durationMs: event.traceItem.durationMs,
+      inputState: event.traceItem.inputState,
+      outputDelta: event.traceItem.outputDelta,
+      updatedAt: now,
+    };
+    return {
+      runtimeNodes: {
+        ...state.runtimeNodes,
+        [event.traceItem.nodeId]: nodeRuntime,
+      },
+      runResult: {
+        mode: event.mode,
+        valid: event.valid,
+        issues: event.issues,
+        trace,
+        outputState: event.outputState,
+      },
+      status: event.traceItem.status === "error" ? `运行失败：${event.traceItem.label}` : `节点完成：${event.traceItem.label}`,
+      selectedNodeId: event.traceItem.nodeId,
+    };
+  }
+  return {
+    runResult: {
+      mode: event.mode,
+      valid: event.valid,
+      issues: event.issues,
+      trace: event.trace,
+      outputState: event.outputState,
+    },
+    status: event.valid ? "真实运行完成" : "运行预览完成，但图校验未通过",
+  };
+}
+
+function upsertTraceItem(trace: RunTraceItem[], item: RunTraceItem): RunTraceItem[] {
+  const index = trace.findIndex((current) => current.nodeId === item.nodeId);
+  if (index === -1) return [...trace, item];
+  return trace.map((current, currentIndex) => (currentIndex === index ? item : current));
+}
+
 function createHistoryId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return `history_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -1156,7 +1278,7 @@ function createHistoryId() {
   return `history_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
 }
 
-export function toReactFlowNodes(project: ProjectIR): Node[] {
+export function toReactFlowNodes(project: ProjectIR, runtimeNodes: Record<string, NodeRuntimeState> = {}): Node[] {
   return project.nodes.map((node) => ({
     id: node.id,
     type: "agentNode",
@@ -1168,6 +1290,7 @@ export function toReactFlowNodes(project: ProjectIR): Node[] {
       config: node.config,
       inputs: node.inputs,
       outputs: node.outputs,
+      runtime: runtimeNodes[node.id] ?? null,
     },
   }));
 }

@@ -105,6 +105,7 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
       return {
         provider: "openai",
         model: "gpt-4.1-mini",
+        routeMode: "keyword",
         instruction: "判断用户需求属于哪个场景，只输出路由 key。",
         inputText: "{{ state.messages }}",
         scenarios: "order:订单问题:订单,物流,发货\nrefund:退款问题:退款,退货,赔付\nother:其他问题:",
@@ -126,6 +127,8 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         url: "https://api.example.com/items/{{ state.item_id }}",
         body: "",
         authSecret: "",
+        mockEnabled: false,
+        mockResponseJson: "{\n  \"status\": \"ok\"\n}",
         outputField: "http_response",
       };
     case "direct_reply":

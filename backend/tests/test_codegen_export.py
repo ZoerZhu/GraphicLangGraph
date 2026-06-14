@@ -45,10 +45,11 @@ def test_codegen_contains_required_files():
 
 
 def test_export_zip_contains_required_files():
-    export_id, zip_path, files = export_project_zip(sample_project())
+    export_id, zip_path, files, smoke_test = export_project_zip(sample_project())
 
     assert export_id
     assert zip_path.exists()
+    assert smoke_test.passed
     assert "langgraph.json" in files
     with zipfile.ZipFile(zip_path) as archive:
         names = set(archive.namelist())
@@ -107,3 +108,84 @@ def test_codegen_supports_mvp_nodes():
     assert "def retriever_1" in nodes_py
     assert "def agent_1" in nodes_py
     assert "def route_router_1" in routers_py
+
+
+def test_codegen_human_approval_uses_interrupt_and_checkpointer():
+    project = create_default_project("审批 Agent")
+    project.state.fields.extend(
+        [
+            StateField(name="approval_action", type="str"),
+            StateField(name="approval_result", type="dict"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="approval_1",
+                type=NodeType.HUMAN_APPROVAL,
+                label="审批",
+                config={"fallback": "rejected", "actionField": "approval_action", "outputField": "approval_result"},
+            ),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复"),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="approval_1"),
+            EdgeIR(id="e2", source="approval_1", sourceHandle="approved", target="reply_1", kind=EdgeKind.CONDITIONAL),
+            EdgeIR(id="e3", source="approval_1", sourceHandle="rejected", target="reply_1", kind=EdgeKind.CONDITIONAL),
+        ]
+    )
+
+    files = generate_project_files(project)
+    nodes_py = next(value for path, value in files.items() if path.endswith("/nodes.py"))
+    graph_py = next(value for path, value in files.items() if path.endswith("/graph.py"))
+
+    assert "interrupt(payload)" in nodes_py
+    assert "InMemorySaver" in graph_py
+    assert "compile(checkpointer=checkpointer)" in graph_py
+
+
+def test_codegen_sanitizes_flow_project_json():
+    project = sample_project()
+    project.nodes[1].config["apiKey"] = "sk-test"
+
+    files = generate_project_files(project)
+    flow_json = files["flow/project.graph.json"]
+
+    assert "sk-test" not in flow_json
+    assert '"apiKey": ""' in flow_json
+
+
+def test_codegen_http_node_preserves_mock_response():
+    project = create_default_project("HTTP Mock Agent")
+    project.state.fields.extend([StateField(name="http_response", type="dict"), StateField(name="final_answer", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="http_1",
+                type=NodeType.HTTP,
+                label="HTTP Mock",
+                config={
+                    "mockEnabled": True,
+                    "mockResponseJson": '{"status":"ok","order_id":"{{ state.order_id }}"}',
+                    "outputField": "http_response",
+                },
+            ),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复", config={"template": "{{ state.http_response }}"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="http_1"),
+            EdgeIR(id="e2", source="http_1", target="reply_1"),
+        ]
+    )
+
+    files = generate_project_files(project)
+    nodes_py = next(value for path, value in files.items() if path.endswith("/nodes.py"))
+
+    assert "_render_json_template" in nodes_py
+    assert "mockEnabled" not in nodes_py
+    assert "status" in nodes_py
+    assert "ok" in nodes_py

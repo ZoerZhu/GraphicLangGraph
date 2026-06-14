@@ -16,7 +16,7 @@ import {
   Wrench
 } from "lucide-react";
 import { useProjectStore } from "../store/projectStore";
-import type { NodeType, Port } from "../types";
+import type { NodeRuntimeState, NodeType, Port } from "../types";
 
 interface AgentNodeData {
   id: string;
@@ -25,6 +25,7 @@ interface AgentNodeData {
   config: Record<string, unknown>;
   inputs: Port[];
   outputs: Port[];
+  runtime?: NodeRuntimeState | null;
 }
 
 const ICONS = {
@@ -50,9 +51,10 @@ export function AgentNode({ id, data, selected }: { id: string; data: AgentNodeD
   const handlePortClick = useProjectStore((state) => state.handlePortClick);
   const selectNode = useProjectStore((state) => state.selectNode);
   const summary = nodeSummary(data.nodeType, data.config);
+  const runtime = data.runtime ?? null;
   return (
     <div
-      className={`agent-node ${hasManyOutputs ? "has-ports" : ""} ${selected ? "is-selected" : ""}`}
+      className={`agent-node ${hasManyOutputs ? "has-ports" : ""} ${selected ? "is-selected" : ""} ${runtime ? `is-runtime-${runtime.status}` : ""}`}
       data-node-type={data.nodeType}
       onClick={() => selectNode(id)}
     >
@@ -106,6 +108,18 @@ export function AgentNode({ id, data, selected }: { id: string; data: AgentNodeD
           ))}
         </div>
       )}
+      {runtime ? (
+        <div className="agent-node__runtime">
+          <div className="agent-node__runtime-head">
+            <span>{runtimeStatusLabel(runtime.status)}</span>
+            {runtime.durationMs ? <small>{runtime.durationMs}ms</small> : null}
+          </div>
+          {runtime.detail ? <div className="agent-node__runtime-detail">{runtime.detail}</div> : null}
+          {Object.keys(runtime.outputDelta).length ? (
+            <pre className="agent-node__runtime-output">{formatRuntimeValue(runtime.outputDelta)}</pre>
+          ) : null}
+        </div>
+      ) : null}
       {data.outputs.map((port, index) => (
         <Handle
           key={port.id}
@@ -123,6 +137,28 @@ export function AgentNode({ id, data, selected }: { id: string; data: AgentNodeD
       ))}
     </div>
   );
+}
+
+function runtimeStatusLabel(status: NodeRuntimeState["status"]) {
+  switch (status) {
+    case "queued":
+      return "等待运行";
+    case "running":
+      return "运行中";
+    case "ok":
+      return "运行完成";
+    case "error":
+      return "运行失败";
+    case "skipped":
+      return "已跳过";
+    default:
+      return "未运行";
+  }
+}
+
+function formatRuntimeValue(value: Record<string, unknown>) {
+  const textValue = JSON.stringify(value, null, 2);
+  return textValue.length > 520 ? `${textValue.slice(0, 520)}...` : textValue;
 }
 
 function nodeSummary(type: NodeType, config: Record<string, unknown>) {
@@ -159,8 +195,8 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
       ];
     case "ai_router":
       return [
+        { label: "模式", value: text(config.routeMode, "keyword") },
         { label: "路由", value: text(config.routeField, "route_key") },
-        { label: "兜底", value: text(config.fallback, "other") },
       ];
     case "human_approval":
       return [

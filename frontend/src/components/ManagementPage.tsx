@@ -11,10 +11,12 @@ import {
   Network,
   Plus,
   Save,
+  Search,
   Server,
   Trash2,
   Wrench,
 } from "lucide-react";
+import { inspectRagKnowledgeBasePath } from "../lib/api";
 import { useProjectStore } from "../store/projectStore";
 import type { MCPServerConfig, ModelConfig, ProjectListItem, RagKnowledgeBaseConfig, ToolConfig } from "../types";
 
@@ -867,6 +869,56 @@ function RagManagerContent({
   onDelete: () => void;
   onCancel: () => void;
 }) {
+  const [inspectPath, setInspectPath] = useState(draft.path);
+  const [inspectMessage, setInspectMessage] = useState("");
+  const [inspectError, setInspectError] = useState(false);
+  const [inspecting, setInspecting] = useState(false);
+
+  useEffect(() => {
+    setInspectPath(draft.path);
+    setInspectMessage("");
+    setInspectError(false);
+  }, [draft.id, editorMode]);
+
+  async function handleInspectPath() {
+    const targetPath = (inspectPath || draft.path).trim();
+    if (!targetPath) {
+      setInspectMessage("请先输入本地知识库目录或 Chroma 目录路径。");
+      setInspectError(true);
+      return;
+    }
+    setInspecting(true);
+    setInspectMessage("正在识别路径和配置文件...");
+    setInspectError(false);
+    try {
+      const result = await inspectRagKnowledgeBasePath(targetPath);
+      if (!result.exists) {
+        setInspectMessage(result.warnings[0] || "路径不存在，无法自动识别。");
+        setInspectError(true);
+        return;
+      }
+      onChange({
+        sourceType: result.sourceType,
+        path: result.path || targetPath,
+        url: result.url,
+        collection: result.collection,
+        embeddingModel: result.embeddingModel,
+        topK: result.topK,
+        metadataJson: result.metadataJson,
+        description: draft.description.trim() ? draft.description : result.description,
+      });
+      setInspectPath(result.path || targetPath);
+      const warningText = result.warnings.length ? `；${result.warnings.join("；")}` : "";
+      setInspectMessage(`已识别 ${ragSourceLabel(result.sourceType)}，检测到 ${result.detectedFiles.length} 个配置/索引文件${warningText}`);
+      setInspectError(false);
+    } catch (error) {
+      setInspectMessage(error instanceof Error ? error.message : "路径识别失败。");
+      setInspectError(true);
+    } finally {
+      setInspecting(false);
+    }
+  }
+
   return (
     <div className="model-manager">
       <ResourceManagerHead title="RAG 配置" text="管理可在节点库 RAG 分组和 Retriever 节点中选择的知识库。" actionText="新增知识库" onNew={onNew} />
@@ -887,6 +939,27 @@ function RagManagerContent({
           ) : (
             <div className="model-editor-card">
               <ResourceEditorHead title={editorMode === "create" ? "新增知识库" : "编辑知识库"} text="配置知识库来源、入口、集合信息和默认检索参数。" mode={editorMode} onCancel={onCancel} onDelete={onDelete} onSave={onSave} />
+              <Field label="上传 / 导入路径">
+                <div className="rag-path-import">
+                  <input
+                    value={inspectPath}
+                    placeholder="粘贴本地路径，例如 E:\\2026\\AI\\RAG_project\\data"
+                    onChange={(event) => setInspectPath(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void handleInspectPath();
+                      }
+                    }}
+                  />
+                  <button disabled={inspecting} onClick={() => void handleInspectPath()} type="button">
+                    <Search size={15} />
+                    <span>{inspecting ? "识别中" : "自动识别"}</span>
+                  </button>
+                </div>
+                <small className="model-config-note">支持输入父目录或 Chroma 目录。系统会自动查找 chroma.sqlite3 和 runtime_config.json，并回填下方配置。</small>
+                {inspectMessage ? <small className={`rag-inspect-status ${inspectError ? "is-error" : ""}`}>{inspectMessage}</small> : null}
+              </Field>
               <Field label="知识库名称">
                 <input value={draft.name} onChange={(event) => onChange({ name: event.target.value })} />
               </Field>
@@ -1216,18 +1289,13 @@ function ModelManagerContent({
               </select>
             </Field>
 
-            <Field label="API Key">
-              <div className="secret-input">
-                <input
-                  type={showApiKey ? "text" : "password"}
-                  value={draft.apiKey}
-                  placeholder="只需要填这里，下方配置会自动填充"
-                  onChange={(event) => onChange({ apiKey: event.target.value })}
-                />
-                <button className="icon-only" onClick={onToggleApiKey} title={showApiKey ? "隐藏 API Key" : "显示 API Key"} type="button">
-                  {showApiKey ? <EyeOff size={15} /> : <Eye size={15} />}
-                </button>
-              </div>
+            <Field label="API Key 环境变量">
+              <input
+                value={draft.apiKeyEnv}
+                placeholder="例如：OPENAI_API_KEY"
+                onChange={(event) => onChange({ apiKeyEnv: event.target.value, apiKey: "" })}
+              />
+              <small className="model-config-note">这里只能填写变量名，例如 MIMO_API_KEY；真实密钥请放在后端运行环境或导出项目的 .env 文件中。</small>
             </Field>
 
             <Field label="Base URL">
@@ -1687,7 +1755,7 @@ function applyProviderPreset(config: ModelConfig, preset: ModelProviderPreset): 
     name: preset.provider === "custom" ? config.name || preset.defaultName : preset.defaultName,
     model: preset.defaultModel || config.model,
     baseUrl: preset.baseUrl,
-    apiKey: config.apiKey,
+    apiKey: "",
     apiKeyEnv: preset.apiKeyEnv,
     homepage: preset.homepage,
     apiFormat: preset.apiFormat,
@@ -1708,7 +1776,7 @@ function normalizeModelDraft(config: ModelConfig): ModelConfig {
     provider: normalizeProviderId(config.provider),
     model: config.model.trim(),
     baseUrl: config.baseUrl.trim(),
-    apiKey: config.apiKey,
+    apiKey: "",
     apiKeyEnv: config.apiKeyEnv.trim(),
     homepage: config.homepage.trim(),
     apiFormat: config.apiFormat.trim() || "openai_compatible",
@@ -1722,8 +1790,10 @@ function normalizeModelDraft(config: ModelConfig): ModelConfig {
 function getModelConfigError(config: ModelConfig, configs: ModelConfig[]) {
   const provider = normalizeProviderId(config.provider);
   const name = config.name.trim();
+  const apiKeyEnv = config.apiKeyEnv.trim();
   if (!provider) return "供应商标识不能为空。";
   if (!name) return "供应商名称不能为空。";
+  if (apiKeyEnv && !isEnvName(apiKeyEnv)) return "API Key 环境变量只能填写变量名，例如 MIMO_API_KEY，不能填写真实密钥。";
   if (provider === "custom") {
     const duplicate = configs.some((item) => item.id !== config.id && item.provider === "custom" && sameText(item.name, name));
     if (duplicate) return "自定义配置名称不能重复。";
@@ -1740,6 +1810,10 @@ function ensureUniqueCustomName(config: ModelConfig, configs: ModelConfig[]) {
     name = `${config.name} ${index}`;
   }
   return { ...config, name };
+}
+
+function isEnvName(value: string) {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
 function setDefaultModelConfig(items: ModelConfig[], id: string): ModelConfig[] {
@@ -1839,10 +1913,9 @@ function modelsFromRows(rows: ModelRow[]) {
 function buildConfigJson(config: ModelConfig) {
   const options: Record<string, unknown> = {
     baseURL: config.baseUrl,
-    apiKey: config.apiKey,
+    apiKeyEnv: config.apiKeyEnv,
     ...parseJsonObject(config.extraOptionsJson),
   };
-  if (!config.apiKey && config.apiKeyEnv) options.apiKeyEnv = config.apiKeyEnv;
   if (config.apiVersion) options.apiVersion = config.apiVersion;
   return JSON.stringify(
     {

@@ -3,7 +3,7 @@ import sys
 from types import SimpleNamespace
 from pathlib import Path
 
-from app.ir.schemas import EdgeIR, NodeIR, NodeType, StateField, create_default_project
+from app.ir.schemas import EdgeIR, EdgeKind, NodeIR, NodeType, StateField, create_default_project
 from app.runner import preview
 
 
@@ -152,6 +152,118 @@ def test_live_preview_uses_runtime_model_config(monkeypatch):
     assert state["final_answer"] == "使用运行配置生成的回答"
 
 
+def test_live_preview_keeps_explicit_node_model(monkeypatch):
+    seen = {}
+
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        seen["provider"] = provider
+        seen["model"] = model
+        seen["runtime_config"] = runtime_config
+        return FakeResponse("使用节点模型生成的回答")
+
+    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+
+    project = create_default_project("节点模型优先测试")
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="llm_answer",
+                type=NodeType.LLM,
+                label="生成回答",
+                config={
+                    "provider": "mimo",
+                    "model": "mimo-v2.5-pro",
+                    "modelConfigId": "model_mimo",
+                    "userPrompt": "{{ state.messages }}",
+                    "outputField": "final_answer",
+                },
+            ),
+            NodeIR(
+                id="reply_final",
+                type=NodeType.DIRECT_REPLY,
+                label="回复",
+                config={"template": "{{ state.final_answer }}", "outputField": "final_answer"},
+            ),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="llm_answer"),
+            EdgeIR(id="e2", source="llm_answer", target="reply_final"),
+        ]
+    )
+
+    trace, state = preview.run_project_preview(
+        project,
+        {"messages": "你好"},
+        "live",
+        {
+            "name": "运行面板模型",
+            "provider": "mimo",
+            "model": "gpt-4.1-mini",
+            "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1",
+            "enabled": True,
+        },
+    )
+
+    assert {item["status"] for item in trace} == {"ok"}
+    assert seen["provider"] == "mimo"
+    assert seen["model"] == "mimo-v2.5-pro"
+    assert seen["runtime_config"]["baseUrl"] == "https://token-plan-cn.xiaomimimo.com/v1"
+    assert state["final_answer"] == "使用节点模型生成的回答"
+
+
+def test_openai_compatible_base_url_can_run_without_configured_key(monkeypatch):
+    seen = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = kwargs
+
+        def invoke(self, messages):
+            seen["messages"] = messages
+            return FakeResponse("无密钥代理响应")
+
+    monkeypatch.setitem(sys.modules, "langchain_openai", SimpleNamespace(ChatOpenAI=FakeChatOpenAI))
+
+    response = preview._call_chat_model(
+        "mimo",
+        "mimo-v2.5-pro",
+        [("user", "你好")],
+        {"baseUrl": "https://token-plan-cn.xiaomimimo.com/v1"},
+    )
+
+    assert response.content == "无密钥代理响应"
+    assert seen["kwargs"]["base_url"] == "https://token-plan-cn.xiaomimimo.com/v1"
+    assert seen["kwargs"]["api_key"] == "not-needed"
+
+
+def test_openai_compatible_ignores_invalid_api_key_env(monkeypatch):
+    seen = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = kwargs
+
+        def invoke(self, messages):
+            return FakeResponse("忽略非法环境变量名")
+
+    monkeypatch.setitem(sys.modules, "langchain_openai", SimpleNamespace(ChatOpenAI=FakeChatOpenAI))
+
+    response = preview._call_chat_model(
+        "mimo",
+        "mimo-v2.5-pro",
+        [("user", "你好")],
+        {
+            "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1",
+            "apiKeyEnv": "tp-not-an-env-name",
+        },
+    )
+
+    assert response.content == "忽略非法环境变量名"
+    assert seen["kwargs"]["api_key"] == "not-needed"
+
+
 def test_live_preview_runs_chroma_retriever_with_sidecar_embedding(monkeypatch, tmp_path: Path):
     chroma_dir = tmp_path / "data" / "chroma"
     chroma_dir.mkdir(parents=True)
@@ -254,3 +366,129 @@ def test_live_preview_runs_chroma_retriever_with_sidecar_embedding(monkeypatch, 
     assert seen["query_kwargs"]["n_results"] == 3
     assert "source.txt" in state["retrieved_context"]
     assert "测试文档内容" in state["retrieved_context"]
+
+
+def test_live_preview_runs_customer_support_order_and_refund_paths(monkeypatch):
+    calls: list[list[tuple[str, str]]] = []
+
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        calls.append(messages)
+        user_content = messages[-1][1]
+        if "SF1234567890" in user_content:
+            return FakeResponse("您的订单 A20260614001 已发货，顺丰单号 SF1234567890，预计明天 18:00 前送达。")
+        return FakeResponse("退款申请已收到，已根据审批结果继续处理。")
+
+    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    project = _customer_support_project()
+
+    trace, state = preview.run_project_preview(
+        project,
+        {"messages": "我想查询订单物流，订单号是 A20260614001", "order_id": "A20260614001"},
+        "live",
+        {"provider": "openai", "model": "gpt-4.1-mini", "enabled": True},
+    )
+
+    assert [item["nodeId"] for item in trace] == ["route_intent", "query_order", "support_agent", "reply_support"]
+    assert {item["status"] for item in trace} == {"ok"}
+    assert state["route_key"] == "order"
+    assert state["order_info"]["tracking_no"] == "SF1234567890"
+    assert "顺丰单号" in state["final_answer"]
+
+    refund_trace, refund_state = preview.run_project_preview(
+        project,
+        {"messages": "我要申请退款", "approval_action": "approved"},
+        "live",
+        {"provider": "openai", "model": "gpt-4.1-mini", "enabled": True},
+    )
+
+    assert [item["nodeId"] for item in refund_trace] == ["route_intent", "refund_approval", "support_agent", "reply_support"]
+    assert {item["status"] for item in refund_trace} == {"ok"}
+    assert refund_state["route_key"] == "refund"
+    assert refund_state["approval_action"] == "approved"
+    assert "退款申请" in refund_state["final_answer"]
+    assert len(calls) == 2
+
+
+def _customer_support_project():
+    project = create_default_project("客服工单 Agent")
+    project.state.fields.extend(
+        [
+            StateField(name="route_key", type="str"),
+            StateField(name="route_reason", type="str"),
+            StateField(name="order_id", type="str"),
+            StateField(name="order_info", type="dict"),
+            StateField(name="approval_action", type="str"),
+            StateField(name="approval_result", type="dict"),
+            StateField(name="agent_result", type="str"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="route_intent",
+                type=NodeType.AI_ROUTER,
+                label="识别问题类型",
+                config={
+                    "inputText": "{{ state.messages }}",
+                    "scenarios": "order:订单问题:订单,物流,发货,快递\nrefund:退款问题:退款,退货,赔付,取消\nother:其他问题:",
+                    "routeField": "route_key",
+                    "reasonField": "route_reason",
+                    "fallback": "other",
+                },
+            ),
+            NodeIR(
+                id="query_order",
+                type=NodeType.HTTP,
+                label="查询订单 API",
+                config={
+                    "method": "GET",
+                    "url": "https://api.example.com/orders/{{ state.order_id }}",
+                    "mockEnabled": True,
+                    "mockResponseJson": '{"order_id":"{{ state.order_id }}","status":"已发货","tracking_no":"SF1234567890"}',
+                    "outputField": "order_info",
+                },
+            ),
+            NodeIR(
+                id="refund_approval",
+                type=NodeType.HUMAN_APPROVAL,
+                label="退款人工审批",
+                config={
+                    "prompt": "用户请求退款，请人工确认是否批准。",
+                    "actionField": "approval_action",
+                    "outputField": "approval_result",
+                    "defaultAction": "approved",
+                    "fallback": "rejected",
+                },
+            ),
+            NodeIR(
+                id="support_agent",
+                type=NodeType.AGENT,
+                label="组织客服回复",
+                config={
+                    "systemPrompt": "你是售后客服 Agent。",
+                    "userPrompt": "用户输入：{{ state.messages }}\n订单信息：{{ state.order_info }}\n审批结果：{{ state.approval_result }}",
+                    "outputField": "agent_result",
+                },
+            ),
+            NodeIR(
+                id="reply_support",
+                type=NodeType.DIRECT_REPLY,
+                label="回复用户",
+                config={"template": "{{ state.agent_result }}", "outputField": "final_answer"},
+            ),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="edge_start_route", source="start", target="route_intent"),
+            EdgeIR(id="edge_route_order", source="route_intent", sourceHandle="order", target="query_order", kind=EdgeKind.CONDITIONAL),
+            EdgeIR(id="edge_route_refund", source="route_intent", sourceHandle="refund", target="refund_approval", kind=EdgeKind.CONDITIONAL),
+            EdgeIR(id="edge_route_other", source="route_intent", sourceHandle="other", target="support_agent", kind=EdgeKind.CONDITIONAL),
+            EdgeIR(id="edge_order_agent", source="query_order", target="support_agent"),
+            EdgeIR(id="edge_refund_ok", source="refund_approval", sourceHandle="approved", target="support_agent", kind=EdgeKind.CONDITIONAL),
+            EdgeIR(id="edge_refund_rejected", source="refund_approval", sourceHandle="rejected", target="support_agent", kind=EdgeKind.CONDITIONAL),
+            EdgeIR(id="edge_agent_reply", source="support_agent", target="reply_support"),
+        ]
+    )
+    return project

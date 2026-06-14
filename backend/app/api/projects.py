@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.compiler import build_project, export_project_zip
+from app.compiler import SmokeTestFailedError, SmokeTestResult, build_project, export_project_zip
 from app.config import EXPORTS_DIR, STORAGE_DIR, ensure_runtime_dirs
+from app.ir.sanitization import sanitized_project, sanitize_project_payload
 from app.ir.schemas import ProjectIR, create_default_project
 from app.ir.validation import validate_project
-from app.runner import run_project_preview as run_project_preview_engine
+from app.runner import iter_project_preview_events, run_project_preview as run_project_preview_engine
 
 
 router = APIRouter(prefix="/api", tags=["projects"])
@@ -28,10 +30,20 @@ class CompileResponse(BaseModel):
     files: list[str]
 
 
+class SmokeTestResponse(BaseModel):
+    passed: bool
+    command: list[str]
+    exitCode: int
+    durationMs: float
+    stdout: str = ""
+    stderr: str = ""
+
+
 class ExportResponse(BaseModel):
     exportId: str
     downloadUrl: str
     files: list[str]
+    smokeTest: SmokeTestResponse
 
 
 class RunModelConfig(BaseModel):
@@ -136,6 +148,7 @@ def get_project(project_id: str) -> ProjectIR:
 def save_project(project_id: str, project: ProjectIR) -> ProjectIR:
     if project.project.id != project_id:
         project.project.id = project_id
+    project = sanitized_project(project)
     _write_project(project)
     return project
 
@@ -188,14 +201,71 @@ def run_project_preview(project_id: str, payload: RunPreviewRequest | None = Non
     )
 
 
+@router.post("/projects/{project_id}/run/stream")
+def stream_project_preview(project_id: str, payload: RunPreviewRequest | None = None) -> StreamingResponse:
+    project = _read_project(project_id)
+    request = payload or RunPreviewRequest(mode="live")
+
+    def events():
+        result = validate_project(project)
+        issues = [issue.model_dump() for issue in result.issues]
+        yield _json_line(
+            {
+                "event": "run_start",
+                "mode": request.mode,
+                "valid": result.valid,
+                "issues": issues,
+                "inputState": request.input,
+            }
+        )
+        if request.mode == "live" and not result.valid:
+            yield _json_line(
+                {
+                    "event": "run_end",
+                    "mode": request.mode,
+                    "valid": result.valid,
+                    "issues": issues,
+                    "trace": [],
+                    "outputState": dict(request.input),
+                }
+            )
+            return
+        for event in iter_project_preview_events(
+            project,
+            request.input,
+            request.mode,
+            request.modelConfig.model_dump(by_alias=True) if request.modelConfig else None,
+        ):
+            event["mode"] = request.mode
+            event["valid"] = result.valid
+            event["issues"] = issues
+            yield _json_line(event)
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")
+
+
 @router.post("/projects/{project_id}/export", response_model=ExportResponse)
 def export_saved_project(project_id: str) -> ExportResponse:
     project = _read_project(project_id)
     result = validate_project(project)
     if not result.valid:
         raise HTTPException(status_code=422, detail=[issue.model_dump() for issue in result.issues])
-    export_id, _zip_path, files = export_project_zip(project)
-    return ExportResponse(exportId=export_id, downloadUrl=f"/api/exports/{export_id}", files=files)
+    try:
+        export_id, _zip_path, files, smoke_test = export_project_zip(project)
+    except SmokeTestFailedError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "导出工程 smoke test 未通过。",
+                "smokeTest": _smoke_response(exc.result).model_dump(),
+            },
+        ) from exc
+    return ExportResponse(
+        exportId=export_id,
+        downloadUrl=f"/api/exports/{export_id}",
+        files=files,
+        smokeTest=_smoke_response(smoke_test),
+    )
 
 
 @router.get("/exports/{export_id}")
@@ -223,4 +293,19 @@ def _read_project(project_id: str) -> ProjectIR:
 
 def _write_project(project: ProjectIR) -> None:
     path = _project_path(project.project.id)
-    path.write_text(project.model_dump_json(by_alias=True, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(sanitize_project_payload(project), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _json_line(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def _smoke_response(result: SmokeTestResult) -> SmokeTestResponse:
+    return SmokeTestResponse(
+        passed=result.passed,
+        command=result.command,
+        exitCode=result.exitCode,
+        durationMs=result.durationMs,
+        stdout=result.stdout,
+        stderr=result.stderr,
+    )

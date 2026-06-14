@@ -1,9 +1,10 @@
-from app.ir.schemas import EdgeIR, EdgeKind, NodeIR, NodeType, Position, ProjectIR, create_default_project
+from app.ir.schemas import EdgeIR, EdgeKind, NodeIR, NodeType, Position, ProjectIR, StateField, create_default_project
 from app.ir.validation import validate_project
 
 
 def test_valid_minimal_graph():
     project = create_default_project()
+    project.state.fields.append(StateField(name="final_answer", type="str"))
     project.nodes.extend(
         [
             NodeIR(
@@ -73,7 +74,7 @@ def test_rejects_condition_without_fallback_edge():
     result = validate_project(project)
 
     assert not result.valid
-    assert any(issue.code == "CONDITION_FALLBACK_EDGE" for issue in result.issues)
+    assert any(issue.code == "CONDITION_BRANCH_EDGE" for issue in result.issues)
 
 
 def test_rejects_custom_function_syntax_error():
@@ -129,7 +130,7 @@ def test_rejects_ai_router_without_fallback_edge():
     result = validate_project(project)
 
     assert not result.valid
-    assert any(issue.code == "ROUTER_FALLBACK_EDGE" for issue in result.issues)
+    assert any(issue.code == "ROUTER_BRANCH_EDGE" for issue in result.issues)
 
 
 def test_rejects_invalid_tool_params_json():
@@ -151,3 +152,89 @@ def test_rejects_invalid_tool_params_json():
 
     assert not result.valid
     assert any(issue.code == "TOOL_PARAMS_JSON" for issue in result.issues)
+
+
+def test_rejects_undeclared_state_write():
+    project = create_default_project()
+    project.nodes.extend(
+        [
+            NodeIR(id="llm_1", type=NodeType.LLM, label="生成", config={"outputField": "final_answer"}),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复", config={"template": "{{ state.final_answer }}"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="llm_1"),
+            EdgeIR(id="e2", source="llm_1", target="reply_1"),
+        ]
+    )
+
+    result = validate_project(project)
+
+    assert not result.valid
+    assert any(issue.code == "STATE_FIELD_UNDECLARED" and issue.field == "final_answer" for issue in result.issues)
+
+
+def test_rejects_missing_conditional_source_handle():
+    project = create_default_project()
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="router_1",
+                type=NodeType.AI_ROUTER,
+                label="路由",
+                config={"fallback": "other", "scenarios": "other:其他问题:"},
+                outputs=[{"id": "other", "type": "condition", "label": "其他"}],
+            ),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复"),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="router_1"),
+            EdgeIR(id="e2", source="router_1", target="reply_1", kind=EdgeKind.CONDITIONAL),
+        ]
+    )
+
+    result = validate_project(project)
+
+    assert not result.valid
+    assert any(issue.code == "CONDITIONAL_EDGE_HANDLE" for issue in result.issues)
+
+
+def test_rejects_plaintext_secret_in_node_config():
+    project = create_default_project()
+    project.state.fields.append(StateField(name="final_answer", type="str"))
+    project.nodes.extend(
+        [
+            NodeIR(id="llm_1", type=NodeType.LLM, label="生成", config={"outputField": "final_answer", "apiKey": "sk-test"}),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复", config={"template": "{{ state.final_answer }}"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="llm_1"),
+            EdgeIR(id="e2", source="llm_1", target="reply_1"),
+        ]
+    )
+
+    result = validate_project(project)
+
+    assert not result.valid
+    assert any(issue.code == "PLAINTEXT_SECRET" for issue in result.issues)
+
+
+def test_rejects_reachable_node_without_terminal_path():
+    project = create_default_project()
+    project.nodes.extend(
+        [
+            NodeIR(id="custom_1", type=NodeType.CUSTOM_FUNCTION, label="函数", config={"code": "return {}"}),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复"),
+        ]
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="custom_1"))
+
+    result = validate_project(project)
+
+    assert not result.valid
+    assert any(issue.code == "NO_TERMINAL_PATH" and issue.nodeId == "custom_1" for issue in result.issues)

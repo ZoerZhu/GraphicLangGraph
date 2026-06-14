@@ -126,6 +126,20 @@ export interface RagKnowledgeBaseConfig {
   enabled: boolean;
 }
 
+export interface RagKnowledgeBaseInspection {
+  exists: boolean;
+  sourceType: string;
+  path: string;
+  url: string;
+  collection: string;
+  description: string;
+  embeddingModel: string;
+  topK: number;
+  metadataJson: string;
+  detectedFiles: string[];
+  warnings: string[];
+}
+
 export interface ImportedAgentConfig {
   id: string;
   name: string;
@@ -195,6 +209,7 @@ export interface ValidationIssue {
   nodeId?: string | null;
   edgeId?: string | null;
   field?: string | null;
+  suggestion?: string | null;
 }
 
 export interface ValidationResult {
@@ -206,17 +221,40 @@ export interface ExportResponse {
   exportId: string;
   downloadUrl: string;
   files: string[];
+  smokeTest: SmokeTestResult;
+}
+
+export interface SmokeTestResult {
+  passed: boolean;
+  command: string[];
+  exitCode: number;
+  durationMs: number;
+  stdout: string;
+  stderr: string;
 }
 
 export interface RunTraceItem {
   nodeId: string;
   type: NodeType;
   label: string;
-  status: "ok" | "skipped" | "error";
+  status: RunTraceStatus;
   detail: string;
   durationMs: number;
   inputState: Record<string, unknown>;
   outputDelta: Record<string, unknown>;
+}
+
+export type RunTraceStatus = "ok" | "skipped" | "error";
+export type NodeRuntimeStatus = "idle" | "queued" | "running" | RunTraceStatus;
+
+export interface NodeRuntimeState {
+  status: NodeRuntimeStatus;
+  label: string;
+  detail: string;
+  durationMs: number;
+  inputState: Record<string, unknown>;
+  outputDelta: Record<string, unknown>;
+  updatedAt: string;
 }
 
 export interface RunPreviewResult {
@@ -226,3 +264,38 @@ export interface RunPreviewResult {
   trace: RunTraceItem[];
   outputState: Record<string, unknown>;
 }
+
+export type RunStreamEvent =
+  | {
+      event: "run_start";
+      mode: RunMode;
+      valid: boolean;
+      issues: ValidationIssue[];
+      inputState: Record<string, unknown>;
+    }
+  | {
+      event: "node_start";
+      mode: RunMode;
+      valid: boolean;
+      issues: ValidationIssue[];
+      nodeId: string;
+      type: NodeType;
+      label: string;
+      inputState: Record<string, unknown>;
+    }
+  | {
+      event: "node_end";
+      mode: RunMode;
+      valid: boolean;
+      issues: ValidationIssue[];
+      traceItem: RunTraceItem;
+      outputState: Record<string, unknown>;
+    }
+  | {
+      event: "run_end";
+      mode: RunMode;
+      valid: boolean;
+      issues: ValidationIssue[];
+      trace: RunTraceItem[];
+      outputState: Record<string, unknown>;
+    };

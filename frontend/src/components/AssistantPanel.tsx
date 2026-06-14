@@ -1,5 +1,6 @@
 import { Send, WandSparkles, X } from "lucide-react";
 import { useState } from "react";
+import { PROJECT_TEMPLATES } from "../lib/templates";
 import { useProjectStore } from "../store/projectStore";
 
 export function AssistantPanel() {
@@ -7,6 +8,8 @@ export function AssistantPanel() {
   const closeAssistant = useProjectStore((state) => state.closeAssistant);
   const applyAssistantPrompt = useProjectStore((state) => state.applyAssistantPrompt);
   const [prompt, setPrompt] = useState("帮我做一个客服 Agent，先识别订单/退款/其他问题，再处理并回复用户。");
+  const [previewTemplateId, setPreviewTemplateId] = useState<string | null>(null);
+  const previewTemplate = PROJECT_TEMPLATES.find((template) => template.id === previewTemplateId) ?? null;
 
   if (!open) return null;
 
@@ -29,17 +32,49 @@ export function AssistantPanel() {
         placeholder="例如：帮我做一个知识库问答 Agent，先改写问题，再检索文档，最后回答。"
       />
       <div className="assistant-actions">
-        <button onClick={() => setPrompt("帮我做一个知识库问答 Agent，先改写问题，再检索文档，最后回答。")} type="button">
+        <button onClick={() => {
+          setPrompt("帮我做一个知识库问答 Agent，先改写问题，再检索文档，最后回答。");
+          setPreviewTemplateId(null);
+        }} type="button">
           知识库问答
         </button>
-        <button onClick={() => setPrompt("帮我做一个售后客服 Agent，识别订单/退款/其他问题，退款需要人工审批。")} type="button">
+        <button onClick={() => {
+          setPrompt("帮我做一个售后客服 Agent，识别订单/退款/其他问题，退款需要人工审批。");
+          setPreviewTemplateId(null);
+        }} type="button">
           客服工单
         </button>
-        <button className="primary" onClick={() => void applyAssistantPrompt(prompt)} type="button">
+        <button className="primary" onClick={() => setPreviewTemplateId(pickTemplateId(prompt))} type="button">
           <Send size={15} />
-          <span>生成画布</span>
+          <span>生成预览</span>
         </button>
       </div>
+      {previewTemplate ? (
+        <div className="assistant-preview">
+          <strong>{previewTemplate.name}</strong>
+          <span>{previewTemplate.description}</span>
+          <div>
+            <small>{previewTemplate.nodes.length} 节点</small>
+            <small>{previewTemplate.edges.length} 连线</small>
+            <small>{previewTemplate.fields.length} State 字段</small>
+          </div>
+          <ul>
+            {previewTemplate.fields.slice(0, 6).map((field) => (
+              <li key={field.name}>{field.name}: {field.type}</li>
+            ))}
+          </ul>
+          <button className="primary" onClick={() => void applyAssistantPrompt(prompt)} type="button">
+            应用到画布
+          </button>
+        </div>
+      ) : null}
     </aside>
   );
+}
+
+function pickTemplateId(prompt: string) {
+  const normalized = prompt.trim();
+  if (/客服|售后|订单|退款/.test(normalized)) return "customer_support";
+  if (/知识库|问答|文档|rag|检索/i.test(normalized)) return "knowledge_qa";
+  return "knowledge_qa";
 }

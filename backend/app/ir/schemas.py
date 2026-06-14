@@ -140,6 +140,7 @@ class ValidationIssue(BaseModel):
     nodeId: str | None = None
     edgeId: str | None = None
     field: str | None = None
+    suggestion: str | None = None
 
 
 class ValidationResult(BaseModel):

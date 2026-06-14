@@ -4,9 +4,11 @@ import type {
   ModelConfig,
   ProjectIR,
   ProjectListItem,
+  RagKnowledgeBaseInspection,
   RagKnowledgeBaseConfig,
   RunMode,
   RunPreviewResult,
+  RunStreamEvent,
   ToolConfig,
   ValidationResult,
 } from "../types";
@@ -16,6 +18,7 @@ import {
   ModelConfigListSchema,
   ProjectListSchema,
   ProjectSchema,
+  RagKnowledgeBaseInspectionSchema,
   RagKnowledgeBaseListSchema,
   RunPreviewResultSchema,
   ToolConfigListSchema,
@@ -142,6 +145,14 @@ export async function saveWorkspaceRagKnowledgeBases(configs: RagKnowledgeBaseCo
   return RagKnowledgeBaseListSchema.parse(data) as RagKnowledgeBaseConfig[];
 }
 
+export async function inspectRagKnowledgeBasePath(path: string): Promise<RagKnowledgeBaseInspection> {
+  const data = await request("/api/workspace/rag/inspect", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+  return RagKnowledgeBaseInspectionSchema.parse(data) as RagKnowledgeBaseInspection;
+}
+
 export async function runProjectPreview(
   projectId: string,
   input: Record<string, unknown>,
@@ -153,4 +164,44 @@ export async function runProjectPreview(
     body: JSON.stringify({ input, mode, modelConfig }),
   });
   return RunPreviewResultSchema.parse(data) as RunPreviewResult;
+}
+
+export async function streamProjectPreview(
+  projectId: string,
+  input: Record<string, unknown>,
+  mode: RunMode,
+  modelConfig: ModelConfig | undefined,
+  onEvent: (event: RunStreamEvent) => void,
+): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/run/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ input, mode, modelConfig }),
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || response.statusText);
+  }
+  if (!response.body) {
+    throw new Error("运行流响应为空。");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      onEvent(JSON.parse(trimmed) as RunStreamEvent);
+    }
+    if (done) break;
+  }
+  if (buffer.trim()) {
+    onEvent(JSON.parse(buffer) as RunStreamEvent);
+  }
 }

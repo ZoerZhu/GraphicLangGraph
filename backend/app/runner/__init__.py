@@ -1,3 +1,3 @@
-from .preview import RunMode, run_project_preview
+from .preview import RunMode, iter_project_preview_events, run_project_preview
 
-__all__ = ["RunMode", "run_project_preview"]
+__all__ = ["RunMode", "iter_project_preview_events", "run_project_preview"]
