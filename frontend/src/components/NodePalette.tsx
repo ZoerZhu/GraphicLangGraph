@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { Bot, ChevronDown, ChevronRight, Database, PanelLeftClose, PanelLeftOpen, Plug, Server } from "lucide-react";
 import { NODE_CATALOG } from "../lib/nodeCatalog";
 import { useProjectStore } from "../store/projectStore";
-import type { NodeType, RagKnowledgeBaseConfig } from "../types";
+import type { NodeType, RagKnowledgeBaseConfig, SkillConfig } from "../types";
 
 interface DragPayload {
   type: NodeType;
@@ -15,8 +15,8 @@ type GroupKey = "skills" | "mcp" | "rag" | "agents";
 export function NodePalette() {
   const addNode = useProjectStore((state) => state.addNode);
   const project = useProjectStore((state) => state.project);
+  const runActive = useProjectStore((state) => state.runActive);
   const projects = useProjectStore((state) => state.projects);
-  const workspaceTools = useProjectStore((state) => state.workspaceTools);
   const workspaceMcpServers = useProjectStore((state) => state.workspaceMcpServers);
   const workspaceRagKnowledgeBases = useProjectStore((state) => state.workspaceRagKnowledgeBases);
   const hasStart = project?.nodes.some((node) => node.type === "start") ?? false;
@@ -29,7 +29,7 @@ export function NodePalette() {
   });
   const [collapsed, setCollapsed] = useState(false);
 
-  const tools = useMemo(() => mergeById([...(project?.tools ?? []), ...workspaceTools]), [project?.tools, workspaceTools]);
+  const skills = useMemo(() => (project?.skills ?? []).filter((item) => item.enabled), [project?.skills]);
   const mcpServers = useMemo(
     () => mergeById([...(project?.mcpServers ?? []), ...workspaceMcpServers]),
     [project?.mcpServers, workspaceMcpServers],
@@ -48,12 +48,17 @@ export function NodePalette() {
   }
 
   function handleDragStart(event: React.DragEvent, payload: DragPayload) {
+    if (runActive) {
+      event.preventDefault();
+      return;
+    }
     event.dataTransfer.setData("application/graphic-langgraph-node", payload.type);
     event.dataTransfer.setData("application/graphic-langgraph-node-config", JSON.stringify(payload));
     event.dataTransfer.effectAllowed = "move";
   }
 
   function handlePointerUp(event: React.PointerEvent, key: string, payload: DragPayload) {
+    if (runActive) return;
     const start = pointerStart.current[key];
     if (!start || event.button !== 0) return;
     const moved = Math.hypot(event.clientX - start.x, event.clientY - start.y);
@@ -89,14 +94,14 @@ export function NodePalette() {
       <div className="node-list">
         {baseNodes.map((item) => {
           const Icon = item.icon;
-          const disabled = item.type === "start" && hasStart;
+          const disabled = runActive || (item.type === "start" && hasStart);
           const payload = { type: item.type };
           return (
             <PaletteButton
               key={item.type}
               id={item.type}
               disabled={disabled}
-              title={disabled ? "当前项目已有 Start 节点" : "点击添加，或拖拽到画布"}
+              title={runActive ? "运行模式下不能添加节点" : disabled ? "当前项目已有 Start 节点" : "点击添加，或拖拽到画布"}
               onPointerDown={(event) => {
                 pointerStart.current[item.type] = { x: event.clientX, y: event.clientY };
               }}
@@ -116,28 +121,29 @@ export function NodePalette() {
         })}
 
         <PaletteGroup
-          title="Skill Node"
-          description="展开选择已导入 Tool/Skill"
+          title="Skills"
+          description="展开选择项目已配置 Skill"
           icon={<Plug size={18} />}
-          count={tools.length}
+          count={skills.length}
           open={openGroups.skills}
           onClick={() => toggleGroup("skills")}
         />
         {openGroups.skills && (
           <ConfiguredList
-            emptyText="先在管理页侧边栏导入 Tool。"
-            items={tools}
-            render={(tool) => {
-              const key = `skill_${tool.id}`;
+            emptyText="先在项目初始化配置添加 Skills。"
+            items={skills}
+            render={(skill) => {
+              const key = `skill_${skill.id}`;
               const payload: DragPayload = {
                 type: "skill_node",
-                label: tool.name,
+                label: skill.name,
                 configPatch: {
-                  toolId: tool.id,
-                  toolName: tool.name,
-                  toolSource: tool.source,
-                  toolDescription: tool.description,
-                  outputField: `${toFieldName(tool.name)}_result`,
+                  skillId: skill.id,
+                  skillName: skill.name,
+                  skillContent: skill.content,
+                  sourcePath: skill.sourcePath,
+                  filePath: skill.filePath,
+                  outputField: `${toFieldName(skill.name)}_skill`,
                 },
               };
               return (
@@ -145,7 +151,8 @@ export function NodePalette() {
                   key={key}
                   id={key}
                   className="configured-node"
-                  title="点击添加，或拖拽到画布"
+                  disabled={runActive}
+                  title={runActive ? "运行模式下不能添加节点" : "点击添加，或拖拽到画布"}
                   onPointerDown={(event) => {
                     pointerStart.current[key] = { x: event.clientX, y: event.clientY };
                   }}
@@ -157,8 +164,8 @@ export function NodePalette() {
                     <Plug size={16} />
                   </span>
                   <span>
-                    <strong>{tool.name}</strong>
-                    <small>{tool.source || "tool"} · {tool.description || "未填写描述"}</small>
+                    <strong>{skill.name}</strong>
+                    <small>{skillSourceLabel(skill)} · {skill.description || "未填写描述"}</small>
                   </span>
                 </PaletteButton>
               );
@@ -197,7 +204,8 @@ export function NodePalette() {
                   key={key}
                   id={key}
                   className="configured-node"
-                  title="点击添加，或拖拽到画布"
+                  disabled={runActive}
+                  title={runActive ? "运行模式下不能添加节点" : "点击添加，或拖拽到画布"}
                   onPointerDown={(event) => {
                     pointerStart.current[key] = { x: event.clientX, y: event.clientY };
                   }}
@@ -254,7 +262,8 @@ export function NodePalette() {
                   key={key}
                   id={key}
                   className="configured-node"
-                  title="点击添加已绑定知识库的 Retriever，或拖拽到画布"
+                  disabled={runActive}
+                  title={runActive ? "运行模式下不能添加节点" : "点击添加已绑定知识库的 Retriever，或拖拽到画布"}
                   onPointerDown={(event) => {
                     pointerStart.current[key] = { x: event.clientX, y: event.clientY };
                   }}
@@ -305,7 +314,8 @@ export function NodePalette() {
                       key={key}
                       id={key}
                       className="configured-node"
-                      title="点击添加；Shift + 左键点击画布中的该节点可分屏编辑"
+                      disabled={runActive}
+                      title={runActive ? "运行模式下不能添加节点" : "点击添加；Shift + 左键点击画布中的该节点可分屏编辑"}
                       onPointerDown={(event) => {
                         pointerStart.current[key] = { x: event.clientX, y: event.clientY };
                       }}
@@ -468,4 +478,11 @@ function ragSourceLabel(sourceType: string) {
     default:
       return "本地目录";
   }
+}
+
+function skillSourceLabel(skill: SkillConfig) {
+  if (skill.sourceType === "github") return "GitHub";
+  if (skill.sourceType === "upload") return "上传";
+  if (skill.sourceType === "local") return "本地";
+  return skill.sourceType || "Skill";
 }

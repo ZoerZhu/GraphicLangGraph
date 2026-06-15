@@ -48,6 +48,7 @@ function CanvasInner() {
   const project = useProjectStore((state) => state.project);
   const selectedNodeId = useProjectStore((state) => state.selectedNodeId);
   const miniMapOpen = useProjectStore((state) => state.miniMapOpen);
+  const runActive = useProjectStore((state) => state.runActive);
   const runtimeNodes = useProjectStore((state) => state.runtimeNodes);
   const selectNode = useProjectStore((state) => state.selectNode);
   const addNode = useProjectStore((state) => state.addNode);
@@ -61,19 +62,20 @@ function CanvasInner() {
   const handleDrop = useCallback(
     (event: React.DragEvent) => {
       event.preventDefault();
+      if (runActive) return;
       const payload = readDropPayload(event);
       const type = payload?.type ?? (event.dataTransfer.getData("application/graphic-langgraph-node") as NodeType);
       if (!type) return;
       addNode(type, screenToFlowPosition({ x: event.clientX, y: event.clientY }), payload?.configPatch, payload?.label);
     },
-    [addNode, screenToFlowPosition],
+    [addNode, runActive, screenToFlowPosition],
   );
 
   if (!project) {
     return <main className="canvas-shell">正在连接后端...</main>;
   }
 
-  const nodes = toReactFlowNodes(project, runtimeNodes).map((node) => ({
+  const nodes = toReactFlowNodes(project, runActive ? runtimeNodes : {}).map((node) => ({
     ...node,
     selected: node.id === selectedNodeId,
   }));
@@ -89,9 +91,9 @@ function CanvasInner() {
         nodes={nodes}
         edges={toReactFlowEdges(project)}
         nodeTypes={nodeTypes}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onConnect={onConnect}
+        onNodesChange={runActive ? undefined : onNodesChange}
+        onEdgesChange={runActive ? undefined : onEdgesChange}
+        onConnect={runActive ? undefined : onConnect}
         onNodeClick={(event, node) => {
           const config = node.data?.config as Record<string, unknown> | undefined;
           const nodeType = node.data?.nodeType as NodeType | undefined;
@@ -103,8 +105,12 @@ function CanvasInner() {
         }}
         onNodeDragStop={() => void save()}
         onPaneClick={() => selectNode(null)}
+        nodesDraggable={!runActive}
+        nodesConnectable={!runActive}
+        edgesFocusable={!runActive}
+        edgesReconnectable={!runActive}
         connectionMode={ConnectionMode.Loose}
-        connectOnClick
+        connectOnClick={!runActive}
         connectionRadius={34}
         defaultEdgeOptions={{
           type: "smoothstep",
@@ -118,7 +124,7 @@ function CanvasInner() {
         <Background gap={18} size={1} color="#d8d8dc" />
         {miniMapOpen ? <CanvasMiniMap project={project} selectedNodeId={selectedNodeId} /> : null}
       </ReactFlow>
-      <ConnectionOverlay edges={project.edges} />
+      {!runActive ? <ConnectionOverlay edges={project.edges} /> : null}
     </main>
   );
 }

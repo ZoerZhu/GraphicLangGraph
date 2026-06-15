@@ -1,7 +1,9 @@
 import json
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+import app.config as app_config
 import app.api.workspace as workspace_api
 from app.main import app
 
@@ -19,6 +21,42 @@ def test_project_list_create_and_delete():
 
     deleted = client.delete(f"/api/projects/{project_id}")
     assert deleted.status_code == 204
+
+
+def test_runtime_env_loads_root_env_file(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text(
+        """
+        MIMO_API_KEY=env-file-token
+        EXISTING_KEY=from-env-file
+        QUOTED_VALUE="quoted token"
+        # ignored
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_config, "ROOT_DIR", tmp_path)
+    monkeypatch.delenv("MIMO_API_KEY", raising=False)
+    monkeypatch.setenv("EXISTING_KEY", "from-process")
+    monkeypatch.delenv("QUOTED_VALUE", raising=False)
+
+    app_config.load_runtime_env()
+
+    assert app_config.os.getenv("MIMO_API_KEY") == "env-file-token"
+    assert app_config.os.getenv("EXISTING_KEY") == "from-process"
+    assert app_config.os.getenv("QUOTED_VALUE") == "quoted token"
+
+
+def test_workspace_env_check_reports_loaded_variable(monkeypatch):
+    monkeypatch.setenv("MIMO_API_KEY", "test-token")
+    client = TestClient(app)
+
+    found = client.post("/api/workspace/env/check", json={"name": "MIMO_API_KEY"})
+    invalid = client.post("/api/workspace/env/check", json={"name": "tp-not-a-variable"})
+
+    assert found.status_code == 200
+    assert found.json()["exists"] is True
+    assert found.json()["length"] == len("test-token")
+    assert invalid.status_code == 200
+    assert invalid.json()["valid"] is False
 
 
 def test_project_run_preview():
@@ -146,6 +184,39 @@ def test_project_run_stream_emits_node_events():
     assert deleted.status_code == 204
 
 
+def test_project_save_and_read_preserves_skills():
+    client = TestClient(app)
+
+    created = client.post("/api/projects", json={"name": "Skills 保存测试 Agent"})
+    assert created.status_code == 200
+    project = created.json()
+    project_id = project["project"]["id"]
+    project["skills"] = [
+        {
+            "id": "skill_tone",
+            "name": "语气控制",
+            "description": "控制客服语气",
+            "sourceType": "manual",
+            "sourcePath": "",
+            "filePath": "",
+            "content": "请保持礼貌、简洁。",
+            "metadataJson": "{}",
+            "enabled": True,
+        }
+    ]
+
+    saved = client.put(f"/api/projects/{project_id}", json=project)
+    assert saved.status_code == 200
+    assert saved.json()["skills"][0]["name"] == "语气控制"
+
+    loaded = client.get(f"/api/projects/{project_id}")
+    assert loaded.status_code == 200
+    assert loaded.json()["skills"][0]["content"] == "请保持礼貌、简洁。"
+
+    deleted = client.delete(f"/api/projects/{project_id}")
+    assert deleted.status_code == 204
+
+
 def test_project_export_returns_smoke_test_result():
     client = TestClient(app)
 
@@ -255,6 +326,44 @@ def test_workspace_model_configs_are_persisted(tmp_path, monkeypatch):
     assert listed.json() == body
 
 
+def test_workspace_model_config_can_store_direct_api_key(tmp_path, monkeypatch):
+    models_file = tmp_path / "models.json"
+    monkeypatch.setattr(workspace_api, "WORKSPACE_MODELS_FILE", models_file)
+    client = TestClient(app)
+
+    payload = [
+        {
+            "id": "model_direct",
+            "name": "直写 Key 测试",
+            "provider": "custom",
+            "model": "model-a",
+            "baseUrl": "https://api.example.com/v1",
+            "apiKey": "direct-token",
+            "apiKeyEnv": "SHOULD_NOT_PERSIST",
+            "apiKeyMode": "direct",
+            "apiVersion": "",
+            "organization": "",
+            "homepage": "",
+            "apiFormat": "openai_compatible",
+            "extraOptionsJson": "{}",
+            "modelRowsJson": "[]",
+            "modelsJson": "{}",
+            "enabled": True,
+            "isDefault": True,
+            "notes": "",
+        }
+    ]
+
+    saved = client.put("/api/workspace/models", json=payload)
+
+    assert saved.status_code == 200
+    body = saved.json()
+    assert body[0]["apiKeyMode"] == "direct"
+    assert body[0]["apiKey"] == "direct-token"
+    assert body[0]["apiKeyEnv"] == ""
+    assert "direct-token" in models_file.read_text(encoding="utf-8")
+
+
 def test_workspace_tools_and_mcp_are_persisted(tmp_path, monkeypatch):
     tools_file = tmp_path / "tools.json"
     mcp_file = tmp_path / "mcp_servers.json"
@@ -292,6 +401,239 @@ def test_workspace_tools_and_mcp_are_persisted(tmp_path, monkeypatch):
     assert mcp_file.exists()
     assert saved_mcp.json()[0]["command"] == "python -m docs_mcp"
     assert client.get("/api/workspace/mcp").json() == saved_mcp.json()
+
+
+def test_workspace_skills_are_persisted_and_imported_from_local_markdown(tmp_path, monkeypatch):
+    skills_file = tmp_path / "skills.json"
+    config_skills_dir = tmp_path / "config" / "skills"
+    monkeypatch.setattr(workspace_api, "WORKSPACE_SKILLS_FILE", skills_file)
+    monkeypatch.setattr(workspace_api, "CONFIG_SKILLS_DIR", config_skills_dir)
+    source = tmp_path / "source_skills"
+    writer_dir = source / "writer"
+    writer_dir.mkdir(parents=True)
+    (writer_dir / "SKILL.md").write_text(
+        """---
+name: Writer Skill
+description: 写作风格控制
+---
+# Writer Skill
+
+请使用清晰、克制的中文输出。
+""",
+        encoding="utf-8",
+    )
+    (writer_dir / "notes.md").write_text("# Notes\n\n关联说明。", encoding="utf-8")
+    (source / "standalone.md").write_text("# Standalone Skill\n\n普通 Markdown skill。", encoding="utf-8")
+    ignored_dir = source / "node_modules"
+    ignored_dir.mkdir()
+    (ignored_dir / "ignored.md").write_text("# Ignored", encoding="utf-8")
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/workspace/skills/import",
+        json={"sourceType": "local", "source": str(source), "useMirror": True},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["imported"]) == 2
+    assert Path(body["importPath"]).is_dir()
+    assert Path(body["importPath"]).is_relative_to(config_skills_dir)
+    names = {item["name"] for item in body["imported"]}
+    assert names == {"Writer Skill", "Standalone Skill"}
+    writer = next(item for item in body["imported"] if item["name"] == "Writer Skill")
+    assert "请使用清晰" in writer["content"]
+    assert "notes.md" in writer["metadataJson"]
+    assert "ignored.md" not in "\n".join(body["detectedFiles"])
+    assert client.get("/api/workspace/skills").json() == body["allConfigs"]
+
+    saved = client.put(
+        "/api/workspace/skills",
+        json=[
+            {
+                "id": "skill_manual",
+                "name": "手动 Skill",
+                "description": "手动配置",
+                "sourceType": "manual",
+                "sourcePath": "",
+                "filePath": "",
+                "content": "手动内容",
+                "metadataJson": "",
+                "enabled": True,
+            }
+        ],
+    )
+    assert saved.status_code == 200
+    assert saved.json()[0]["metadataJson"] == "{}"
+
+
+def test_workspace_skills_upload_detects_multiple_skills(tmp_path, monkeypatch):
+    skills_file = tmp_path / "skills.json"
+    config_skills_dir = tmp_path / "config" / "skills"
+    monkeypatch.setattr(workspace_api, "WORKSPACE_SKILLS_FILE", skills_file)
+    monkeypatch.setattr(workspace_api, "CONFIG_SKILLS_DIR", config_skills_dir)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/workspace/skills/upload",
+        data={"rootName": "upload-skills"},
+        files=[
+            ("files", ("pack/SKILL.md", b"# Uploaded Skill\n\nUse uploaded rules.", "text/markdown")),
+            ("files", ("pack/extra.md", b"# Extra\n\nRelated file.", "text/markdown")),
+            ("files", ("loose.md", b"# Loose Skill\n\nStandalone upload.", "text/markdown")),
+            ("files", ("pack/.git/ignored.md", b"# Ignored", "text/markdown")),
+        ],
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["imported"]) == 2
+    assert {item["name"] for item in body["imported"]} == {"Uploaded Skill", "Loose Skill"}
+    assert "extra.md" in "\n".join(body["detectedFiles"])
+    assert "ignored.md" not in "\n".join(body["detectedFiles"])
+
+
+def test_workspace_mcp_imports_local_codex_config(tmp_path, monkeypatch):
+    mcp_file = tmp_path / "mcp_servers.json"
+    config_mcp_dir = tmp_path / "config" / "mcp"
+    monkeypatch.setattr(workspace_api, "WORKSPACE_MCP_FILE", mcp_file)
+    monkeypatch.setattr(workspace_api, "CONFIG_MCP_DIR", config_mcp_dir)
+    source = tmp_path / "source_mcp"
+    codex_dir = source / ".codex"
+    codex_dir.mkdir(parents=True)
+    (codex_dir / "config.toml").write_text(
+        """
+[mcp_servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
+env_vars = ["LOCAL_TOKEN"]
+cwd = "."
+startup_timeout_sec = 20
+
+[mcp_servers.figma]
+url = "https://mcp.figma.com/mcp"
+bearer_token_env_var = "FIGMA_OAUTH_TOKEN"
+http_headers = { "X-Figma-Region" = "us-east-1" }
+env_http_headers = { "X-Feature-Flag" = "FIGMA_FEATURE_FLAG" }
+enabled = true
+""",
+        encoding="utf-8",
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/workspace/mcp/import",
+        json={"sourceType": "local", "source": str(source), "useMirror": True},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["imported"]) == 2
+    assert Path(body["importPath"]).is_dir()
+    assert Path(body["importPath"]).is_relative_to(config_mcp_dir)
+    stdio = next(item for item in body["imported"] if item["transport"] == "stdio")
+    assert stdio["command"] == "npx"
+    assert '"@upstash/context7-mcp"' in stdio["argsJson"]
+    assert '"LOCAL_TOKEN"' in stdio["envVarsJson"]
+    remote = next(item for item in body["imported"] if item["transport"] == "http")
+    assert remote["url"] == "https://mcp.figma.com/mcp"
+    assert remote["bearerTokenEnvVar"] == "FIGMA_OAUTH_TOKEN"
+    assert "X-Figma-Region" in remote["httpHeadersJson"]
+    assert client.get("/api/workspace/mcp").json() == body["allConfigs"]
+
+
+def test_workspace_tools_imports_local_python_functions(tmp_path, monkeypatch):
+    tools_file = tmp_path / "tools.json"
+    config_tools_dir = tmp_path / "config" / "tools"
+    monkeypatch.setattr(workspace_api, "WORKSPACE_TOOLS_FILE", tools_file)
+    monkeypatch.setattr(workspace_api, "CONFIG_TOOLS_DIR", config_tools_dir)
+    source = tmp_path / "source_tools"
+    source.mkdir()
+    (source / "tools.py").write_text(
+        '''
+from langchain_core.tools import tool
+
+
+@tool("search_docs")
+def search_documents(query: str, limit: int = 3) -> str:
+    """Search local documents."""
+    return query
+
+
+def helper(value: str) -> str:
+    """Not imported when decorated tools exist."""
+    return value
+''',
+        encoding="utf-8",
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/workspace/tools/import",
+        json={"sourceType": "local", "source": str(source), "useMirror": True},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["imported"]) == 1
+    imported = body["imported"][0]
+    assert imported["name"] == "search_docs"
+    assert imported["source"] == "python"
+    assert imported["description"] == "Search local documents."
+    schema = json.loads(imported["schemaJson"])
+    assert schema["properties"]["query"]["type"] == "string"
+    assert schema["properties"]["limit"]["type"] == "number"
+    assert schema["required"] == ["query"]
+    assert schema["x-graphic"]["function"] == "search_documents"
+    assert Path(body["importPath"]).is_relative_to(config_tools_dir)
+    assert client.get("/api/workspace/tools").json() == body["allConfigs"]
+
+
+def test_workspace_tools_upload_detects_openapi_operations(tmp_path, monkeypatch):
+    tools_file = tmp_path / "tools.json"
+    config_tools_dir = tmp_path / "config" / "tools"
+    monkeypatch.setattr(workspace_api, "WORKSPACE_TOOLS_FILE", tools_file)
+    monkeypatch.setattr(workspace_api, "CONFIG_TOOLS_DIR", config_tools_dir)
+    client = TestClient(app)
+    openapi = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/orders/{order_id}": {
+                "get": {
+                    "operationId": "get_order",
+                    "summary": "查询订单",
+                    "parameters": [
+                        {
+                            "name": "order_id",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                }
+            }
+        },
+    }
+
+    response = client.post(
+        "/api/workspace/tools/upload",
+        data={"rootName": "openapi-tools"},
+        files=[("files", ("openapi-tools/openapi.json", json.dumps(openapi).encode("utf-8"), "application/json"))],
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["imported"]) == 1
+    imported = body["imported"][0]
+    assert imported["name"] == "get_order"
+    assert imported["source"] == "openapi"
+    schema = json.loads(imported["schemaJson"])
+    assert schema["properties"]["order_id"]["type"] == "string"
+    assert schema["x-graphic"]["method"] == "GET"
+    assert schema["x-graphic"]["path"] == "/orders/{order_id}"
+    assert Path(body["importPath"]).is_relative_to(config_tools_dir)
+    assert (Path(body["importPath"]) / "openapi.json").is_file()
+    assert "openapi.json" in "\n".join(body["detectedFiles"])
 
 
 def test_workspace_rag_knowledge_bases_are_persisted(tmp_path, monkeypatch):

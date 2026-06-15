@@ -96,12 +96,43 @@ class ToolConfig(BaseModel):
     tool_schema: str = Field("{}", alias="schemaJson")
 
 
+class SkillConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    id: str = Field(default_factory=lambda: f"skill_{uuid4().hex[:8]}")
+    name: str = "未命名 Skill"
+    description: str = ""
+    source_type: str = Field("manual", alias="sourceType")
+    source_path: str = Field("", alias="sourcePath")
+    file_path: str = Field("", alias="filePath")
+    content: str = ""
+    metadata_json: str = Field("{}", alias="metadataJson")
+    enabled: bool = True
+
+
 class MCPServerConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
     id: str = Field(default_factory=lambda: f"mcp_{uuid4().hex[:8]}")
     name: str = "未命名 MCP"
     transport: str = "stdio"
     command: str = ""
+    args_json: str = Field("[]", alias="argsJson")
+    env_json: str = Field("{}", alias="envJson")
+    env_vars_json: str = Field("[]", alias="envVarsJson")
+    cwd: str = ""
     url: str = ""
+    bearer_token_env_var: str = Field("", alias="bearerTokenEnvVar")
+    http_headers_json: str = Field("{}", alias="httpHeadersJson")
+    env_http_headers_json: str = Field("{}", alias="envHttpHeadersJson")
+    enabled: bool = True
+    startup_timeout_sec: int = Field(10, alias="startupTimeoutSec")
+    tool_timeout_sec: int = Field(60, alias="toolTimeoutSec")
+    enabled_tools_json: str = Field("[]", alias="enabledToolsJson")
+    disabled_tools_json: str = Field("[]", alias="disabledToolsJson")
+    default_tools_approval_mode: str = Field("", alias="defaultToolsApprovalMode")
+    source_type: str = Field("manual", alias="sourceType")
+    source_path: str = Field("", alias="sourcePath")
     description: str = ""
 
 
@@ -128,6 +159,7 @@ class ProjectIR(BaseModel):
     edges: list[EdgeIR] = Field(default_factory=list)
     secrets: list[SecretRef] = Field(default_factory=list)
     tools: list[ToolConfig] = Field(default_factory=list)
+    skills: list[SkillConfig] = Field(default_factory=list)
     mcpServers: list[MCPServerConfig] = Field(default_factory=list)
     importedAgents: list[ImportedAgentConfig] = Field(default_factory=list)
     agentLinks: list[AgentLinkConfig] = Field(default_factory=list)

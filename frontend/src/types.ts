@@ -83,13 +83,64 @@ export interface ToolConfig {
   schemaJson: string;
 }
 
+export interface ToolImportResult {
+  imported: ToolConfig[];
+  allConfigs: ToolConfig[];
+  importPath: string;
+  detectedFiles: string[];
+  warnings: string[];
+}
+
+export interface SkillConfig {
+  id: string;
+  name: string;
+  description: string;
+  sourceType: string;
+  sourcePath: string;
+  filePath: string;
+  content: string;
+  metadataJson: string;
+  enabled: boolean;
+}
+
+export interface SkillImportResult {
+  imported: SkillConfig[];
+  allConfigs: SkillConfig[];
+  importPath: string;
+  detectedFiles: string[];
+  warnings: string[];
+}
+
 export interface MCPServerConfig {
   id: string;
   name: string;
   transport: string;
   command: string;
+  argsJson: string;
+  envJson: string;
+  envVarsJson: string;
+  cwd: string;
   url: string;
+  bearerTokenEnvVar: string;
+  httpHeadersJson: string;
+  envHttpHeadersJson: string;
+  enabled: boolean;
+  startupTimeoutSec: number;
+  toolTimeoutSec: number;
+  enabledToolsJson: string;
+  disabledToolsJson: string;
+  defaultToolsApprovalMode: string;
+  sourceType: string;
+  sourcePath: string;
   description: string;
+}
+
+export interface McpImportResult {
+  imported: MCPServerConfig[];
+  allConfigs: MCPServerConfig[];
+  importPath: string;
+  detectedFiles: string[];
+  warnings: string[];
 }
 
 export interface ModelConfig {
@@ -100,6 +151,7 @@ export interface ModelConfig {
   baseUrl: string;
   apiKey: string;
   apiKeyEnv: string;
+  apiKeyMode: "env" | "direct" | string;
   apiVersion: string;
   organization: string;
   homepage: string;
@@ -110,6 +162,14 @@ export interface ModelConfig {
   enabled: boolean;
   isDefault: boolean;
   notes: string;
+}
+
+export interface EnvVarCheckResult {
+  valid: boolean;
+  exists: boolean;
+  name: string;
+  length: number;
+  message: string;
 }
 
 export interface RagKnowledgeBaseConfig {
@@ -172,6 +232,7 @@ export interface ProjectIR {
   edges: EdgeIR[];
   secrets: Array<{ name: string; env: string }>;
   tools: ToolConfig[];
+  skills: SkillConfig[];
   mcpServers: MCPServerConfig[];
   importedAgents: ImportedAgentConfig[];
   agentLinks: AgentLinkConfig[];
@@ -200,6 +261,59 @@ export interface ProjectHistoryRecord {
   nodeCount: number;
   edgeCount: number;
   snapshot: ProjectIR;
+}
+
+export interface RunHistoryRecord {
+  id: string;
+  projectId: string;
+  projectName: string;
+  createdAt: string;
+  modelConfigId: string | null;
+  modelConfigName: string;
+  inputState: Record<string, unknown>;
+  graphFingerprint?: string;
+  graphSnapshot?: RunHistoryGraphSnapshot;
+  result: RunPreviewResult;
+  runtimeNodes: Record<string, NodeRuntimeState>;
+}
+
+export type RunHistoryReplayMode = "details" | "overlay";
+
+export interface RunHistoryGraphSnapshot {
+  nodeCount: number;
+  edgeCount: number;
+  stateFields: Array<{
+    name: string;
+    type: string;
+  }>;
+  nodes: Array<{
+    id: string;
+    type: NodeType;
+    label: string;
+    inputs: Array<{ id: string; type: string }>;
+    outputs: Array<{ id: string; type: string }>;
+  }>;
+  edges: Array<{
+    source: string;
+    sourceHandle: string | null;
+    target: string;
+    targetHandle: string | null;
+    kind: EdgeKind;
+  }>;
+}
+
+export interface RunHistoryGraphMismatch {
+  reason: "changed" | "legacy";
+  historyFingerprint: string | null;
+  currentFingerprint: string;
+  historyNodeCount: number;
+  currentNodeCount: number;
+  historyEdgeCount: number;
+  currentEdgeCount: number;
+  matchedNodeIds: string[];
+  missingNodeIds: string[];
+  incompatibleNodeIds: string[];
+  addedNodeIds: string[];
 }
 
 export interface ValidationIssue {

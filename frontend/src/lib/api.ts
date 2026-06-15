@@ -1,6 +1,8 @@
 import type {
+  EnvVarCheckResult,
   ExportResponse,
   MCPServerConfig,
+  McpImportResult,
   ModelConfig,
   ProjectIR,
   ProjectListItem,
@@ -9,11 +11,16 @@ import type {
   RunMode,
   RunPreviewResult,
   RunStreamEvent,
+  SkillConfig,
+  SkillImportResult,
   ToolConfig,
+  ToolImportResult,
   ValidationResult,
 } from "../types";
 import {
   ExportResponseSchema,
+  EnvVarCheckSchema,
+  McpImportResultSchema,
   McpServerConfigListSchema,
   ModelConfigListSchema,
   ProjectListSchema,
@@ -21,7 +28,10 @@ import {
   RagKnowledgeBaseInspectionSchema,
   RagKnowledgeBaseListSchema,
   RunPreviewResultSchema,
+  SkillConfigListSchema,
+  SkillImportResultSchema,
   ToolConfigListSchema,
+  ToolImportResultSchema,
   ValidationResultSchema,
 } from "./schemas";
 
@@ -37,6 +47,18 @@ async function request(path: string, init?: RequestInit): Promise<unknown> {
     throw new Error(detail || response.statusText);
   }
   return response.json();
+}
+
+async function parseResponseError(response: Response): Promise<string> {
+  const text = await response.text();
+  if (!text) return response.statusText;
+  try {
+    const parsed = JSON.parse(text) as { detail?: unknown };
+    if (typeof parsed.detail === "string") return parsed.detail;
+  } catch {
+    // Keep the raw response body below.
+  }
+  return text;
 }
 
 export async function createProject(name = "Untitled Agent", kind: "agent" | "agents" = "agent"): Promise<ProjectIR> {
@@ -106,6 +128,75 @@ export async function saveWorkspaceTools(configs: ToolConfig[]): Promise<ToolCon
   return ToolConfigListSchema.parse(data) as ToolConfig[];
 }
 
+export async function importWorkspaceToolsFromSource(sourceType: "local" | "github", source: string, useMirror = true): Promise<ToolImportResult> {
+  const data = await request("/api/workspace/tools/import", {
+    method: "POST",
+    body: JSON.stringify({ sourceType, source, useMirror }),
+  });
+  return ToolImportResultSchema.parse(data) as ToolImportResult;
+}
+
+export async function uploadWorkspaceToolFolder(files: File[], rootName: string): Promise<ToolImportResult> {
+  const form = new FormData();
+  form.append("rootName", rootName);
+  for (const file of files) {
+    const relativePath = "webkitRelativePath" in file && typeof file.webkitRelativePath === "string" && file.webkitRelativePath
+      ? file.webkitRelativePath
+      : file.name;
+    form.append("files", file, relativePath);
+  }
+  const response = await fetch(`${API_BASE}/api/workspace/tools/upload`, {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) {
+    throw new Error(await parseResponseError(response));
+  }
+  const data = await response.json();
+  return ToolImportResultSchema.parse(data) as ToolImportResult;
+}
+
+export async function listWorkspaceSkills(): Promise<SkillConfig[]> {
+  const data = await request("/api/workspace/skills");
+  return SkillConfigListSchema.parse(data) as SkillConfig[];
+}
+
+export async function saveWorkspaceSkills(configs: SkillConfig[]): Promise<SkillConfig[]> {
+  const data = await request("/api/workspace/skills", {
+    method: "PUT",
+    body: JSON.stringify(configs),
+  });
+  return SkillConfigListSchema.parse(data) as SkillConfig[];
+}
+
+export async function importWorkspaceSkillsFromSource(sourceType: "local" | "github", source: string, useMirror = true): Promise<SkillImportResult> {
+  const data = await request("/api/workspace/skills/import", {
+    method: "POST",
+    body: JSON.stringify({ sourceType, source, useMirror }),
+  });
+  return SkillImportResultSchema.parse(data) as SkillImportResult;
+}
+
+export async function uploadWorkspaceSkillFolder(files: File[], rootName: string): Promise<SkillImportResult> {
+  const form = new FormData();
+  form.append("rootName", rootName);
+  for (const file of files) {
+    const relativePath = "webkitRelativePath" in file && typeof file.webkitRelativePath === "string" && file.webkitRelativePath
+      ? file.webkitRelativePath
+      : file.name;
+    form.append("files", file, relativePath);
+  }
+  const response = await fetch(`${API_BASE}/api/workspace/skills/upload`, {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) {
+    throw new Error(await parseResponseError(response));
+  }
+  const data = await response.json();
+  return SkillImportResultSchema.parse(data) as SkillImportResult;
+}
+
 export async function listWorkspaceMcpServers(): Promise<MCPServerConfig[]> {
   const data = await request("/api/workspace/mcp");
   return McpServerConfigListSchema.parse(data) as MCPServerConfig[];
@@ -119,6 +210,14 @@ export async function saveWorkspaceMcpServers(configs: MCPServerConfig[]): Promi
   return McpServerConfigListSchema.parse(data) as MCPServerConfig[];
 }
 
+export async function importWorkspaceMcpServers(payload: { sourceType: "local" | "github"; source: string; useMirror: boolean }): Promise<McpImportResult> {
+  const data = await request("/api/workspace/mcp/import", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  return McpImportResultSchema.parse(data) as McpImportResult;
+}
+
 export async function listWorkspaceModelConfigs(): Promise<ModelConfig[]> {
   const data = await request("/api/workspace/models");
   return ModelConfigListSchema.parse(data) as ModelConfig[];
@@ -130,6 +229,14 @@ export async function saveWorkspaceModelConfigs(configs: ModelConfig[]): Promise
     body: JSON.stringify(configs),
   });
   return ModelConfigListSchema.parse(data) as ModelConfig[];
+}
+
+export async function checkWorkspaceEnvVar(name: string): Promise<EnvVarCheckResult> {
+  const data = await request("/api/workspace/env/check", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+  return EnvVarCheckSchema.parse(data) as EnvVarCheckResult;
 }
 
 export async function listWorkspaceRagKnowledgeBases(): Promise<RagKnowledgeBaseConfig[]> {

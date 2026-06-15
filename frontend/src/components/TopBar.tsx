@@ -5,6 +5,7 @@ import {
   Download,
   History,
   LayoutTemplate,
+  LoaderCircle,
   Map,
   Play,
   RotateCcw,
@@ -22,7 +23,8 @@ export function TopBar() {
   const historyOpen = useProjectStore((state) => state.historyOpen);
   const templatesOpen = useProjectStore((state) => state.templatesOpen);
   const assistantOpen = useProjectStore((state) => state.assistantOpen);
-  const runOpen = useProjectStore((state) => state.runOpen);
+  const runActive = useProjectStore((state) => state.runActive);
+  const runRunning = useProjectStore((state) => state.runRunning);
   const miniMapOpen = useProjectStore((state) => state.miniMapOpen);
   const backToManager = useProjectStore((state) => state.backToManager);
   const updateProjectMeta = useProjectStore((state) => state.updateProjectMeta);
@@ -45,6 +47,7 @@ export function TopBar() {
               className="title-input"
               aria-label="Agent 名称"
               title="修改 Agent 名称"
+              disabled={runActive}
               value={project?.project.name ?? "GraphicLangGraph"}
               onChange={(event) => updateProjectMeta({ name: event.target.value })}
               onBlur={() => void save()}
@@ -52,6 +55,7 @@ export function TopBar() {
             <input
               className="description-input"
               aria-label="Agent 描述"
+              disabled={runActive}
               value={project?.project.description ?? ""}
               onChange={(event) => updateProjectMeta({ description: event.target.value })}
               onBlur={() => void save()}
@@ -73,23 +77,23 @@ export function TopBar() {
             <ShieldCheck size={16} />
             <span>校验</span>
           </button>
-          <button className={runOpen ? "is-active" : ""} onClick={toggleRunPanel} title="运行预览">
-            <Play size={16} />
-            <span>运行</span>
+          <button className={`run-toggle ${runActive ? "is-active" : ""}`} onClick={toggleRunPanel} title={runActive ? "退出运行模式" : "进入运行模式"}>
+            {runRunning ? <LoaderCircle className="spin-icon" size={16} /> : <Play size={16} />}
+            <span>{runActive ? "退出运行" : "运行"}</span>
           </button>
           <button className={miniMapOpen ? "is-active" : ""} onClick={toggleMiniMap} title="显示或隐藏小地图">
             <Map size={16} />
             <span>地图</span>
           </button>
-          <button className={templatesOpen ? "is-active" : ""} onClick={toggleTemplates} title="模板库">
+          <button className={templatesOpen ? "is-active" : ""} disabled={runActive} onClick={toggleTemplates} title={runActive ? "运行模式下不可用" : "模板库"}>
             <LayoutTemplate size={16} />
             <span>模板</span>
           </button>
-          <button className={assistantOpen ? "is-active" : ""} onClick={toggleAssistant} title="搭建助手">
+          <button className={assistantOpen ? "is-active" : ""} disabled={runActive} onClick={toggleAssistant} title={runActive ? "运行模式下不可用" : "搭建助手"}>
             <BotMessageSquare size={16} />
             <span>助手</span>
           </button>
-          <button className={historyOpen ? "is-active" : ""} onClick={toggleHistory} title="历史记录">
+          <button className={historyOpen ? "is-active" : ""} disabled={runActive} onClick={toggleHistory} title={runActive ? "运行模式下不可用" : "历史记录"}>
             <History size={16} />
             <span>历史</span>
           </button>

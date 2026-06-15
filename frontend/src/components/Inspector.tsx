@@ -1,12 +1,13 @@
 import { useMemo } from "react";
 import { X } from "lucide-react";
 import { useProjectStore } from "../store/projectStore";
-import type { MCPServerConfig, ModelConfig, RagKnowledgeBaseConfig, StateField, ToolConfig } from "../types";
+import type { MCPServerConfig, ModelConfig, RagKnowledgeBaseConfig, SkillConfig, StateField, ToolConfig } from "../types";
 import { FloatingPanel } from "./FloatingPanel";
 
 export function Inspector() {
   const project = useProjectStore((state) => state.project);
   const selectedNodeId = useProjectStore((state) => state.selectedNodeId);
+  const runActive = useProjectStore((state) => state.runActive);
   const selectNode = useProjectStore((state) => state.selectNode);
   const projects = useProjectStore((state) => state.projects);
   const workspaceTools = useProjectStore((state) => state.workspaceTools);
@@ -22,6 +23,7 @@ export function Inspector() {
     [project?.nodes, selectedNodeId],
   );
   const availableTools = useMemo(() => mergeById([...(project?.tools ?? []), ...workspaceTools]), [project?.tools, workspaceTools]);
+  const availableSkills = useMemo(() => (project?.skills ?? []).filter((skill) => skill.enabled), [project?.skills]);
   const availableMcpServers = useMemo(
     () => mergeById([...(project?.mcpServers ?? []), ...workspaceMcpServers]),
     [project?.mcpServers, workspaceMcpServers],
@@ -33,7 +35,7 @@ export function Inspector() {
   const availableModelConfigs = useMemo(() => buildModelConfigOptions(workspaceModelConfigs), [workspaceModelConfigs]);
   const availableRagKnowledgeBases = useMemo(() => workspaceRagKnowledgeBases.filter((item) => item.enabled), [workspaceRagKnowledgeBases]);
 
-  if (!project || !node) {
+  if (!project || !node || runActive) {
     return null;
   }
 
@@ -134,6 +136,13 @@ export function Inspector() {
               placeholder="get_order,refund_policy"
             />
           </Field>
+          <Field label="注入 Skills">
+            <SkillMultiSelect
+              skills={availableSkills}
+              selectedIds={parseStringList(node.config.skillIdsJson)}
+              onChange={(ids) => updateNodeConfig(node.id, { skillIdsJson: JSON.stringify(ids) })}
+            />
+          </Field>
           <div className="inline-grid">
             <Field label="最大迭代">
               <input
@@ -154,48 +163,63 @@ export function Inspector() {
       )}
       {node.type === "tool" && (
         <>
-          <Field label="工具名称">
-            <input
-              value={String(node.config.toolName ?? "business_tool")}
-              onChange={(event) => updateNodeConfig(node.id, { toolName: event.target.value })}
-            />
-          </Field>
-          <Field label="来源">
-            <select value={String(node.config.source ?? "python")} onChange={(event) => updateNodeConfig(node.id, { source: event.target.value })}>
-              <option value="python">Python</option>
-              <option value="http">HTTP</option>
-              <option value="mcp">MCP</option>
-              <option value="openapi">OpenAPI</option>
-            </select>
-          </Field>
-          <Field label="描述">
-            <textarea rows={3} value={String(node.config.description ?? "")} onChange={(event) => updateNodeConfig(node.id, { description: event.target.value })} />
-          </Field>
-          <Field label="参数 Schema JSON">
+          <ModelSelectionFields
+            config={node.config}
+            defaultModel="gpt-4.1-mini"
+            defaultProvider="openai"
+            modelConfigs={availableModelConfigs}
+            nodeId={node.id}
+            providerLabel="决策模型配置"
+            providerManualLabel="决策模型供应商标识"
+            providerNote="这是 Tools Agent 用来判断、规划并反复调用工具的模型，不是 Tool 的供应商。"
+            updateNodeConfig={updateNodeConfig}
+          />
+          <Field label="Tools Agent 指令">
             <textarea
-              className="code-area"
               rows={5}
-              value={String(node.config.paramsJson ?? "{}")}
-              onChange={(event) => updateNodeConfig(node.id, { paramsJson: event.target.value })}
+              value={String(node.config.systemPrompt ?? "")}
+              onChange={(event) => updateNodeConfig(node.id, { systemPrompt: event.target.value })}
             />
+          </Field>
+          <Field label="用户输入">
+            <textarea
+              rows={4}
+              value={String(node.config.userPrompt ?? "{{ state.messages }}")}
+              onChange={(event) => updateNodeConfig(node.id, { userPrompt: event.target.value })}
+            />
+          </Field>
+          <Field label="可用 Tools">
+            <ToolMultiSelect
+              tools={availableTools}
+              selectedIds={parseStringList(node.config.toolIdsJson)}
+              onChange={(ids) => {
+                const selectedTools = availableTools.filter((tool) => ids.includes(tool.id));
+                updateNodeConfig(node.id, {
+                  toolIdsJson: JSON.stringify(ids),
+                  toolRegistryJson: JSON.stringify(selectedTools),
+                  tools: selectedTools.map((tool) => tool.name).join(","),
+                });
+              }}
+            />
+            <small className="model-config-note">从主页面「Tools」中已经配置好的工具里选择；未勾选的工具不会暴露给该节点。</small>
           </Field>
           <div className="inline-grid">
-            <Field label="需要审批">
-              <select
-                value={String(Boolean(node.config.requiresApproval ?? false))}
-                onChange={(event) => updateNodeConfig(node.id, { requiresApproval: event.target.value === "true" })}
-              >
-                <option value="false">否</option>
-                <option value="true">是</option>
-              </select>
+            <Field label="最大调用轮次">
+              <input
+                type="number"
+                min={1}
+                value={String(node.config.maxIterations ?? 4)}
+                onChange={(event) => updateNodeConfig(node.id, { maxIterations: Number(event.target.value) })}
+              />
             </Field>
             <Field label="输出字段">
               <input
-                value={String(node.config.outputField ?? "tool_result")}
+                value={String(node.config.outputField ?? "tools_result")}
                 onChange={(event) => updateNodeConfig(node.id, { outputField: event.target.value })}
               />
             </Field>
           </div>
+          <small className="model-config-note">运行到该节点时，模型会读取这里注册的工具信息，并可在多轮内反复调用相同或不同工具。</small>
         </>
       )}
       {node.type === "retriever" && (
@@ -522,36 +546,37 @@ export function Inspector() {
       )}
       {node.type === "skill_node" && (
         <>
-          <Field label="绑定 Skill/Tool">
+          <Field label="绑定 Skill">
             <select
-              value={String(node.config.toolId ?? "")}
+              value={String(node.config.skillId ?? node.config.toolId ?? "")}
               onChange={(event) => {
-                const tool = availableTools.find((item) => item.id === event.target.value);
+                const skill = availableSkills.find((item) => item.id === event.target.value);
                 updateNodeConfig(node.id, {
-                  toolId: tool?.id ?? "",
-                  toolName: tool?.name ?? "未选择 Skill",
-                  toolSource: tool?.source ?? "",
-                  toolDescription: tool?.description ?? "",
+                  skillId: skill?.id ?? "",
+                  skillName: skill?.name ?? "未选择 Skill",
+                  skillContent: skill?.content ?? "",
+                  sourcePath: skill?.sourcePath ?? "",
+                  filePath: skill?.filePath ?? "",
                 });
-                if (tool) updateNode(node.id, { label: tool.name });
+                if (skill) updateNode(node.id, { label: skill.name });
               }}
             >
               <option value="">未选择</option>
-              {availableTools.map((tool) => (
-                <option key={tool.id} value={tool.id}>
-                  {tool.name}
+              {availableSkills.map((skill) => (
+                <option key={skill.id} value={skill.id}>
+                  {skill.name}
                 </option>
               ))}
             </select>
           </Field>
           <Field label="来源">
-            <input value={String(node.config.toolSource ?? "")} onChange={(event) => updateNodeConfig(node.id, { toolSource: event.target.value })} />
+            <input value={String(node.config.sourcePath ?? "")} onChange={(event) => updateNodeConfig(node.id, { sourcePath: event.target.value })} />
           </Field>
-          <Field label="说明">
+          <Field label="内容">
             <textarea
-              rows={3}
-              value={String(node.config.toolDescription ?? "")}
-              onChange={(event) => updateNodeConfig(node.id, { toolDescription: event.target.value })}
+              rows={8}
+              value={String(node.config.skillContent ?? "")}
+              onChange={(event) => updateNodeConfig(node.id, { skillContent: event.target.value })}
             />
           </Field>
           <Field label="输出字段">
@@ -660,6 +685,91 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+function SkillMultiSelect({
+  skills,
+  selectedIds,
+  onChange,
+}: {
+  skills: SkillConfig[];
+  selectedIds: string[];
+  onChange: (ids: string[]) => void;
+}) {
+  if (skills.length === 0) {
+    return <small className="model-config-note">当前项目还没有可用 Skill。先在初始化配置的 Skills tab 添加。</small>;
+  }
+  const selected = new Set(selectedIds);
+  return (
+    <div className="inspector-check-list">
+      {skills.map((skill) => (
+        <label key={skill.id} className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={selected.has(skill.id)}
+            onChange={(event) => {
+              const next = event.target.checked
+                ? [...selectedIds, skill.id]
+                : selectedIds.filter((id) => id !== skill.id);
+              onChange(Array.from(new Set(next)));
+            }}
+          />
+          <span>{skill.name}</span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
+function ToolMultiSelect({
+  tools,
+  selectedIds,
+  onChange,
+}: {
+  tools: ToolConfig[];
+  selectedIds: string[];
+  onChange: (ids: string[]) => void;
+}) {
+  if (tools.length === 0) {
+    return <small className="model-config-note">当前还没有可用 Tool。先在主页面「Tools」管理区导入或新增工具。</small>;
+  }
+  const selected = new Set(selectedIds);
+  return (
+    <div className="inspector-check-list">
+      {tools.map((tool) => (
+        <label key={tool.id} className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={selected.has(tool.id)}
+            onChange={(event) => {
+              const next = event.target.checked
+                ? [...selectedIds, tool.id]
+                : selectedIds.filter((id) => id !== tool.id);
+              onChange(Array.from(new Set(next)));
+            }}
+          />
+          <span>
+            <strong>{tool.name}</strong>
+            <small>{tool.source || "tool"} · {tool.description || "未填写描述"}</small>
+          </span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
+function parseStringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item).trim()).filter(Boolean);
+  }
+  const text = String(value ?? "").trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed.map((item) => String(item).trim()).filter(Boolean) : [];
+  } catch {
+    return text.split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean);
+  }
+}
+
 function inspectorInitialRect() {
   const viewportWidth = typeof window === "undefined" ? 1440 : window.innerWidth;
   const viewportHeight = typeof window === "undefined" ? 900 : window.innerHeight;
@@ -696,6 +806,9 @@ function ModelSelectionFields({
   defaultModel,
   modelConfigs,
   nodeId,
+  providerLabel = "供应商",
+  providerManualLabel = "供应商",
+  providerNote = "从管理页已保存的模型配置中选择；保存后会写入节点的供应商和模型。",
   updateNodeConfig,
 }: {
   config: Record<string, unknown>;
@@ -703,6 +816,9 @@ function ModelSelectionFields({
   defaultModel: string;
   modelConfigs: ModelConfigOption[];
   nodeId: string;
+  providerLabel?: string;
+  providerManualLabel?: string;
+  providerNote?: string;
   updateNodeConfig: (nodeId: string, patch: Record<string, unknown>) => void;
 }) {
   const provider = String(config.provider ?? defaultProvider);
@@ -718,9 +834,9 @@ function ModelSelectionFields({
   if (modelConfigs.length === 0) {
     return (
       <>
-        <Field label="供应商">
+        <Field label={providerManualLabel}>
           <input value={provider} onChange={(event) => updateNodeConfig(nodeId, { provider: event.target.value, modelConfigId: "", modelConfigName: "" })} />
-          <small className="model-config-note">还没有本地模型配置，暂时使用手动输入。可在管理页「模型」中添加。</small>
+          <small className="model-config-note">还没有本地模型配置，暂时使用手动输入。可在管理页「模型」中添加。{providerNote}</small>
         </Field>
         <Field label="模型">
           <input value={model} onChange={(event) => updateNodeConfig(nodeId, { model: event.target.value })} />
@@ -731,7 +847,7 @@ function ModelSelectionFields({
 
   return (
     <>
-      <Field label="供应商">
+      <Field label={providerLabel}>
         <select
           value={selectedConfig?.id ?? ""}
           onChange={(event) => {
@@ -761,7 +877,7 @@ function ModelSelectionFields({
             </option>
           ))}
         </select>
-        <small className="model-config-note">从管理页已保存的模型配置中选择；保存后会写入节点的供应商和模型。</small>
+        <small className="model-config-note">{providerNote}</small>
       </Field>
       {selectedConfig ? (
         <Field label="模型">

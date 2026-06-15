@@ -68,13 +68,41 @@ export const ProjectSchema = z.object({
       schemaJson: z.string(),
     }),
   ).default([]),
+  skills: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      description: z.string(),
+      sourceType: z.string().default("manual"),
+      sourcePath: z.string().default(""),
+      filePath: z.string().default(""),
+      content: z.string().default(""),
+      metadataJson: z.string().default("{}"),
+      enabled: z.boolean().default(true),
+    }),
+  ).default([]),
   mcpServers: z.array(
     z.object({
       id: z.string(),
       name: z.string(),
       transport: z.string(),
       command: z.string(),
+      argsJson: z.string().default("[]"),
+      envJson: z.string().default("{}"),
+      envVarsJson: z.string().default("[]"),
+      cwd: z.string().default(""),
       url: z.string(),
+      bearerTokenEnvVar: z.string().default(""),
+      httpHeadersJson: z.string().default("{}"),
+      envHttpHeadersJson: z.string().default("{}"),
+      enabled: z.boolean().default(true),
+      startupTimeoutSec: z.number().default(10),
+      toolTimeoutSec: z.number().default(60),
+      enabledToolsJson: z.string().default("[]"),
+      disabledToolsJson: z.string().default("[]"),
+      defaultToolsApprovalMode: z.string().default(""),
+      sourceType: z.string().default("manual"),
+      sourcePath: z.string().default(""),
       description: z.string(),
     }),
   ).default([]),
@@ -150,6 +178,7 @@ export const ModelConfigSchema = z.object({
   baseUrl: z.string(),
   apiKey: z.string(),
   apiKeyEnv: z.string(),
+  apiKeyMode: z.string().default("env"),
   apiVersion: z.string(),
   organization: z.string(),
   homepage: z.string(),
@@ -164,6 +193,14 @@ export const ModelConfigSchema = z.object({
 
 export const ModelConfigListSchema = z.array(ModelConfigSchema);
 
+export const EnvVarCheckSchema = z.object({
+  valid: z.boolean(),
+  exists: z.boolean(),
+  name: z.string(),
+  length: z.number(),
+  message: z.string(),
+});
+
 export const ToolConfigSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -174,16 +211,69 @@ export const ToolConfigSchema = z.object({
 
 export const ToolConfigListSchema = z.array(ToolConfigSchema);
 
+export const ToolImportResultSchema = z.object({
+  imported: ToolConfigListSchema,
+  allConfigs: ToolConfigListSchema,
+  importPath: z.string(),
+  detectedFiles: z.array(z.string()),
+  warnings: z.array(z.string()),
+});
+
+export const SkillConfigSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  sourceType: z.string().default("manual"),
+  sourcePath: z.string().default(""),
+  filePath: z.string().default(""),
+  content: z.string().default(""),
+  metadataJson: z.string().default("{}"),
+  enabled: z.boolean().default(true),
+});
+
+export const SkillConfigListSchema = z.array(SkillConfigSchema);
+
+export const SkillImportResultSchema = z.object({
+  imported: z.array(SkillConfigSchema),
+  allConfigs: z.array(SkillConfigSchema),
+  importPath: z.string(),
+  detectedFiles: z.array(z.string()),
+  warnings: z.array(z.string()),
+});
+
 export const McpServerConfigSchema = z.object({
   id: z.string(),
   name: z.string(),
   transport: z.string(),
   command: z.string(),
+  argsJson: z.string().default("[]"),
+  envJson: z.string().default("{}"),
+  envVarsJson: z.string().default("[]"),
+  cwd: z.string().default(""),
   url: z.string(),
+  bearerTokenEnvVar: z.string().default(""),
+  httpHeadersJson: z.string().default("{}"),
+  envHttpHeadersJson: z.string().default("{}"),
+  enabled: z.boolean().default(true),
+  startupTimeoutSec: z.number().default(10),
+  toolTimeoutSec: z.number().default(60),
+  enabledToolsJson: z.string().default("[]"),
+  disabledToolsJson: z.string().default("[]"),
+  defaultToolsApprovalMode: z.string().default(""),
+  sourceType: z.string().default("manual"),
+  sourcePath: z.string().default(""),
   description: z.string(),
 });
 
 export const McpServerConfigListSchema = z.array(McpServerConfigSchema);
+
+export const McpImportResultSchema = z.object({
+  imported: z.array(McpServerConfigSchema),
+  allConfigs: z.array(McpServerConfigSchema),
+  importPath: z.string(),
+  detectedFiles: z.array(z.string()),
+  warnings: z.array(z.string()),
+});
 
 export const RagKnowledgeBaseSchema = z.object({
   id: z.string(),

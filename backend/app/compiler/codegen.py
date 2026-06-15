@@ -57,6 +57,7 @@ def generate_project_files(project: ProjectIR) -> dict[str, str]:
         f"src/{package}/config.py": _config_py(),
         f"src/{package}/state.py": _state_py(project),
         f"src/{package}/tools.py": _tools_py(project),
+        f"src/{package}/skills.py": _skills_py(project),
         f"src/{package}/nodes.py": _nodes_py(project),
         f"src/{package}/routers.py": _routers_py(project),
         f"src/{package}/graph.py": _graph_py(project),
@@ -292,6 +293,37 @@ def _tools_py(project: ProjectIR) -> str:
     return "\n".join(lines)
 
 
+def _skills_py(project: ProjectIR) -> str:
+    skills = [skill for skill in project.skills if getattr(skill, "enabled", True) is not False]
+    if not skills:
+        return "from __future__ import annotations\n\n\nSKILL_REGISTRY = {}\n"
+
+    registry: dict[str, dict[str, str]] = {}
+    for skill in skills:
+        payload = {
+            "id": str(skill.id),
+            "name": str(skill.name or skill.id),
+            "description": str(skill.description or ""),
+            "sourcePath": str(skill.source_path or ""),
+            "filePath": str(skill.file_path or ""),
+            "content": str(skill.content or ""),
+        }
+        if payload["id"]:
+            registry[payload["id"]] = payload
+        if payload["name"] and payload["name"] not in registry:
+            registry[payload["name"]] = payload
+
+    return "\n".join(
+        [
+            "from __future__ import annotations",
+            "",
+            "",
+            f"SKILL_REGISTRY = {json.dumps(registry, ensure_ascii=False, indent=2)}",
+            "",
+        ]
+    )
+
+
 def _tool_specs(project: ProjectIR) -> dict[str, str]:
     specs: dict[str, str] = {}
     for tool_config in project.tools:
@@ -325,6 +357,7 @@ def _nodes_py(project: ProjectIR) -> str:
         "",
         "from .config import env, render_template",
         "from .state import AgentState",
+        "from .skills import SKILL_REGISTRY",
         "from .tools import TOOL_REGISTRY",
         "",
     ]
@@ -371,13 +404,15 @@ def _node_function(node: NodeIR) -> str:
         max_iterations = int(node.config.get("maxIterations", 4) or 4)
         output_field = py_name(str(node.config.get("outputField", f"{function_name}_result")))
         tool_names = json.dumps(_csv_tool_names(str(node.config.get("tools", ""))), ensure_ascii=False)
+        skill_ids = json.dumps(_json_string_list(node.config.get("skillIdsJson")), ensure_ascii=False)
         return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
     model_ref = _chat_model({provider}, {model}, {base_url}, {api_key_env}, {api_version}, {organization})
     tool_names = {tool_names}
+    skill_ids = {skill_ids}
     tools = [TOOL_REGISTRY[name] for name in tool_names if name in TOOL_REGISTRY]
     user_content = _agent_user_content(state, {user_prompt})
     messages = []
-    system_content = render_template({system_prompt}, state)
+    system_content = _system_with_skills(render_template({system_prompt}, state), skill_ids)
     if system_content:
         messages.append(("system", system_content))
     messages.append(("user", user_content))
@@ -393,19 +428,17 @@ def _node_function(node: NodeIR) -> str:
     }}
 '''
     if node.type == NodeType.TOOL:
-        tool_name = json.dumps(str(node.config.get("toolName", node.label or function_name)))
-        description = json.dumps(str(node.config.get("description", "")))
-        params_json = json.dumps(str(node.config.get("paramsJson", "{}")))
+        tool_ids = json.dumps(_json_list(node.config.get("toolIdsJson")), ensure_ascii=False)
+        tool_registry = json.dumps(_json_list(node.config.get("toolRegistryJson")), ensure_ascii=False)
+        max_iterations = int(node.config.get("maxIterations", 4) or 4)
         output_field = py_name(str(node.config.get("outputField", f"{function_name}_result")))
-        requires_approval = bool(node.config.get("requiresApproval", False))
         return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
     return {{
         "{output_field}": {{
-            "tool": {tool_name},
-            "description": {description},
-            "params_schema": {params_json},
-            "requires_approval": {requires_approval!r},
-            "status": "configured",
+            "registered_tool_ids": {tool_ids},
+            "registered_tools": {tool_registry},
+            "max_iterations": {max_iterations},
+            "status": "tools_agent_configured",
         }}
     }}
 '''
@@ -524,6 +557,16 @@ def _node_function(node: NodeIR) -> str:
         "{output_field}": content,
         "messages": [AIMessage(content=content)],
     }}
+'''
+    if node.type == NodeType.SKILL_NODE:
+        skill_id = json.dumps(str(node.config.get("skillId") or node.config.get("toolId") or ""))
+        skill_name = json.dumps(str(node.config.get("skillName") or node.config.get("toolName") or node.label or "Skill"))
+        skill_content = json.dumps(str(node.config.get("skillContent") or node.config.get("content") or ""))
+        output_field = py_name(str(node.config.get("outputField", f"{function_name}_skill")))
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    skill = SKILL_REGISTRY.get({skill_id}) or SKILL_REGISTRY.get({skill_name}) or {{}}
+    content = str(skill.get("content") or {skill_content})
+    return {{"{output_field}": content}}
 '''
     if node.type == NodeType.CUSTOM_FUNCTION:
         code = str(node.config.get("code", "return {}"))
@@ -715,6 +758,19 @@ def _nodes_helpers() -> str:
     return init_chat_model(model, model_provider=provider_key, **kwargs)
 
 
+def _system_with_skills(system_prompt: str, skill_ids: list[str]) -> str:
+    selected = [SKILL_REGISTRY[skill_id] for skill_id in skill_ids if skill_id in SKILL_REGISTRY]
+    if not selected:
+        return system_prompt.strip()
+    sections = ["可用 Skills:"]
+    for skill in selected:
+        name = str(skill.get("name") or skill.get("id") or "Skill")
+        content = str(skill.get("content") or "").strip() or "（该 Skill 暂无内容）"
+        sections.append(f"### {name}\\n{content}")
+    skill_prompt = "\\n\\n".join(sections)
+    return f"{system_prompt.strip()}\\n\\n{skill_prompt}".strip() if system_prompt.strip() else skill_prompt
+
+
 def _messages_from_state(state: AgentState, system_prompt: str = "") -> list[tuple[str, str]]:
     messages: list[tuple[str, str]] = []
     if system_prompt:
@@ -847,6 +903,34 @@ def _csv_tool_names(value: str) -> list[str]:
         if name and name not in names:
             names.append(name)
     return names
+
+
+def _json_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return _csv_tool_names(text)
+    if not isinstance(parsed, list):
+        return []
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return _csv_tool_names(text)
+    return parsed if isinstance(parsed, list) else []
 
 
 def _parse_json_object(value: str) -> dict[str, Any]:

@@ -1,20 +1,24 @@
 import { useState } from "react";
-import { Bot, Cable, Link2, Server, Wrench } from "lucide-react";
+import { Bot, Cable, Link2, Plug, Server, Wrench } from "lucide-react";
 import { useProjectStore } from "../store/projectStore";
-import type { AgentLinkConfig, ImportedAgentConfig, MCPServerConfig, ToolConfig } from "../types";
+import type { AgentLinkConfig, ImportedAgentConfig, MCPServerConfig, SkillConfig, ToolConfig } from "../types";
 
-type TabKey = "tools" | "mcp" | "agents" | "links";
+type TabKey = "tools" | "skills" | "mcp" | "agents" | "links";
 
 export function ResourceConfigPanel() {
   const project = useProjectStore((state) => state.project);
   const projects = useProjectStore((state) => state.projects);
+  const workspaceSkills = useProjectStore((state) => state.workspaceSkills);
   const updateTools = useProjectStore((state) => state.updateTools);
+  const updateSkills = useProjectStore((state) => state.updateSkills);
   const updateMcpServers = useProjectStore((state) => state.updateMcpServers);
   const updateImportedAgents = useProjectStore((state) => state.updateImportedAgents);
   const updateAgentLinks = useProjectStore((state) => state.updateAgentLinks);
   const [tab, setTab] = useState<TabKey>("tools");
+  const [selectedSkillId, setSelectedSkillId] = useState("");
 
   if (!project) return null;
+  const projectSkills = project.skills ?? [];
 
   return (
     <aside className="resource-panel glass-panel">
@@ -24,6 +28,7 @@ export function ResourceConfigPanel() {
       </div>
       <div className="resource-tabs">
         <TabButton active={tab === "tools"} icon={<Wrench size={15} />} label="Tools" onClick={() => setTab("tools")} />
+        <TabButton active={tab === "skills"} icon={<Plug size={15} />} label="Skills" onClick={() => setTab("skills")} />
         <TabButton active={tab === "mcp"} icon={<Server size={15} />} label="MCP" onClick={() => setTab("mcp")} />
         <TabButton active={tab === "agents"} icon={<Bot size={15} />} label="Agents" onClick={() => setTab("agents")} />
         <TabButton active={tab === "links"} icon={<Cable size={15} />} label="通信" onClick={() => setTab("links")} />
@@ -55,6 +60,22 @@ export function ResourceConfigPanel() {
               </Field>
             </>
           )}
+        />
+      )}
+
+      {tab === "skills" && (
+        <SkillProjectList
+          items={projectSkills}
+          workspaceSkills={workspaceSkills}
+          selectedSkillId={selectedSkillId}
+          onSelectSkill={setSelectedSkillId}
+          onAdd={(skill) => {
+            if (!skill || projectSkills.some((item) => item.id === skill.id)) return;
+            updateSkills([...projectSkills, skill]);
+            setSelectedSkillId("");
+          }}
+          onToggle={(id, enabled) => updateSkills(updateItem(projectSkills, id, { enabled }))}
+          onRemove={(id) => updateSkills(projectSkills.filter((item) => item.id !== id))}
         />
       )}
 
@@ -159,6 +180,64 @@ function TabButton({ active, icon, label, onClick }: { active: boolean; icon: Re
   );
 }
 
+function SkillProjectList({
+  items,
+  workspaceSkills,
+  selectedSkillId,
+  onSelectSkill,
+  onAdd,
+  onToggle,
+  onRemove,
+}: {
+  items: SkillConfig[];
+  workspaceSkills: SkillConfig[];
+  selectedSkillId: string;
+  onSelectSkill: (id: string) => void;
+  onAdd: (skill: SkillConfig | undefined) => void;
+  onToggle: (id: string, enabled: boolean) => void;
+  onRemove: (id: string) => void;
+}) {
+  const available = workspaceSkills.filter((skill) => !items.some((item) => item.id === skill.id));
+  const selected = available.find((skill) => skill.id === selectedSkillId);
+  return (
+    <div className="resource-list">
+      <div className="resource-add resource-add--picker">
+        <select value={selectedSkillId} onChange={(event) => onSelectSkill(event.target.value)}>
+          <option value="">从全局 Skills 选择</option>
+          {available.map((skill) => (
+            <option key={skill.id} value={skill.id}>
+              {skill.name}
+            </option>
+          ))}
+        </select>
+        <button onClick={() => onAdd(selected)} disabled={!selected} type="button">
+          <Link2 size={15} />
+          <span>添加 Skill</span>
+        </button>
+      </div>
+      {items.length === 0 ? <div className="resource-empty">还没有添加项目 Skill。先在管理页导入全局 Skills，再从上方选择。</div> : null}
+      {items.map((skill) => (
+        <section key={skill.id} className="resource-card">
+          <Field label="名称">
+            <input readOnly value={skill.name} />
+          </Field>
+          <Field label="说明">
+            <textarea readOnly rows={2} value={skill.description || skill.content.slice(0, 160)} />
+          </Field>
+          <Field label="来源">
+            <input readOnly value={skill.filePath || skill.sourcePath || skill.sourceType} />
+          </Field>
+          <label className="checkbox-row">
+            <input checked={skill.enabled} onChange={(event) => onToggle(skill.id, event.target.checked)} type="checkbox" />
+            <span>启用该项目 Skill</span>
+          </label>
+          <button className="danger resource-remove" onClick={() => onRemove(skill.id)} type="button">移除</button>
+        </section>
+      ))}
+    </div>
+  );
+}
+
 function ResourceList<T extends { id: string }>({
   items,
   emptyText,
@@ -207,7 +286,29 @@ function newTool(): ToolConfig {
 }
 
 function newMcpServer(): MCPServerConfig {
-  return { id: createId("mcp"), name: "新 MCP", transport: "stdio", command: "", url: "", description: "" };
+  return {
+    id: createId("mcp"),
+    name: "新 MCP",
+    transport: "stdio",
+    command: "",
+    argsJson: "[]",
+    envJson: "{}",
+    envVarsJson: "[]",
+    cwd: "",
+    url: "",
+    bearerTokenEnvVar: "",
+    httpHeadersJson: "{}",
+    envHttpHeadersJson: "{}",
+    enabled: true,
+    startupTimeoutSec: 10,
+    toolTimeoutSec: 60,
+    enabledToolsJson: "[]",
+    disabledToolsJson: "[]",
+    defaultToolsApprovalMode: "",
+    sourceType: "manual",
+    sourcePath: "",
+    description: "",
+  };
 }
 
 function newImportedAgent(projects: { id: string; name: string }[], currentProjectId: string): ImportedAgentConfig {
@@ -237,6 +338,7 @@ function createId(prefix: string) {
 
 function tabLabel(tab: TabKey) {
   if (tab === "tools") return "Tools";
+  if (tab === "skills") return "Skills";
   if (tab === "mcp") return "MCP";
   if (tab === "agents") return "Agents";
   return "通信";

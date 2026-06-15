@@ -1,11 +1,15 @@
+import { useState } from "react";
 import { Handle, Position } from "@xyflow/react";
 import {
   Bot,
   Braces,
   BrainCircuit,
+  ChevronDown,
+  ChevronUp,
   Database,
   GitBranch,
   Globe,
+  LoaderCircle,
   MessageSquareReply,
   Play,
   Plug,
@@ -17,6 +21,8 @@ import {
 } from "lucide-react";
 import { useProjectStore } from "../store/projectStore";
 import type { NodeRuntimeState, NodeType, Port } from "../types";
+import { RunInputEditor, RunModelPicker, RunStartButton } from "./RunControls";
+import { RuntimeValueView } from "./RuntimeValueView";
 
 interface AgentNodeData {
   id: string;
@@ -50,91 +56,132 @@ export function AgentNode({ id, data, selected }: { id: string; data: AgentNodeD
   const hasManyOutputs = data.outputs.length > 1;
   const handlePortClick = useProjectStore((state) => state.handlePortClick);
   const selectNode = useProjectStore((state) => state.selectNode);
+  const runActive = useProjectStore((state) => state.runActive);
   const summary = nodeSummary(data.nodeType, data.config);
+  const selectedTools = data.nodeType === "tool" ? selectedToolNames(data.config) : [];
   const runtime = data.runtime ?? null;
+  const [runtimeOpen, setRuntimeOpen] = useState(false);
+  const hasRuntimeOutput = Boolean(runtime && Object.keys(runtime.outputDelta).length);
+  const runtimeClass = runtime ? `is-runtime-${runtime.status}` : "";
+  const nodeRunning = runtime?.status === "running";
   return (
     <div
-      className={`agent-node ${hasManyOutputs ? "has-ports" : ""} ${selected ? "is-selected" : ""} ${runtime ? `is-runtime-${runtime.status}` : ""}`}
-      data-node-type={data.nodeType}
-      onClick={() => selectNode(id)}
+      className={`agent-node-frame ${runtimeClass}`}
     >
-      {data.inputs.map((port, index) => (
-        <Handle
-          key={port.id}
-          id={port.id}
-          type="target"
-          position={Position.Left}
-          className="node-handle node-handle--target"
-          title={port.label ?? port.id}
-          onClick={(event) => {
-            event.stopPropagation();
-            handlePortClick(id, "target", port.id);
-          }}
-          style={{ top: `${62 + index * 22}px` }}
-        />
-      ))}
-      <div className="agent-node__head">
-        <span className="agent-node__head-left">
-          <span className="agent-node__icon">
-            <Icon size={15} />
-          </span>
-          <span className="agent-node__type">{nodeTypeLabel(data.nodeType)}</span>
-        </span>
-        <button
-          className="agent-node__edit nodrag nopan"
-          title="查看详情并编辑"
-          onClick={(event) => {
-            event.stopPropagation();
-            selectNode(id);
-          }}
-        >
-          编辑
-        </button>
-      </div>
-      <div className="agent-node__label">{data.label}</div>
-      <div className="agent-node__id">{id}</div>
-      <div className="agent-node__summary">
-        {summary.map((item) => (
-          <div key={item.label} className="agent-node__summary-row">
-            <span>{item.label}</span>
-            <strong>{item.value}</strong>
-          </div>
+      <div
+        className={`agent-node ${hasManyOutputs ? "has-ports" : ""} ${selected ? "is-selected" : ""} ${runtimeClass}`}
+        data-node-type={data.nodeType}
+        onClick={() => selectNode(id)}
+      >
+        {data.inputs.map((port, index) => (
+          <Handle
+            key={port.id}
+            id={port.id}
+            type="target"
+            position={Position.Left}
+            className="node-handle node-handle--target"
+            title={port.label ?? port.id}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (runActive) return;
+              handlePortClick(id, "target", port.id);
+            }}
+            style={{ top: `${62 + index * 22}px` }}
+          />
         ))}
-      </div>
-      {data.outputs.length > 1 && (
-        <div className="agent-node__ports">
-          {data.outputs.map((port) => (
-            <span key={port.id}>{port.label ?? port.id}</span>
+        <div className="agent-node__head">
+          <span className="agent-node__head-left">
+            <span className="agent-node__icon">
+              <Icon size={15} />
+            </span>
+            <span className="agent-node__type">{nodeTypeLabel(data.nodeType)}</span>
+          </span>
+          <span className="agent-node__head-actions">
+            {nodeRunning ? (
+              <span className="agent-node__running-indicator" title="节点运行中">
+                <LoaderCircle className="spin-icon" size={15} />
+              </span>
+            ) : null}
+            {!runActive ? (
+              <button
+                className="agent-node__edit nodrag nopan"
+                title="查看详情并编辑"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  selectNode(id);
+                }}
+              >
+                编辑
+              </button>
+            ) : null}
+          </span>
+        </div>
+        <div className="agent-node__label">{data.label}</div>
+        <div className="agent-node__id">{id}</div>
+        <div className="agent-node__summary">
+          {summary.map((item) => (
+            <div key={item.label} className="agent-node__summary-row">
+              <span>{item.label}</span>
+              <strong>{item.value}</strong>
+            </div>
           ))}
         </div>
-      )}
-      {runtime ? (
-        <div className="agent-node__runtime">
-          <div className="agent-node__runtime-head">
-            <span>{runtimeStatusLabel(runtime.status)}</span>
-            {runtime.durationMs ? <small>{runtime.durationMs}ms</small> : null}
+        {selectedTools.length > 0 ? (
+          <div className="agent-node__tool-list nodrag nopan" title="该节点可用 Tools">
+            {selectedTools.map((tool, index) => (
+              <span key={`${tool}-${index}`}>{tool}</span>
+            ))}
           </div>
-          {runtime.detail ? <div className="agent-node__runtime-detail">{runtime.detail}</div> : null}
-          {Object.keys(runtime.outputDelta).length ? (
-            <pre className="agent-node__runtime-output">{formatRuntimeValue(runtime.outputDelta)}</pre>
-          ) : null}
+        ) : null}
+        {data.outputs.length > 1 && (
+          <div className="agent-node__ports">
+            {data.outputs.map((port) => (
+              <span key={port.id}>{port.label ?? port.id}</span>
+            ))}
+          </div>
+        )}
+        {data.outputs.map((port, index) => (
+          <Handle
+            key={port.id}
+            id={port.id}
+            type="source"
+            position={Position.Right}
+            className="node-handle node-handle--source"
+            title={port.label ?? port.id}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (runActive) return;
+              handlePortClick(id, "source", port.id);
+            }}
+            style={{ top: hasManyOutputs ? `${154 + index * 24}px` : "50%" }}
+          />
+        ))}
+      </div>
+      {runActive && data.nodeType === "start" ? <StartNodeRunControls /> : null}
+      {runtime ? (
+        <div className={`agent-node__runtime nodrag nopan ${runtimeOpen ? "is-open" : ""}`}>
+          <div className="agent-node__runtime-head">
+            <span className="agent-node__runtime-status">{runtimeStatusLabel(runtime.status)}</span>
+            <span className="agent-node__runtime-actions">
+              {runtime.durationMs ? <small>{runtime.durationMs}ms</small> : null}
+              <button
+                type="button"
+                className="agent-node__runtime-toggle nodrag nopan"
+                title={runtimeOpen ? "收起运行结果" : "展开运行结果"}
+                aria-label={runtimeOpen ? "收起运行结果" : "展开运行结果"}
+                aria-expanded={runtimeOpen}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setRuntimeOpen((open) => !open);
+                }}
+              >
+                {runtimeOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+              </button>
+            </span>
+          </div>
+          {runtimeOpen ? <RuntimeResult runtime={runtime} hasOutput={hasRuntimeOutput} /> : null}
         </div>
       ) : null}
-      {data.outputs.map((port, index) => (
-        <Handle
-          key={port.id}
-          id={port.id}
-          type="source"
-          position={Position.Right}
-          className="node-handle node-handle--source"
-          title={port.label ?? port.id}
-          onClick={(event) => {
-            event.stopPropagation();
-            handlePortClick(id, "source", port.id);
-          }}
-          style={{ top: hasManyOutputs ? `${154 + index * 24}px` : "50%" }}
-        />
-      ))}
     </div>
   );
 }
@@ -156,9 +203,65 @@ function runtimeStatusLabel(status: NodeRuntimeState["status"]) {
   }
 }
 
-function formatRuntimeValue(value: Record<string, unknown>) {
-  const textValue = JSON.stringify(value, null, 2);
-  return textValue.length > 520 ? `${textValue.slice(0, 520)}...` : textValue;
+function RuntimeResult({ runtime, hasOutput }: { runtime: NodeRuntimeState; hasOutput: boolean }) {
+  const entries = Object.entries(runtime.outputDelta);
+  return (
+    <div className="agent-node__runtime-body nodrag nopan">
+      {runtime.detail ? <div className="agent-node__runtime-detail">{runtime.detail}</div> : null}
+      {hasOutput ? (
+        <div className="agent-node__runtime-vars">
+          {entries.map(([name, value]) => (
+            <section key={name} className="agent-node__runtime-var">
+              <div className="agent-node__runtime-var-name">state.{name}</div>
+              <RuntimeValueView value={value} />
+            </section>
+          ))}
+        </div>
+      ) : (
+        <div className="agent-node__runtime-empty">暂无输出内容</div>
+      )}
+    </div>
+  );
+}
+
+function StartNodeRunControls() {
+  const [open, setOpen] = useState(true);
+  const project = useProjectStore((state) => state.project);
+  const runInput = useProjectStore((state) => state.runInput);
+  const runRunning = useProjectStore((state) => state.runRunning);
+  const workspaceModelConfigs = useProjectStore((state) => state.workspaceModelConfigs);
+  const selectedRunModelConfigId = useProjectStore((state) => state.selectedRunModelConfigId);
+  const setRunInput = useProjectStore((state) => state.setRunInput);
+  const setSelectedRunModelConfigId = useProjectStore((state) => state.setSelectedRunModelConfigId);
+  const runPreview = useProjectStore((state) => state.runPreview);
+
+  return (
+    <div className={`agent-node__start-run nodrag nopan ${open ? "is-open" : "is-collapsed"}`} onClick={(event) => event.stopPropagation()}>
+      <button
+        aria-label={open ? "收起开始节点运行控件" : "展开开始节点运行控件"}
+        className="agent-node__start-run-toggle nodrag nopan"
+        data-no-drag
+        onClick={(event) => {
+          event.stopPropagation();
+          setOpen((current) => !current);
+        }}
+        onPointerDown={(event) => event.stopPropagation()}
+        title={open ? "收起" : "展开"}
+        type="button"
+      >
+        {open ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+      </button>
+      {open ? <RunInputEditor project={project} runInput={runInput} setRunInput={setRunInput} /> : null}
+      <div className="run-inline-controls">
+        <RunModelPicker
+          models={workspaceModelConfigs}
+          selectedModelId={selectedRunModelConfigId}
+          onChange={setSelectedRunModelConfigId}
+        />
+        <RunStartButton running={runRunning} onRun={() => void runPreview()} />
+      </div>
+    </div>
+  );
 }
 
 function nodeSummary(type: NodeType, config: Record<string, unknown>) {
@@ -177,11 +280,13 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
       return [
         { label: "模型", value: text(config.model, "gpt-4.1-mini") },
         { label: "工具", value: text(config.tools, "未绑定") },
+        { label: "Skills", value: skillSummary(config.skillIdsJson) },
       ];
     case "tool":
       return [
-        { label: "工具", value: text(config.toolName, "business_tool") },
-        { label: "输出", value: text(config.outputField, "tool_result") },
+        { label: "Tools", value: selectedToolNames(config).length ? `${selectedToolNames(config).length} 个` : "未绑定" },
+        { label: "轮次", value: text(config.maxIterations, "4") },
+        { label: "输出", value: text(config.outputField, "tools_result") },
       ];
     case "retriever":
       return [
@@ -220,7 +325,7 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
       ];
     case "skill_node":
       return [
-        { label: "Skill", value: text(config.toolName, "未选择 Skill") },
+        { label: "Skill", value: text(config.skillName ?? config.toolName, "未选择 Skill") },
         { label: "输出", value: text(config.outputField, "skill_result") },
       ];
     case "mcp_node":
@@ -240,6 +345,56 @@ function text(value: unknown, fallback: string) {
   if (typeof value === "string" && value.trim()) return value.trim();
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return fallback;
+}
+
+function skillSummary(value: unknown) {
+  const ids = parseStringList(value);
+  return ids.length ? `${ids.length} 个` : "未绑定";
+}
+
+function selectedToolNames(config: Record<string, unknown>): string[] {
+  const registry = parseObjectList(config.toolRegistryJson);
+  const names = registry
+    .map((item) => text(item.name ?? item.id, ""))
+    .filter(Boolean);
+  if (names.length) return uniqueStrings(names);
+  const toolsText = text(config.tools, "");
+  if (toolsText) return uniqueStrings(toolsText.split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean));
+  return uniqueStrings(parseStringList(config.toolIdsJson));
+}
+
+function parseObjectList(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+  }
+  const textValue = String(value ?? "").trim();
+  if (!textValue) return [];
+  try {
+    const parsed = JSON.parse(textValue);
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function uniqueStrings(items: string[]) {
+  return Array.from(new Set(items.map((item) => item.trim()).filter(Boolean)));
+}
+
+function parseStringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item).trim()).filter(Boolean);
+  }
+  const textValue = String(value ?? "").trim();
+  if (!textValue) return [];
+  try {
+    const parsed = JSON.parse(textValue);
+    return Array.isArray(parsed) ? parsed.map((item) => String(item).trim()).filter(Boolean) : [];
+  } catch {
+    return textValue.split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean);
+  }
 }
 
 function operatorLabel(operator: string) {

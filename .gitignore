@@ -13,6 +13,12 @@ __pycache__/
 !/.env.example
 storage/projects/*.json
 storage/workspace/*.json
+config/mcp/*
+!config/mcp/.gitkeep
+config/tools/*
+!config/tools/.gitkeep
+config/skills/*
+!config/skills/.gitkeep
 exports/*.zip
 exports/*.png
 exports/builds/

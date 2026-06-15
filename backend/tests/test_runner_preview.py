@@ -3,7 +3,7 @@ import sys
 from types import SimpleNamespace
 from pathlib import Path
 
-from app.ir.schemas import EdgeIR, EdgeKind, NodeIR, NodeType, StateField, create_default_project
+from app.ir.schemas import EdgeIR, EdgeKind, NodeIR, NodeType, SkillConfig, StateField, ToolConfig, create_default_project
 from app.runner import preview
 
 
@@ -211,6 +211,159 @@ def test_live_preview_keeps_explicit_node_model(monkeypatch):
     assert seen["model"] == "mimo-v2.5-pro"
     assert seen["runtime_config"]["baseUrl"] == "https://token-plan-cn.xiaomimimo.com/v1"
     assert state["final_answer"] == "使用节点模型生成的回答"
+
+
+def test_live_preview_injects_selected_skills_into_agent_system_prompt(monkeypatch):
+    seen = {}
+
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        seen["messages"] = messages
+        return FakeResponse("已按 Skill 输出")
+
+    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+
+    project = create_default_project("Skill 注入测试")
+    project.skills.append(
+        SkillConfig(
+            id="skill_tone",
+            name="语气控制",
+            description="控制客服语气",
+            content="请保持礼貌、简洁，并给出可执行下一步。",
+        )
+    )
+    project.nodes.append(
+        NodeIR(
+            id="support_agent",
+            type=NodeType.AGENT,
+            label="客服 Agent",
+            config={
+                "systemPrompt": "你是客服助手。",
+                "skillIdsJson": '["skill_tone"]',
+                "outputField": "agent_result",
+            },
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="support_agent"))
+
+    trace, state = preview.run_project_preview(project, {"messages": "怎么退款？"}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert state["agent_result"] == "已按 Skill 输出"
+    assert seen["messages"][0][0] == "system"
+    assert "可用 Skills:" in seen["messages"][0][1]
+    assert "### 语气控制" in seen["messages"][0][1]
+    assert "请保持礼貌" in seen["messages"][0][1]
+
+
+def test_live_preview_skill_node_writes_skill_content():
+    project = create_default_project("Skill Node 测试")
+    project.skills.append(
+        SkillConfig(
+            id="skill_context",
+            name="业务说明",
+            content="订单状态字段说明。",
+        )
+    )
+    project.nodes.append(
+        NodeIR(
+            id="skill_context_node",
+            type=NodeType.SKILL_NODE,
+            label="业务说明",
+            config={"skillId": "skill_context", "skillName": "业务说明", "outputField": "skill_context"},
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="skill_context_node"))
+
+    trace, state = preview.run_project_preview(project, {"messages": "查询订单"}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert state["skill_context"] == "订单状态字段说明。"
+
+
+def test_live_preview_tools_node_can_call_registered_tool_multiple_times(monkeypatch, tmp_path: Path):
+    tool_file = tmp_path / "local_tools.py"
+    tool_file.write_text(
+        """
+def echo(query: str, suffix: str = "") -> str:
+    return f"{query}{suffix}"
+""",
+        encoding="utf-8",
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "suffix": {"type": "string"},
+        },
+        "required": ["query"],
+        "x-graphic": {
+            "kind": "python_function",
+            "sourcePath": str(tool_file),
+            "function": "echo",
+        },
+    }
+    seen_messages = []
+
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        seen_messages.append(messages)
+        if len(seen_messages) == 1:
+            return FakeResponse(
+                json.dumps(
+                    {
+                        "tool_calls": [
+                            {"tool": "echo", "args": {"query": "A"}},
+                            {"tool": "echo", "args": {"query": "B", "suffix": "!"}},
+                        ],
+                        "final_answer": "",
+                    }
+                )
+            )
+        return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "工具调用完成"}))
+
+    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+
+    project = create_default_project("Tools Agent 测试")
+    project.state.fields.extend(
+        [
+            StateField(name="tools_result", type="str"),
+            StateField(name="tools_result_tool_calls", type="list"),
+        ]
+    )
+    project.tools.append(
+        ToolConfig(
+            id="tool_echo",
+            name="echo",
+            description="Echo test tool",
+            source="python",
+            schemaJson=json.dumps(schema),
+        )
+    )
+    project.nodes.append(
+        NodeIR(
+            id="tools_agent",
+            type=NodeType.TOOL,
+            label="Tools",
+            config={
+                "provider": "openai",
+                "model": "gpt-4.1-mini",
+                "systemPrompt": "选择合适工具。",
+                "toolIdsJson": '["tool_echo"]',
+                "maxIterations": 3,
+                "outputField": "tools_result",
+            },
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="tools_agent"))
+
+    trace, state = preview.run_project_preview(project, {"messages": "调用 echo 两次"}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert state["tools_result"] == "工具调用完成"
+    assert len(state["tools_result_tool_calls"]) == 2
+    assert state["tools_result_tool_calls"][0]["observation"]["result"] == "A"
+    assert state["tools_result_tool_calls"][1]["observation"]["result"] == "B!"
+    assert "可用工具" in seen_messages[0][0][1]
+    assert "工具执行结果" in seen_messages[1][-1][1]
 
 
 def test_openai_compatible_base_url_can_run_without_configured_key(monkeypatch):

@@ -19,11 +19,13 @@ import {
   listWorkspaceMcpServers,
   listWorkspaceRagKnowledgeBases,
   listWorkspaceModelConfigs,
+  listWorkspaceSkills,
   listWorkspaceTools,
   listProjects,
   saveWorkspaceMcpServers,
   saveWorkspaceRagKnowledgeBases,
   saveWorkspaceModelConfigs,
+  saveWorkspaceSkills,
   saveWorkspaceTools,
   saveProject,
   streamProjectPreview,
@@ -45,10 +47,15 @@ import type {
   ProjectIR,
   ProjectListItem,
   RagKnowledgeBaseConfig,
+  RunHistoryGraphMismatch,
+  RunHistoryGraphSnapshot,
+  RunHistoryRecord,
+  RunHistoryReplayMode,
   RunMode,
   RunPreviewResult,
   RunStreamEvent,
   RunTraceItem,
+  SkillConfig,
   StateField,
   ToolConfig,
   ValidationResult,
@@ -59,7 +66,7 @@ interface PendingConnection {
   sourceHandle: string | null;
 }
 
-type ManagerView = "agent" | "agents" | "tools" | "mcp" | "rag" | "models";
+type ManagerView = "agent" | "agents" | "tools" | "skills" | "mcp" | "rag" | "models";
 
 interface ProjectStore {
   mode: "manager" | "editor";
@@ -67,6 +74,7 @@ interface ProjectStore {
   project: ProjectIR | null;
   projects: ProjectListItem[];
   workspaceTools: ToolConfig[];
+  workspaceSkills: SkillConfig[];
   workspaceMcpServers: MCPServerConfig[];
   workspaceModelConfigs: ModelConfig[];
   workspaceRagKnowledgeBases: RagKnowledgeBaseConfig[];
@@ -83,10 +91,17 @@ interface ProjectStore {
   templatesOpen: boolean;
   assistantOpen: boolean;
   runOpen: boolean;
+  runActive: boolean;
+  runCollapsed: boolean;
   runMode: RunMode;
   runInput: string;
+  runRunning: boolean;
   selectedRunModelConfigId: string | null;
   runResult: RunPreviewResult | null;
+  runHistoryRecords: RunHistoryRecord[];
+  selectedRunHistoryId: string | null;
+  runHistoryReplayMode: RunHistoryReplayMode;
+  runHistoryMismatch: RunHistoryGraphMismatch | null;
   runtimeNodes: Record<string, NodeRuntimeState>;
   status: string;
   loading: boolean;
@@ -101,10 +116,12 @@ interface ProjectStore {
   selectNode: (nodeId: string | null) => void;
   updateProjectMeta: (patch: Partial<ProjectIR["project"]>) => void;
   updateWorkspaceTools: (tools: ToolConfig[]) => Promise<void>;
+  updateWorkspaceSkills: (skills: SkillConfig[]) => Promise<void>;
   updateWorkspaceMcpServers: (servers: MCPServerConfig[]) => Promise<void>;
   updateWorkspaceModelConfigs: (configs: ModelConfig[]) => Promise<void>;
   updateWorkspaceRagKnowledgeBases: (configs: RagKnowledgeBaseConfig[]) => Promise<void>;
   updateTools: (tools: ToolConfig[]) => void;
+  updateSkills: (skills: SkillConfig[]) => void;
   updateMcpServers: (servers: MCPServerConfig[]) => void;
   updateImportedAgents: (agents: ImportedAgentConfig[]) => void;
   updateAgentLinks: (links: AgentLinkConfig[]) => void;
@@ -138,9 +155,15 @@ interface ProjectStore {
   applyAssistantPrompt: (prompt: string) => Promise<void>;
   toggleRunPanel: () => void;
   closeRunPanel: () => void;
+  expandRunPanel: () => void;
+  collapseRunPanel: () => void;
+  exitRunMode: () => void;
   setRunMode: (mode: RunMode) => void;
   setRunInput: (value: string) => void;
   setSelectedRunModelConfigId: (id: string | null) => void;
+  selectRunHistoryRecord: (recordId: string) => void;
+  setRunHistoryReplayMode: (mode: RunHistoryReplayMode) => void;
+  clearRunHistory: () => void;
   runPreview: () => Promise<void>;
   openSplitAgent: (projectId: string) => Promise<void>;
   closeSplitAgent: () => void;
@@ -154,9 +177,11 @@ interface ProjectStore {
 
 const PROJECT_KEY = "graphic-langgraph-project-id";
 const WORKSPACE_TOOLS_KEY = "graphic-langgraph-workspace-tools";
+const WORKSPACE_SKILLS_KEY = "graphic-langgraph-workspace-skills";
 const WORKSPACE_MCP_KEY = "graphic-langgraph-workspace-mcp";
 const WORKSPACE_MODELS_KEY = "graphic-langgraph-workspace-models";
 const HISTORY_LIMIT = 80;
+const RUN_HISTORY_LIMIT = 30;
 
 export const useProjectStore = create<ProjectStore>((set, get) => ({
   mode: "manager",
@@ -164,6 +189,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   project: null,
   projects: [],
   workspaceTools: [],
+  workspaceSkills: [],
   workspaceMcpServers: [],
   workspaceModelConfigs: [],
   workspaceRagKnowledgeBases: [],
@@ -180,10 +206,17 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   templatesOpen: false,
   assistantOpen: false,
   runOpen: false,
+  runActive: false,
+  runCollapsed: false,
   runMode: "live",
   runInput: "{\n  \"messages\": \"请在这里输入测试问题\"\n}",
+  runRunning: false,
   selectedRunModelConfigId: null,
   runResult: null,
+  runHistoryRecords: [],
+  selectedRunHistoryId: null,
+  runHistoryReplayMode: "overlay",
+  runHistoryMismatch: null,
   runtimeNodes: {},
   status: "未连接后端",
   loading: false,
@@ -191,14 +224,16 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   async initialize() {
     set({ loading: true, status: "正在加载历史 Agent" });
     try {
-      const [projects, storedTools, storedMcpServers, storedModelConfigs, storedRagKnowledgeBases] = await Promise.all([
+      const [projects, storedTools, storedSkills, storedMcpServers, storedModelConfigs, storedRagKnowledgeBases] = await Promise.all([
         listProjects(),
         listWorkspaceTools(),
+        listWorkspaceSkills(),
         listWorkspaceMcpServers(),
         listWorkspaceModelConfigs(),
         listWorkspaceRagKnowledgeBases(),
       ]);
       let workspaceTools = normalizeTools(storedTools);
+      let workspaceSkills = normalizeSkills(storedSkills);
       let workspaceMcpServers = normalizeMcpServers(storedMcpServers);
       let workspaceModelConfigs = normalizeModelConfigs(storedModelConfigs);
       const workspaceRagKnowledgeBases = normalizeRagKnowledgeBases(storedRagKnowledgeBases);
@@ -212,6 +247,18 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
             migratedResources = true;
           } catch {
             workspaceTools = localTools;
+          }
+        }
+      }
+      if (workspaceSkills.length === 0) {
+        const localSkills = normalizeSkills(readLocalArray<SkillConfig>(WORKSPACE_SKILLS_KEY));
+        if (localSkills.length > 0) {
+          try {
+            workspaceSkills = normalizeSkills(await saveWorkspaceSkills(localSkills));
+            removeLocalItem(WORKSPACE_SKILLS_KEY);
+            migratedResources = true;
+          } catch {
+            workspaceSkills = localSkills;
           }
         }
       }
@@ -246,6 +293,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
         mode: "manager",
         project: null,
         workspaceTools,
+        workspaceSkills,
         workspaceMcpServers,
         workspaceModelConfigs,
         workspaceRagKnowledgeBases,
@@ -286,7 +334,15 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       templatesOpen: false,
       assistantOpen: false,
       runOpen: false,
+      runActive: false,
+      runCollapsed: false,
       runResult: null,
+      runRunning: false,
+      runHistoryRecords: readRunHistory(project.project.id),
+      selectedRunHistoryId: null,
+      runHistoryReplayMode: "overlay",
+      runHistoryMismatch: null,
+      runtimeNodes: {},
       status: "项目已加载",
       loading: false,
     });
@@ -315,7 +371,15 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       templatesOpen: false,
       assistantOpen: false,
       runOpen: false,
+      runActive: false,
+      runCollapsed: false,
       runResult: null,
+      runRunning: false,
+      runHistoryRecords: [],
+      selectedRunHistoryId: null,
+      runHistoryReplayMode: "overlay",
+      runHistoryMismatch: null,
+      runtimeNodes: {},
       status: "已创建 Agent",
       loading: false,
     });
@@ -364,7 +428,15 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       templatesOpen: false,
       assistantOpen: false,
       runOpen: false,
+      runActive: false,
+      runCollapsed: false,
       runResult: null,
+      runRunning: false,
+      runHistoryRecords: [],
+      selectedRunHistoryId: null,
+      runHistoryReplayMode: "overlay",
+      runHistoryMismatch: null,
+      runtimeNodes: {},
       status: "返回管理界面",
     });
   },
@@ -376,6 +448,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   updateProjectMeta(patch) {
     const project = get().project;
     if (!project) return;
+    if (get().runActive) {
+      set({ status: "运行模式下不能编辑 Agent 信息" });
+      return;
+    }
     set({ project: { ...project, project: { ...project.project, ...patch } }, status: "已更新 Agent 信息" });
   },
 
@@ -387,6 +463,17 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       set({ workspaceTools: savedTools, status: "全局 Tools 已保存到后端" });
     } catch (error) {
       set({ status: error instanceof Error ? error.message : "全局 Tools 保存失败" });
+    }
+  },
+
+  async updateWorkspaceSkills(skills) {
+    const workspaceSkills = normalizeSkills(skills);
+    set({ workspaceSkills, status: "正在保存全局 Skills" });
+    try {
+      const savedSkills = normalizeSkills(await saveWorkspaceSkills(workspaceSkills));
+      set({ workspaceSkills: savedSkills, status: "全局 Skills 已保存到后端" });
+    } catch (error) {
+      set({ status: error instanceof Error ? error.message : "全局 Skills 保存失败" });
     }
   },
 
@@ -441,30 +528,60 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   updateTools(tools) {
     const project = get().project;
     if (!project) return;
+    if (get().runActive) {
+      set({ status: "运行模式下不能编辑 Tools 配置" });
+      return;
+    }
     set({ project: { ...project, tools }, status: "已更新 Tools 配置" });
+  },
+
+  updateSkills(skills) {
+    const project = get().project;
+    if (!project) return;
+    if (get().runActive) {
+      set({ status: "运行模式下不能编辑 Skills 配置" });
+      return;
+    }
+    set({ project: { ...project, skills: normalizeSkills(skills) }, status: "已更新 Skills 配置" });
   },
 
   updateMcpServers(mcpServers) {
     const project = get().project;
     if (!project) return;
+    if (get().runActive) {
+      set({ status: "运行模式下不能编辑 MCP 配置" });
+      return;
+    }
     set({ project: { ...project, mcpServers }, status: "已更新 MCP 配置" });
   },
 
   updateImportedAgents(importedAgents) {
     const project = get().project;
     if (!project) return;
+    if (get().runActive) {
+      set({ status: "运行模式下不能编辑导入 Agent" });
+      return;
+    }
     set({ project: { ...project, importedAgents }, status: "已更新导入 Agent" });
   },
 
   updateAgentLinks(agentLinks) {
     const project = get().project;
     if (!project) return;
+    if (get().runActive) {
+      set({ status: "运行模式下不能编辑 Agent 通信配置" });
+      return;
+    }
     set({ project: { ...project, agentLinks }, status: "已更新 Agent 通信配置" });
   },
 
   addNode(type, position, configPatch, label) {
     const project = get().project;
     if (!project) return;
+    if (get().runActive) {
+      set({ status: "运行模式下不能添加节点" });
+      return;
+    }
     const count = project.nodes.length;
     const defaultPosition =
       typeof window !== "undefined" && window.innerWidth <= 900
@@ -495,6 +612,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   updateNode(nodeId, patch) {
     const project = get().project;
     if (!project) return;
+    if (get().runActive) {
+      set({ status: "运行模式下不能编辑节点" });
+      return;
+    }
     set({
       project: {
         ...project,
@@ -506,6 +627,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   updateNodeConfig(nodeId, patch) {
     const project = get().project;
     if (!project) return;
+    if (get().runActive) {
+      set({ status: "运行模式下不能编辑节点配置" });
+      return;
+    }
     set({
       project: {
         ...project,
@@ -532,12 +657,17 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   setStateFields(fields) {
     const project = get().project;
     if (!project) return;
+    if (get().runActive) {
+      set({ status: "运行模式下不能编辑 State 字段" });
+      return;
+    }
     set({ project: { ...project, state: { ...project.state, fields } } });
   },
 
   onNodesChange(changes) {
     const project = get().project;
     if (!project) return;
+    if (get().runActive) return;
     const rfNodes = toReactFlowNodes(project);
     const changed = applyNodeChanges(changes, rfNodes);
     const changedById = new Map(changed.map((node) => [node.id, node]));
@@ -559,6 +689,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   onEdgesChange(changes) {
     const project = get().project;
     if (!project) return;
+    if (get().runActive) return;
     const changed = applyEdgeChanges(changes, toReactFlowEdges(project));
     set({ project: { ...project, edges: changed.map(fromReactFlowEdge) } });
   },
@@ -566,6 +697,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   onConnect(connection) {
     const project = get().project;
     if (!project || !connection.source || !connection.target) return;
+    if (get().runActive) {
+      set({ status: "运行模式下不能连线" });
+      return;
+    }
     const edge = buildReactFlowEdge(project, connection.source, connection.sourceHandle, connection.target, connection.targetHandle);
     const next = addEdge(edge, toReactFlowEdges(project));
     set({ project: { ...project, edges: next.map(fromReactFlowEdge) }, pendingConnection: null, status: "已连接节点" });
@@ -574,6 +709,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   handlePortClick(nodeId, direction, handleId) {
     const project = get().project;
     if (!project) return;
+    if (get().runActive) {
+      set({ status: "运行模式下不能连线" });
+      return;
+    }
 
     if (direction === "source") {
       set({
@@ -784,15 +923,68 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   },
 
   toggleRunPanel() {
-    set((state) => ({ runOpen: !state.runOpen, historyOpen: false }));
+    const project = get().project;
+    if (!project) return;
+    const state = get();
+    if (state.runActive) {
+      get().exitRunMode();
+      return;
+    }
+    set({
+      runActive: true,
+      runOpen: true,
+      runCollapsed: false,
+      runResult: null,
+      runRunning: false,
+      runtimeNodes: {},
+      selectedRunHistoryId: null,
+      runHistoryReplayMode: "overlay",
+      runHistoryMismatch: null,
+      selectedNodeId: null,
+      historyOpen: false,
+      templatesOpen: false,
+      assistantOpen: false,
+      runHistoryRecords: readRunHistory(project.project.id),
+      status: "已进入运行模式",
+    });
   },
 
   closeRunPanel() {
     set({ runOpen: false });
   },
 
+  expandRunPanel() {
+    set({ runOpen: true, runCollapsed: false });
+  },
+
+  collapseRunPanel() {
+    set({ runOpen: true, runCollapsed: true });
+  },
+
+  exitRunMode() {
+    set({
+      runActive: false,
+      runOpen: false,
+      runCollapsed: false,
+      runResult: null,
+      runRunning: false,
+      runtimeNodes: {},
+      selectedRunHistoryId: null,
+      runHistoryReplayMode: "overlay",
+      runHistoryMismatch: null,
+      status: "已退出运行模式",
+    });
+  },
+
   setRunMode(runMode) {
-    set({ runMode, runResult: null });
+    set({
+      runMode,
+      runResult: null,
+      runtimeNodes: {},
+      selectedRunHistoryId: null,
+      runHistoryReplayMode: "overlay",
+      runHistoryMismatch: null,
+    });
   },
 
   setRunInput(runInput) {
@@ -800,7 +992,82 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   },
 
   setSelectedRunModelConfigId(selectedRunModelConfigId) {
-    set({ selectedRunModelConfigId, runResult: null, status: "已切换运行模型" });
+    set({
+      selectedRunModelConfigId,
+      runResult: null,
+      runtimeNodes: {},
+      selectedRunHistoryId: null,
+      runHistoryReplayMode: "overlay",
+      runHistoryMismatch: null,
+      status: "已切换运行模型",
+    });
+  },
+
+  selectRunHistoryRecord(recordId) {
+    const project = get().project;
+    if (!project) return;
+    const records = readRunHistory(project.project.id);
+    const record = records.find((item) => item.id === recordId);
+    if (!record) {
+      set({ status: "运行历史不存在" });
+      return;
+    }
+    const mismatch = detectRunHistoryGraphMismatch(record, project);
+    const replayMode: RunHistoryReplayMode = mismatch ? "details" : "overlay";
+    set({
+      runActive: true,
+      runOpen: true,
+      runCollapsed: false,
+      runResult: record.result,
+      runRunning: false,
+      runtimeNodes: replayMode === "overlay" ? getCompatibleRuntimeNodes(project, record) : {},
+      selectedRunHistoryId: record.id,
+      runHistoryReplayMode: replayMode,
+      runHistoryMismatch: mismatch,
+      runHistoryRecords: records,
+      runInput: JSON.stringify(record.inputState, null, 2),
+      selectedRunModelConfigId: record.modelConfigId,
+      status: mismatch
+        ? `该历史与当前 Agent 结构不一致：${formatShortTime(record.createdAt)}`
+        : `已载入运行历史：${formatShortTime(record.createdAt)}`,
+    });
+  },
+
+  setRunHistoryReplayMode(runHistoryReplayMode) {
+    const project = get().project;
+    const selectedRunHistoryId = get().selectedRunHistoryId;
+    if (!project || !selectedRunHistoryId) return;
+    const records = readRunHistory(project.project.id);
+    const record = records.find((item) => item.id === selectedRunHistoryId);
+    if (!record) {
+      set({ status: "运行历史不存在" });
+      return;
+    }
+    const mismatch = detectRunHistoryGraphMismatch(record, project);
+    const runtimeNodes = runHistoryReplayMode === "overlay" ? getCompatibleRuntimeNodes(project, record) : {};
+    const overlayCount = Object.keys(runtimeNodes).length;
+    set({
+      runtimeNodes,
+      runHistoryReplayMode,
+      runHistoryMismatch: mismatch,
+      status: runHistoryReplayMode === "overlay"
+        ? `已按可匹配节点叠加历史结果：${overlayCount} 个节点`
+        : "已切换为只看历史详情",
+    });
+  },
+
+  clearRunHistory() {
+    const project = get().project;
+    if (!project) return;
+    writeRunHistory(project.project.id, []);
+    set({
+      runHistoryRecords: [],
+      selectedRunHistoryId: null,
+      runHistoryReplayMode: "overlay",
+      runHistoryMismatch: null,
+      runtimeNodes: {},
+      status: "已清空运行历史",
+    });
   },
 
   async runPreview() {
@@ -823,16 +1090,22 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     }
     set({
       runMode,
+      runActive: true,
+      runOpen: true,
+      runCollapsed: false,
       status: "正在真实运行",
       runResult: null,
+      runRunning: true,
       runtimeNodes: initializeRuntimeNodes(project),
+      selectedRunHistoryId: null,
+      runHistoryReplayMode: "overlay",
+      runHistoryMismatch: null,
     });
     const saved = await saveProject(project);
     const historyRecords = recordProjectHistory(saved, "运行预览前保存");
     set({
       project: saved,
       historyRecords,
-      runOpen: true,
       selectedRunModelConfigId,
     });
     try {
@@ -840,7 +1113,24 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
         set((state) => applyRunStreamEvent(state, event));
       });
     } catch (error) {
+      const failedState = get();
+      if (failedState.project && failedState.runResult) {
+        const runHistoryRecords = recordRunHistory(
+          failedState.project,
+          failedState.runResult,
+          failedState.runtimeNodes,
+          input,
+          selectedModelConfig,
+        );
+        set({
+          runHistoryRecords,
+          selectedRunHistoryId: runHistoryRecords[0]?.id ?? null,
+          runHistoryReplayMode: "overlay",
+          runHistoryMismatch: null,
+        });
+      }
       set({
+        runRunning: false,
         status: error instanceof Error ? error.message : "真实运行失败",
       });
     }
@@ -991,6 +1281,22 @@ function normalizeTools(tools: ToolConfig[]): ToolConfig[] {
     }));
 }
 
+function normalizeSkills(skills: SkillConfig[]): SkillConfig[] {
+  return skills
+    .filter((skill) => skill && typeof skill.id === "string")
+    .map((skill) => ({
+      id: skill.id,
+      name: String(skill.name || "未命名 Skill"),
+      description: String(skill.description || ""),
+      sourceType: String(skill.sourceType || "manual"),
+      sourcePath: String(skill.sourcePath || ""),
+      filePath: String(skill.filePath || ""),
+      content: String(skill.content || ""),
+      metadataJson: String(skill.metadataJson || "{}"),
+      enabled: skill.enabled !== false,
+    }));
+}
+
 function normalizeMcpServers(servers: MCPServerConfig[]): MCPServerConfig[] {
   return servers
     .filter((server) => server && typeof server.id === "string")
@@ -999,7 +1305,22 @@ function normalizeMcpServers(servers: MCPServerConfig[]): MCPServerConfig[] {
       name: String(server.name || "未命名 MCP"),
       transport: String(server.transport || "stdio"),
       command: String(server.command || ""),
+      argsJson: String(server.argsJson || "[]"),
+      envJson: String(server.envJson || "{}"),
+      envVarsJson: String(server.envVarsJson || "[]"),
+      cwd: String(server.cwd || ""),
       url: String(server.url || ""),
+      bearerTokenEnvVar: String(server.bearerTokenEnvVar || ""),
+      httpHeadersJson: String(server.httpHeadersJson || "{}"),
+      envHttpHeadersJson: String(server.envHttpHeadersJson || "{}"),
+      enabled: server.enabled !== false,
+      startupTimeoutSec: Math.max(1, Number(server.startupTimeoutSec || 10)),
+      toolTimeoutSec: Math.max(1, Number(server.toolTimeoutSec || 60)),
+      enabledToolsJson: String(server.enabledToolsJson || "[]"),
+      disabledToolsJson: String(server.disabledToolsJson || "[]"),
+      defaultToolsApprovalMode: String(server.defaultToolsApprovalMode || ""),
+      sourceType: String(server.sourceType || "manual"),
+      sourcePath: String(server.sourcePath || ""),
       description: String(server.description || ""),
     }));
 }
@@ -1031,8 +1352,9 @@ function normalizeModelConfigs(configs: ModelConfig[]): ModelConfig[] {
       provider: String(config.provider || "openai"),
       model: String(config.model || "gpt-4.1-mini"),
       baseUrl: String(config.baseUrl || ""),
-      apiKey: "",
+      apiKey: String(config.apiKey || ""),
       apiKeyEnv: String(config.apiKeyEnv || ""),
+      apiKeyMode: String(config.apiKeyMode || (config.apiKey ? "direct" : "env")),
       apiVersion: String(config.apiVersion || ""),
       organization: String(config.organization || ""),
       homepage: String(config.homepage || ""),
@@ -1126,6 +1448,10 @@ function historyKey(projectId: string) {
   return `graphic-langgraph-history-${projectId}`;
 }
 
+function runHistoryKey(projectId: string) {
+  return `graphic-langgraph-run-history-${projectId}`;
+}
+
 function readHistory(projectId: string): ProjectHistoryRecord[] {
   if (typeof window === "undefined") return [];
   try {
@@ -1140,6 +1466,22 @@ function readHistory(projectId: string): ProjectHistoryRecord[] {
 function writeHistory(projectId: string, records: ProjectHistoryRecord[]) {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(historyKey(projectId), JSON.stringify(records.slice(0, HISTORY_LIMIT)));
+}
+
+function readRunHistory(projectId: string): RunHistoryRecord[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(runHistoryKey(projectId));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? (parsed as RunHistoryRecord[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeRunHistory(projectId: string, records: RunHistoryRecord[]) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(runHistoryKey(projectId), JSON.stringify(records.slice(0, RUN_HISTORY_LIMIT)));
 }
 
 function recordProjectHistory(project: ProjectIR, description: string): ProjectHistoryRecord[] {
@@ -1173,6 +1515,204 @@ function cloneProject(project: ProjectIR): ProjectIR {
   return JSON.parse(JSON.stringify(project)) as ProjectIR;
 }
 
+function recordRunHistory(
+  project: ProjectIR,
+  result: RunPreviewResult,
+  runtimeNodes: Record<string, NodeRuntimeState>,
+  inputState: Record<string, unknown>,
+  modelConfig: ModelConfig | null | undefined,
+): RunHistoryRecord[] {
+  const records = readRunHistory(project.project.id);
+  const graphSnapshot = createRunHistoryGraphSnapshot(project);
+  const record: RunHistoryRecord = {
+    id: createHistoryId(),
+    projectId: project.project.id,
+    projectName: project.project.name || "未命名",
+    createdAt: new Date().toISOString(),
+    modelConfigId: modelConfig?.id ?? null,
+    modelConfigName: modelConfig?.name || "未选择模型",
+    inputState: cloneRecord(inputState),
+    graphFingerprint: createRunHistoryGraphFingerprint(graphSnapshot),
+    graphSnapshot,
+    result: cloneRecord(result) as RunPreviewResult,
+    runtimeNodes: cloneRecord(runtimeNodes) as Record<string, NodeRuntimeState>,
+  };
+  const next = [record, ...records].slice(0, RUN_HISTORY_LIMIT);
+  writeRunHistory(project.project.id, next);
+  return next;
+}
+
+function finalizeRunHistory(state: ProjectStore, result: RunPreviewResult): Partial<ProjectStore> {
+  if (!state.project) {
+    return { runResult: result };
+  }
+  const workspaceModelConfigs = normalizeModelConfigs(state.workspaceModelConfigs);
+  const selectedRunModelConfigId = pickModelConfigId(workspaceModelConfigs, state.selectedRunModelConfigId);
+  const selectedModelConfig = workspaceModelConfigs.find((config) => config.id === selectedRunModelConfigId) ?? null;
+  const runHistoryRecords = recordRunHistory(
+    state.project,
+    result,
+    state.runtimeNodes,
+    parseRecord(state.runInput),
+    selectedModelConfig,
+  );
+  return {
+    runResult: result,
+    runHistoryRecords,
+    selectedRunHistoryId: runHistoryRecords[0]?.id ?? null,
+    runHistoryReplayMode: "overlay",
+    runHistoryMismatch: null,
+  };
+}
+
+function parseRecord(value: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function cloneRecord<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function createRunHistoryGraphSnapshot(project: ProjectIR): RunHistoryGraphSnapshot {
+  return {
+    nodeCount: project.nodes.length,
+    edgeCount: project.edges.length,
+    stateFields: [...project.state.fields]
+      .map((field) => ({ name: field.name, type: field.type || "str" }))
+      .sort((left, right) => compareText(left.name, right.name)),
+    nodes: [...project.nodes]
+      .map((node) => ({
+        id: node.id,
+        type: node.type,
+        label: node.label,
+        inputs: [...node.inputs]
+          .map((port) => ({ id: port.id, type: port.type }))
+          .sort((left, right) => compareText(left.id, right.id)),
+        outputs: [...node.outputs]
+          .map((port) => ({ id: port.id, type: port.type }))
+          .sort((left, right) => compareText(left.id, right.id)),
+      }))
+      .sort((left, right) => compareText(left.id, right.id)),
+    edges: [...project.edges]
+      .map((edge) => ({
+        source: edge.source,
+        sourceHandle: edge.sourceHandle ?? null,
+        target: edge.target,
+        targetHandle: edge.targetHandle ?? null,
+        kind: edge.kind,
+      }))
+      .sort((left, right) =>
+        compareText(
+          `${left.source}:${left.sourceHandle ?? ""}:${left.target}:${left.targetHandle ?? ""}:${left.kind}`,
+          `${right.source}:${right.sourceHandle ?? ""}:${right.target}:${right.targetHandle ?? ""}:${right.kind}`,
+        ),
+      ),
+  };
+}
+
+function createRunHistoryGraphFingerprint(snapshot: RunHistoryGraphSnapshot): string {
+  const structuralSnapshot = {
+    stateFields: snapshot.stateFields,
+    nodes: snapshot.nodes.map((node) => ({
+      id: node.id,
+      type: node.type,
+      inputs: node.inputs,
+      outputs: node.outputs,
+    })),
+    edges: snapshot.edges,
+  };
+  return `glg_${hashString(JSON.stringify(structuralSnapshot))}`;
+}
+
+function detectRunHistoryGraphMismatch(record: RunHistoryRecord, project: ProjectIR): RunHistoryGraphMismatch | null {
+  const currentSnapshot = createRunHistoryGraphSnapshot(project);
+  const currentFingerprint = createRunHistoryGraphFingerprint(currentSnapshot);
+  const historyFingerprint = record.graphFingerprint ?? (record.graphSnapshot ? createRunHistoryGraphFingerprint(record.graphSnapshot) : null);
+  if (historyFingerprint && historyFingerprint === currentFingerprint) return null;
+
+  const historyNodes = getHistoryComparableNodes(record);
+  const currentNodesById = new Map(currentSnapshot.nodes.map((node) => [node.id, node]));
+  const historyNodeIds = new Set(historyNodes.map((node) => node.id));
+  const matchedNodeIds = historyNodes
+    .filter((node) => {
+      const current = currentNodesById.get(node.id);
+      return Boolean(current && (!node.type || current.type === node.type));
+    })
+    .map((node) => node.id);
+  const missingNodeIds = historyNodes.filter((node) => !currentNodesById.has(node.id)).map((node) => node.id);
+  const incompatibleNodeIds = historyNodes
+    .filter((node) => {
+      const current = currentNodesById.get(node.id);
+      return Boolean(current && node.type && current.type !== node.type);
+    })
+    .map((node) => node.id);
+  const addedNodeIds = currentSnapshot.nodes.filter((node) => !historyNodeIds.has(node.id)).map((node) => node.id);
+
+  return {
+    reason: historyFingerprint ? "changed" : "legacy",
+    historyFingerprint,
+    currentFingerprint,
+    historyNodeCount: record.graphSnapshot?.nodeCount ?? historyNodes.length,
+    currentNodeCount: currentSnapshot.nodeCount,
+    historyEdgeCount: record.graphSnapshot?.edgeCount ?? 0,
+    currentEdgeCount: currentSnapshot.edgeCount,
+    matchedNodeIds,
+    missingNodeIds,
+    incompatibleNodeIds,
+    addedNodeIds,
+  };
+}
+
+function getCompatibleRuntimeNodes(project: ProjectIR, record: RunHistoryRecord): Record<string, NodeRuntimeState> {
+  const compatibleNodeIds = new Set(getHistoryComparableNodes(record)
+    .filter((historyNode) => {
+      const currentNode = project.nodes.find((node) => node.id === historyNode.id);
+      return Boolean(currentNode && (!historyNode.type || currentNode.type === historyNode.type));
+    })
+    .map((node) => node.id));
+  const runtimeNodes: Record<string, NodeRuntimeState> = {};
+  for (const [nodeId, runtime] of Object.entries(record.runtimeNodes)) {
+    if (compatibleNodeIds.has(nodeId)) {
+      runtimeNodes[nodeId] = runtime;
+    }
+  }
+  return runtimeNodes;
+}
+
+function getHistoryComparableNodes(record: RunHistoryRecord): Array<{ id: string; type?: NodeType; label: string }> {
+  if (record.graphSnapshot?.nodes.length) {
+    return record.graphSnapshot.nodes.map((node) => ({ id: node.id, type: node.type, label: node.label }));
+  }
+  const nodes = new Map<string, { id: string; type?: NodeType; label: string }>();
+  for (const item of record.result.trace) {
+    nodes.set(item.nodeId, { id: item.nodeId, type: item.type, label: item.label });
+  }
+  for (const [nodeId, runtime] of Object.entries(record.runtimeNodes)) {
+    if (!nodes.has(nodeId)) {
+      nodes.set(nodeId, { id: nodeId, label: runtime.label });
+    }
+  }
+  return [...nodes.values()];
+}
+
+function compareText(left: string, right: string) {
+  return left.localeCompare(right, "en");
+}
+
+function hashString(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
 function initializeRuntimeNodes(project: ProjectIR): Record<string, NodeRuntimeState> {
   const now = new Date().toISOString();
   const nodes: Record<string, NodeRuntimeState> = {};
@@ -1202,11 +1742,13 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
         trace: [],
         outputState: event.inputState,
       },
+      runRunning: event.valid,
       status: event.valid ? "真实运行开始" : "图校验未通过，未开始真实运行",
     };
   }
   if (event.event === "node_start") {
     return {
+      runRunning: true,
       runtimeNodes: {
         ...state.runtimeNodes,
         [event.nodeId]: {
@@ -1238,6 +1780,7 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
       updatedAt: now,
     };
     return {
+      runRunning: true,
       runtimeNodes: {
         ...state.runtimeNodes,
         [event.traceItem.nodeId]: nodeRuntime,
@@ -1254,13 +1797,14 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
     };
   }
   return {
-    runResult: {
+    ...finalizeRunHistory(state, {
       mode: event.mode,
       valid: event.valid,
       issues: event.issues,
       trace: event.trace,
       outputState: event.outputState,
-    },
+    }),
+    runRunning: false,
     status: event.valid ? "真实运行完成" : "运行预览完成，但图校验未通过",
   };
 }
@@ -1276,6 +1820,12 @@ function createHistoryId() {
     return `history_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
   }
   return `history_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function formatShortTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "未知时间";
+  return date.toLocaleString("zh-CN", { hour12: false });
 }
 
 export function toReactFlowNodes(project: ProjectIR, runtimeNodes: Record<string, NodeRuntimeState> = {}): Node[] {

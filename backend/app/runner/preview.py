@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import importlib.util
+import inspect
 import json
 import os
 import re
@@ -11,12 +14,14 @@ from urllib.error import URLError
 
 import httpx
 
-from app.config import ROOT_DIR
+from app.config import ROOT_DIR, WORKSPACE_TOOLS_FILE
 from app.ir.schemas import EdgeKind, NodeIR, NodeType, ProjectIR
 
 
 RunMode = Literal["dry", "live"]
 ModelRuntimeConfig = dict[str, Any] | None
+SkillRuntimeConfig = dict[str, dict[str, Any]]
+ToolRuntimeConfig = dict[str, dict[str, Any]]
 
 TEMPLATE_RE = re.compile(r"{{\s*state\.([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
 TEXT_SUFFIXES = {".md", ".markdown", ".txt"}
@@ -77,6 +82,8 @@ def _walk_project(
     model_config: ModelRuntimeConfig,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     nodes = {node.id: node for node in project.nodes}
+    skills = _enabled_skills_by_id(project)
+    tools = _tool_configs_by_id(project)
     outgoing: dict[str, list] = {}
     for edge in project.edges:
         outgoing.setdefault(edge.source, []).append(edge)
@@ -95,7 +102,7 @@ def _walk_project(
         before = dict(state)
         started = time.perf_counter()
         try:
-            delta, detail = _execute_node(node, state, mode, model_config)
+            delta, detail = _execute_node(node, state, mode, model_config, skills, tools)
             state.update(delta)
             status = "ok"
         except Exception as exc:  # Keep the preview response structured instead of surfacing a 500.
@@ -151,6 +158,8 @@ def _walk_project_events(
     model_config: ModelRuntimeConfig,
 ):
     nodes = {node.id: node for node in project.nodes}
+    skills = _enabled_skills_by_id(project)
+    tools = _tool_configs_by_id(project)
     outgoing: dict[str, list] = {}
     for edge in project.edges:
         outgoing.setdefault(edge.source, []).append(edge)
@@ -181,7 +190,7 @@ def _walk_project_events(
         }
         started = time.perf_counter()
         try:
-            delta, detail = _execute_node(node, state, mode, model_config)
+            delta, detail = _execute_node(node, state, mode, model_config, skills, tools)
             state.update(delta)
             status = "ok"
         except Exception as exc:  # Keep streamed events structured instead of surfacing a 500.
@@ -248,13 +257,15 @@ def _execute_node(
     state: dict[str, Any],
     mode: RunMode,
     model_config: ModelRuntimeConfig,
+    skills: SkillRuntimeConfig,
+    tools: ToolRuntimeConfig,
 ) -> tuple[dict[str, Any], str]:
     if mode == "dry":
-        return _execute_dry_node(node, state)
-    return _execute_live_node(node, state, model_config)
+        return _execute_dry_node(node, state, skills, tools)
+    return _execute_live_node(node, state, model_config, skills, tools)
 
 
-def _execute_dry_node(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+def _execute_dry_node(node: NodeIR, state: dict[str, Any], skills: SkillRuntimeConfig, tools: ToolRuntimeConfig) -> tuple[dict[str, Any], str]:
     config = node.config
     if node.type == NodeType.LLM:
         field = str(config.get("outputField", "final_answer"))
@@ -264,9 +275,13 @@ def _execute_dry_node(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, An
         return {field: f"[dry-run] {node.label} 将作为 Agent 执行"}, f"模拟 Agent 输出到 state.{field}"
     if node.type == NodeType.TOOL:
         field = str(config.get("outputField", "tool_result"))
+        selected_tools = _selected_tool_configs(config, tools)
         return {
-            field: {"tool": config.get("toolName", node.label), "status": "dry-run"},
-        }, f"模拟 Tool 输出到 state.{field}"
+            field: f"[dry-run] {node.label} 可在 {len(selected_tools)} 个 Tool 中自主选择并多轮调用",
+            f"{field}_tool_calls": [
+                {"tool": tool.get("name") or tool.get("id"), "status": "registered"} for tool in selected_tools
+            ],
+        }, f"模拟 Tools Agent 注册 {len(selected_tools)} 个 Tool，输出到 state.{field}"
     if node.type == NodeType.RETRIEVER:
         field = str(config.get("outputField", "retrieved_context"))
         return {
@@ -294,7 +309,9 @@ def _execute_dry_node(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, An
     if node.type == NodeType.DIRECT_REPLY:
         field = str(config.get("outputField", "final_answer"))
         return {field: state.get(field) or "[dry-run] Direct Reply"}, f"终止并返回 state.{field}"
-    if node.type in {NodeType.SKILL_NODE, NodeType.MCP_NODE, NodeType.AGENT_REF, NodeType.CUSTOM_FUNCTION}:
+    if node.type == NodeType.SKILL_NODE:
+        return _execute_skill_node(node, skills, dry_run=True)
+    if node.type in {NodeType.MCP_NODE, NodeType.AGENT_REF, NodeType.CUSTOM_FUNCTION}:
         field = str(config.get("outputField", f"{node.type}_result"))
         return {field: f"[dry-run] {node.label}"}, f"模拟输出到 state.{field}"
     return {}, "跳过未知节点"
@@ -304,14 +321,18 @@ def _execute_live_node(
     node: NodeIR,
     state: dict[str, Any],
     model_config: ModelRuntimeConfig,
+    skills: SkillRuntimeConfig,
+    tools: ToolRuntimeConfig,
 ) -> tuple[dict[str, Any], str]:
     config = node.config
     if node.type == NodeType.LLM:
         return _execute_live_llm(node, state, model_config)
     if node.type == NodeType.AGENT:
-        return _execute_live_agent(node, state, model_config)
+        return _execute_live_agent(node, state, model_config, skills)
+    if node.type == NodeType.SKILL_NODE:
+        return _execute_skill_node(node, skills, dry_run=False)
     if node.type == NodeType.TOOL:
-        return _execute_live_tool(node, state)
+        return _execute_live_tool(node, state, model_config, tools)
     if node.type == NodeType.RETRIEVER:
         return _execute_live_retriever(node, state)
     if node.type == NodeType.CONDITION:
@@ -346,10 +367,11 @@ def _execute_live_llm(node: NodeIR, state: dict[str, Any], model_config: ModelRu
     return {output_field: content}, f"真实调用 {provider}/{model}{suffix}，输出到 state.{output_field}"
 
 
-def _execute_live_agent(node: NodeIR, state: dict[str, Any], model_config: ModelRuntimeConfig) -> tuple[dict[str, Any], str]:
+def _execute_live_agent(node: NodeIR, state: dict[str, Any], model_config: ModelRuntimeConfig, skills: SkillRuntimeConfig) -> tuple[dict[str, Any], str]:
     config = node.config
     provider, model = _resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
     system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip()
+    system_prompt = _append_selected_skills(system_prompt, _selected_skill_configs(config, skills))
     user_prompt = str(config.get("userPrompt", "")).strip()
     if user_prompt:
         user_text = render_template(user_prompt, state)
@@ -364,7 +386,79 @@ def _execute_live_agent(node: NodeIR, state: dict[str, Any], model_config: Model
     output_field = str(config.get("outputField", f"{node.id}_result"))
     tools = str(config.get("tools", "")).strip()
     tool_hint = f"，参考工具/前置结果：{tools}" if tools else ""
-    return {output_field: content}, f"真实调用 Agent 模型 {provider}/{model}{tool_hint}，输出到 state.{output_field}"
+    skill_count = len(_selected_skill_configs(config, skills))
+    skill_hint = f"，注入 {skill_count} 个 Skill" if skill_count else ""
+    return {output_field: content}, f"真实调用 Agent 模型 {provider}/{model}{tool_hint}{skill_hint}，输出到 state.{output_field}"
+
+
+def _execute_skill_node(node: NodeIR, skills: SkillRuntimeConfig, dry_run: bool) -> tuple[dict[str, Any], str]:
+    config = node.config
+    output_field = str(config.get("outputField", "skill_result"))
+    skill_id = str(config.get("skillId") or config.get("toolId") or "").strip()
+    skill = skills.get(skill_id) if skill_id else None
+    skill_name = str((skill or {}).get("name") or config.get("skillName") or config.get("toolName") or node.label)
+    content = str((skill or {}).get("content") or config.get("skillContent") or config.get("content") or "")
+    if dry_run and not content:
+        content = f"[dry-run] {skill_name}"
+    mode_text = "模拟读取" if dry_run else "读取"
+    return {output_field: content}, f"{mode_text} Skill「{skill_name}」内容到 state.{output_field}"
+
+
+def _enabled_skills_by_id(project: ProjectIR) -> SkillRuntimeConfig:
+    result: SkillRuntimeConfig = {}
+    for skill in getattr(project, "skills", []) or []:
+        if getattr(skill, "enabled", True) is False:
+            continue
+        skill_id = str(getattr(skill, "id", "")).strip()
+        if not skill_id:
+            continue
+        result[skill_id] = {
+            "id": skill_id,
+            "name": str(getattr(skill, "name", "") or skill_id),
+            "description": str(getattr(skill, "description", "") or ""),
+            "sourcePath": str(getattr(skill, "source_path", "") or ""),
+            "filePath": str(getattr(skill, "file_path", "") or ""),
+            "content": str(getattr(skill, "content", "") or ""),
+        }
+    return result
+
+
+def _selected_skill_configs(config: dict[str, Any], skills: SkillRuntimeConfig) -> list[dict[str, Any]]:
+    ids = _json_string_list(config.get("skillIdsJson"))
+    fallback_id = str(config.get("skillId") or "").strip()
+    if fallback_id and fallback_id not in ids:
+        ids.append(fallback_id)
+    return [skills[skill_id] for skill_id in ids if skill_id in skills]
+
+
+def _append_selected_skills(system_prompt: str, selected_skills: list[dict[str, Any]]) -> str:
+    if not selected_skills:
+        return system_prompt
+    sections = ["可用 Skills:"]
+    for skill in selected_skills:
+        name = str(skill.get("name") or skill.get("id") or "Skill").strip()
+        content = str(skill.get("content") or "").strip()
+        if content:
+            sections.append(f"### {name}\n{content}")
+        else:
+            sections.append(f"### {name}\n（该 Skill 暂无内容）")
+    skill_prompt = "\n\n".join(sections)
+    return f"{system_prompt}\n\n{skill_prompt}".strip() if system_prompt else skill_prompt
+
+
+def _json_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return [item.strip() for item in text.split(",") if item.strip()]
+    if not isinstance(parsed, list):
+        return []
+    return [str(item).strip() for item in parsed if str(item).strip()]
 
 
 def _execute_live_ai_router(node: NodeIR, state: dict[str, Any], model_config: ModelRuntimeConfig) -> tuple[dict[str, Any], str]:
@@ -435,19 +529,322 @@ def _execute_live_http(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, A
     return {output_field: value}, f"真实 HTTP {method} {url}，写入 state.{output_field}"
 
 
-def _execute_live_tool(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+def _execute_live_tool(
+    node: NodeIR,
+    state: dict[str, Any],
+    model_config: ModelRuntimeConfig,
+    tools: ToolRuntimeConfig,
+) -> tuple[dict[str, Any], str]:
     config = node.config
     source = str(config.get("source", "")).strip().lower()
-    if source == "http" or str(config.get("url", "")).strip() or str(config.get("mockResponseJson", "")).strip():
+    legacy_single_tool = not _json_string_list(config.get("toolIdsJson")) and not _json_object_list(config.get("toolRegistryJson"))
+    if legacy_single_tool and (source == "http" or str(config.get("url", "")).strip() or str(config.get("mockResponseJson", "")).strip()):
         return _execute_live_http(node, state)
     output_field = str(config.get("outputField", f"{node.id}_result"))
+    selected_tools = _selected_tool_configs(config, tools)
+    if not selected_tools and legacy_single_tool:
+        return {
+            output_field: {
+                "tool": config.get("toolName", node.label),
+                "source": source or "declarative",
+                "status": "configured",
+            }
+        }, f"声明式 Tool 已记录到 state.{output_field}"
+    if not selected_tools:
+        raise RuntimeError("Tools 节点没有选择任何已配置 Tool。")
+
+    provider, model = _resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
+    max_iterations = min(_positive_int(config.get("maxIterations", 4), 4), 12)
+    system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip()
+    messages: list[tuple[str, str]] = [
+        ("system", _tools_agent_system_prompt(system_prompt, selected_tools, max_iterations)),
+        ("user", render_template(str(config.get("userPrompt") or _agent_state_prompt(state)), state)),
+    ]
+    calls: list[dict[str, Any]] = []
+    final_answer = ""
+    for iteration in range(max_iterations):
+        response = _call_chat_model(provider, model, messages, model_config)
+        content = getattr(response, "content", str(response))
+        decision = _parse_tool_agent_decision(content)
+        tool_calls = _normalize_tool_calls(decision.get("tool_calls"))
+        if not tool_calls:
+            final_answer = _first_config_value(decision.get("final_answer"), content)
+            break
+
+        observations: list[dict[str, Any]] = []
+        for call_index, tool_call in enumerate(tool_calls, start=1):
+            tool_name = str(tool_call.get("tool") or tool_call.get("name") or "").strip()
+            args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
+            tool_config = _find_selected_tool(selected_tools, tool_name)
+            if not tool_config:
+                observation = {"ok": False, "error": f"未知 Tool：{tool_name}"}
+            else:
+                observation = _invoke_registered_tool(tool_config, args)
+            calls.append(
+                {
+                    "iteration": iteration + 1,
+                    "index": call_index,
+                    "tool": tool_name,
+                    "args": args,
+                    "observation": observation,
+                }
+            )
+            observations.append({"tool": tool_name, "observation": observation})
+        messages.append(("assistant", content))
+        messages.append(("user", "工具执行结果：\n" + json.dumps(observations, ensure_ascii=False, indent=2) + "\n请继续；如果已经足够，请返回 final_answer。"))
+    else:
+        final_answer = f"达到最大工具调用轮次 {max_iterations}，已停止。"
+
     return {
-        output_field: {
-            "tool": config.get("toolName", node.label),
-            "source": source or "declarative",
-            "status": "configured",
+        output_field: final_answer,
+        f"{output_field}_tool_calls": calls,
+    }, f"Tools Agent 注册 {len(selected_tools)} 个 Tool，执行 {len(calls)} 次工具调用，输出到 state.{output_field}"
+
+
+def _tools_agent_system_prompt(system_prompt: str, selected_tools: list[dict[str, Any]], max_iterations: int) -> str:
+    tool_lines = []
+    for tool in selected_tools:
+        schema = _parse_json_object(str(tool.get("schemaJson", "{}")))
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+        tool_lines.append(
+            {
+                "id": tool.get("id"),
+                "name": tool.get("name"),
+                "source": tool.get("source"),
+                "description": tool.get("description"),
+                "args": properties,
+                "required": required,
+            }
+        )
+    instructions = (
+        "你是一个可以自主调用工具的 Agent。"
+        f"最多进行 {max_iterations} 轮工具调用；同一个工具可以反复调用，也可以在同一轮调用多个不同工具。"
+        "每次回复必须是 JSON，格式为："
+        '{"tool_calls":[{"tool":"工具名称","args":{}}],"final_answer":""}。'
+        "如果还需要工具，填写 tool_calls；如果已经完成，tool_calls 为空数组，并填写 final_answer。"
+        "不要输出 Markdown。"
+    )
+    registry = "可用工具：\n" + json.dumps(tool_lines, ensure_ascii=False, indent=2)
+    return "\n\n".join(part for part in (system_prompt, instructions, registry) if part).strip()
+
+
+def _parse_tool_agent_decision(content: str) -> dict[str, Any]:
+    text = str(content or "").strip()
+    if not text:
+        return {"tool_calls": [], "final_answer": ""}
+    candidates = [text]
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidates.insert(0, fenced.group(1).strip())
+    start = text.find("{")
+    end = text.rfind("}")
+    if 0 <= start < end:
+        candidates.append(text[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, list):
+            return {"tool_calls": parsed, "final_answer": ""}
+        if isinstance(parsed, dict):
+            return parsed
+    return {"tool_calls": [], "final_answer": text}
+
+
+def _normalize_tool_calls(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    calls: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            calls.append(item)
+    return calls
+
+
+def _invoke_registered_tool(tool_config: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    schema = _parse_json_object(str(tool_config.get("schemaJson", "{}")))
+    metadata = schema.get("x-graphic") if isinstance(schema.get("x-graphic"), dict) else {}
+    kind = str(metadata.get("kind") or "").strip()
+    source = str(tool_config.get("source") or "").strip().lower()
+    try:
+        if source == "python" or kind == "python_function":
+            result = _invoke_python_tool(metadata, args)
+            return {"ok": True, "result": _compact_tool_result(result)}
+        if source in {"openapi", "http"} or kind == "openapi_operation":
+            return {
+                "ok": True,
+                "status": "registered_not_executed",
+                "message": "该工具已注册为 OpenAPI/HTTP 工具，预览运行暂未配置真实 baseUrl 调用。",
+                "operation": {
+                    "method": metadata.get("method"),
+                    "path": metadata.get("path"),
+                },
+                "args": args,
+            }
+        return {
+            "ok": True,
+            "status": "registered",
+            "tool": tool_config.get("name"),
+            "source": source or "json",
+            "args": args,
         }
-    }, f"声明式 Tool 已记录到 state.{output_field}"
+    except Exception as exc:
+        return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+
+
+def _invoke_python_tool(metadata: dict[str, Any], args: dict[str, Any]) -> Any:
+    source_path = str(metadata.get("sourcePath") or "").strip()
+    function_name = str(metadata.get("function") or "").strip()
+    if not source_path or not function_name:
+        raise RuntimeError("Python Tool 缺少 sourcePath 或 function 元数据。")
+    path = Path(source_path).expanduser()
+    if not path.is_absolute():
+        path = ROOT_DIR / path
+    if not path.is_file():
+        raise RuntimeError(f"Python Tool 文件不存在：{path}")
+    module_name = f"graphic_tool_{abs(hash(path))}_{path.stem}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载 Python Tool 文件：{path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    function = getattr(module, function_name, None)
+    if function is None:
+        raise RuntimeError(f"Python Tool 函数不存在：{function_name}")
+    if hasattr(function, "invoke") and callable(function.invoke):
+        result = function.invoke(args)
+    elif callable(function):
+        result = function(**args)
+    else:
+        raise RuntimeError(f"Python Tool 不可调用：{function_name}")
+    if inspect.isawaitable(result):
+        result = _run_awaitable(result)
+    return result
+
+
+def _run_awaitable(value: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(value)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(value)
+    finally:
+        loop.close()
+
+
+def _compact_tool_result(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value if not isinstance(value, str) or len(value) <= 4000 else value[:4000] + "...[truncated]"
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return _compact_value(value)
+    except TypeError:
+        return str(value)
+
+
+def _find_selected_tool(selected_tools: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    normalized = name.strip().lower()
+    if not normalized:
+        return None
+    for tool in selected_tools:
+        candidates = {str(tool.get("id") or "").lower(), str(tool.get("name") or "").lower()}
+        if normalized in candidates:
+            return tool
+    return None
+
+
+def _selected_tool_configs(config: dict[str, Any], tools: ToolRuntimeConfig) -> list[dict[str, Any]]:
+    selected_ids = _json_string_list(config.get("toolIdsJson"))
+    snapshot_tools = _json_object_list(config.get("toolRegistryJson"))
+    snapshot_by_id = {str(tool.get("id") or "").strip(): tool for tool in snapshot_tools if str(tool.get("id") or "").strip()}
+    if not selected_ids and snapshot_tools:
+        selected_ids = [str(tool.get("id") or "").strip() for tool in snapshot_tools if str(tool.get("id") or "").strip()]
+    legacy_name = str(config.get("toolName") or "").strip()
+    if legacy_name and legacy_name not in selected_ids:
+        selected_ids.append(legacy_name)
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for tool_id in selected_ids:
+        tool = tools.get(tool_id) or snapshot_by_id.get(tool_id)
+        if not tool:
+            tool = next((item for item in tools.values() if str(item.get("name") or "") == tool_id), None)
+        if not tool:
+            continue
+        key = str(tool.get("id") or tool.get("name") or tool_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(tool)
+    return result
+
+
+def _json_object_list(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+
+
+def _tool_configs_by_id(project: ProjectIR) -> ToolRuntimeConfig:
+    result: ToolRuntimeConfig = {}
+    for tool in _workspace_tool_dicts():
+        _register_tool_config(result, tool)
+    for tool in getattr(project, "tools", []) or []:
+        _register_tool_config(result, _model_to_tool_dict(tool))
+    for node in project.nodes:
+        for tool in _json_object_list(node.config.get("toolRegistryJson")):
+            _register_tool_config(result, tool)
+    return result
+
+
+def _workspace_tool_dicts() -> list[dict[str, Any]]:
+    if not WORKSPACE_TOOLS_FILE.exists():
+        return []
+    try:
+        data = json.loads(WORKSPACE_TOOLS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
+def _model_to_tool_dict(tool: Any) -> dict[str, Any]:
+    if isinstance(tool, dict):
+        return tool
+    if hasattr(tool, "model_dump"):
+        return tool.model_dump(by_alias=True)
+    return {
+        "id": str(getattr(tool, "id", "") or ""),
+        "name": str(getattr(tool, "name", "") or ""),
+        "description": str(getattr(tool, "description", "") or ""),
+        "source": str(getattr(tool, "source", "") or ""),
+        "schemaJson": str(getattr(tool, "tool_schema", "") or "{}"),
+    }
+
+
+def _register_tool_config(registry: ToolRuntimeConfig, tool: dict[str, Any]) -> None:
+    tool_id = str(tool.get("id") or "").strip()
+    name = str(tool.get("name") or "").strip()
+    if not tool_id and not name:
+        return
+    normalized = {
+        "id": tool_id or name,
+        "name": name or tool_id,
+        "description": str(tool.get("description") or ""),
+        "source": str(tool.get("source") or "python"),
+        "schemaJson": str(tool.get("schemaJson") or tool.get("tool_schema") or "{}"),
+    }
+    registry[normalized["id"]] = normalized
+    registry[normalized["name"]] = normalized
 
 
 def _execute_live_retriever(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:

@@ -8,21 +8,49 @@ import {
   Edit3,
   Eye,
   EyeOff,
+  FolderInput,
+  Github,
   Network,
+  Plug,
   Plus,
   Save,
   Search,
   Server,
   Trash2,
+  Upload,
   Wrench,
 } from "lucide-react";
-import { inspectRagKnowledgeBasePath } from "../lib/api";
+import {
+  checkWorkspaceEnvVar,
+  importWorkspaceMcpServers,
+  importWorkspaceSkillsFromSource,
+  importWorkspaceToolsFromSource,
+  inspectRagKnowledgeBasePath,
+  uploadWorkspaceSkillFolder,
+  uploadWorkspaceToolFolder,
+} from "../lib/api";
 import { useProjectStore } from "../store/projectStore";
-import type { MCPServerConfig, ModelConfig, ProjectListItem, RagKnowledgeBaseConfig, ToolConfig } from "../types";
+import type {
+  EnvVarCheckResult,
+  MCPServerConfig,
+  McpImportResult,
+  ModelConfig,
+  ProjectListItem,
+  RagKnowledgeBaseConfig,
+  SkillConfig,
+  SkillImportResult,
+  ToolConfig,
+  ToolImportResult,
+} from "../types";
 
-type ResourceTab = "tools" | "mcp" | "rag" | "models";
-type ManagerView = "agent" | "agents" | "tools" | "mcp" | "rag" | "models";
+type ResourceTab = "tools" | "skills" | "mcp" | "rag" | "models";
+type ManagerView = "agent" | "agents" | "tools" | "skills" | "mcp" | "rag" | "models";
 type ResourceEditorMode = "empty" | "create" | "edit";
+type ApiKeyMode = "env" | "direct";
+type EnvCheckState = {
+  status: "idle" | "checking" | "success" | "error" | "warning";
+  message: string;
+};
 type DialogState =
   | {
       kind: "alert";
@@ -44,6 +72,7 @@ export function ManagementPage() {
   const projects = useProjectStore((state) => state.projects);
   const managerView = useProjectStore((state) => state.managerView);
   const workspaceTools = useProjectStore((state) => state.workspaceTools);
+  const workspaceSkills = useProjectStore((state) => state.workspaceSkills);
   const workspaceMcpServers = useProjectStore((state) => state.workspaceMcpServers);
   const workspaceModelConfigs = useProjectStore((state) => state.workspaceModelConfigs);
   const workspaceRagKnowledgeBases = useProjectStore((state) => state.workspaceRagKnowledgeBases);
@@ -56,6 +85,7 @@ export function ManagementPage() {
   const deleteProjectById = useProjectStore((state) => state.deleteProjectById);
   const renameProjectById = useProjectStore((state) => state.renameProjectById);
   const updateWorkspaceTools = useProjectStore((state) => state.updateWorkspaceTools);
+  const updateWorkspaceSkills = useProjectStore((state) => state.updateWorkspaceSkills);
   const updateWorkspaceMcpServers = useProjectStore((state) => state.updateWorkspaceMcpServers);
   const updateWorkspaceModelConfigs = useProjectStore((state) => state.updateWorkspaceModelConfigs);
   const updateWorkspaceRagKnowledgeBases = useProjectStore((state) => state.updateWorkspaceRagKnowledgeBases);
@@ -64,6 +94,9 @@ export function ManagementPage() {
   const [selectedToolId, setSelectedToolId] = useState<string | null>(null);
   const [toolDraft, setToolDraft] = useState<ToolConfig>(() => newTool());
   const [toolEditorMode, setToolEditorMode] = useState<ResourceEditorMode>("empty");
+  const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
+  const [skillDraft, setSkillDraft] = useState<SkillConfig>(() => newSkill());
+  const [skillEditorMode, setSkillEditorMode] = useState<ResourceEditorMode>("empty");
   const [selectedMcpId, setSelectedMcpId] = useState<string | null>(null);
   const [mcpDraft, setMcpDraft] = useState<MCPServerConfig>(() => newMcpServer());
   const [mcpEditorMode, setMcpEditorMode] = useState<ResourceEditorMode>("empty");
@@ -100,6 +133,21 @@ export function ManagementPage() {
     setSelectedToolId(null);
     setToolEditorMode("empty");
   }, [managerView, selectedToolId, toolEditorMode, workspaceTools]);
+
+  useEffect(() => {
+    if (managerView !== "skills") return;
+    if (!selectedSkillId) {
+      if (skillEditorMode === "edit") setSkillEditorMode("empty");
+      return;
+    }
+    const selected = workspaceSkills.find((skill) => skill.id === selectedSkillId);
+    if (selected) {
+      setSkillDraft(selected);
+      return;
+    }
+    setSelectedSkillId(null);
+    setSkillEditorMode("empty");
+  }, [managerView, selectedSkillId, skillEditorMode, workspaceSkills]);
 
   useEffect(() => {
     if (managerView !== "mcp") return;
@@ -192,6 +240,30 @@ export function ManagementPage() {
     setToolEditorMode("edit");
   }
 
+  async function importToolConfigs(payload: { sourceType: "local" | "github"; source: string; useMirror: boolean }): Promise<ToolImportResult> {
+    const result = await importWorkspaceToolsFromSource(payload.sourceType, payload.source, payload.useMirror);
+    await updateWorkspaceTools(result.allConfigs);
+    selectImportedTool(result);
+    return result;
+  }
+
+  async function uploadToolFolder(files: File[], rootName: string): Promise<ToolImportResult> {
+    const result = await uploadWorkspaceToolFolder(files, rootName);
+    await updateWorkspaceTools(result.allConfigs);
+    selectImportedTool(result);
+    return result;
+  }
+
+  function selectImportedTool(result: ToolImportResult) {
+    const firstImported = result.imported[0];
+    if (!firstImported) return;
+    const selected = result.allConfigs.find((tool) => tool.id === firstImported.id) ?? firstImported;
+    setSelectedToolId(selected.id);
+    setToolDraft(selected);
+    setToolEditorMode("edit");
+    setManagerView("tools");
+  }
+
   function deleteToolDraft() {
     if (toolEditorMode === "empty") return;
     const exists = workspaceTools.some((tool) => tool.id === toolDraft.id);
@@ -213,6 +285,85 @@ export function ManagementPage() {
         setSelectedToolId(null);
         setToolEditorMode("empty");
         setToolDraft(newTool());
+      },
+    });
+  }
+
+  function openSkillManager(skillId?: string) {
+    if (skillId) {
+      const selected = workspaceSkills.find((skill) => skill.id === skillId);
+      setSelectedSkillId(skillId);
+      if (selected) setSkillDraft(selected);
+      setSkillEditorMode("edit");
+    } else {
+      setSelectedSkillId(null);
+      setSkillEditorMode("empty");
+    }
+    setManagerView("skills");
+  }
+
+  function createSkillDraft() {
+    setSelectedSkillId(null);
+    setSkillDraft(newSkill());
+    setSkillEditorMode("create");
+    setManagerView("skills");
+  }
+
+  function saveSkillDraft() {
+    if (skillEditorMode === "empty") return;
+    const normalized = normalizeSkillDraft(skillDraft);
+    const exists = workspaceSkills.some((skill) => skill.id === normalized.id);
+    const next = exists ? workspaceSkills.map((skill) => (skill.id === normalized.id ? normalized : skill)) : [...workspaceSkills, normalized];
+    void updateWorkspaceSkills(next);
+    setSelectedSkillId(normalized.id);
+    setSkillEditorMode("edit");
+  }
+
+  async function importSkillConfigs(payload: { sourceType: "local" | "github"; source: string; useMirror: boolean }): Promise<SkillImportResult> {
+    const result = await importWorkspaceSkillsFromSource(payload.sourceType, payload.source, payload.useMirror);
+    await updateWorkspaceSkills(result.allConfigs);
+    selectImportedSkill(result);
+    return result;
+  }
+
+  async function uploadSkillFolder(files: File[], rootName: string): Promise<SkillImportResult> {
+    const result = await uploadWorkspaceSkillFolder(files, rootName);
+    await updateWorkspaceSkills(result.allConfigs);
+    selectImportedSkill(result);
+    return result;
+  }
+
+  function selectImportedSkill(result: SkillImportResult) {
+    const firstImported = result.imported[0];
+    if (!firstImported) return;
+    const selected = result.allConfigs.find((skill) => skill.id === firstImported.id) ?? firstImported;
+    setSelectedSkillId(selected.id);
+    setSkillDraft(selected);
+    setSkillEditorMode("edit");
+    setManagerView("skills");
+  }
+
+  function deleteSkillDraft() {
+    if (skillEditorMode === "empty") return;
+    const exists = workspaceSkills.some((skill) => skill.id === skillDraft.id);
+    if (!exists) {
+      setSelectedSkillId(null);
+      setSkillEditorMode("empty");
+      setSkillDraft(newSkill());
+      return;
+    }
+    setDialog({
+      kind: "confirm",
+      title: "删除 Skill",
+      message: `确定删除「${skillDraft.name || "未命名 Skill"}」？已添加到项目中的 Skill 快照不会自动删除。`,
+      confirmText: "删除",
+      cancelText: "取消",
+      danger: true,
+      onConfirm: () => {
+        void updateWorkspaceSkills(workspaceSkills.filter((skill) => skill.id !== skillDraft.id));
+        setSelectedSkillId(null);
+        setSkillEditorMode("empty");
+        setSkillDraft(newSkill());
       },
     });
   }
@@ -245,6 +396,20 @@ export function ManagementPage() {
     void updateWorkspaceMcpServers(next);
     setSelectedMcpId(normalized.id);
     setMcpEditorMode("edit");
+  }
+
+  async function importMcpConfigs(payload: { sourceType: "local" | "github"; source: string; useMirror: boolean }): Promise<McpImportResult> {
+    const result = await importWorkspaceMcpServers(payload);
+    await updateWorkspaceMcpServers(result.allConfigs);
+    const firstImported = result.imported[0];
+    if (firstImported) {
+      const selected = result.allConfigs.find((server) => server.id === firstImported.id) ?? firstImported;
+      setSelectedMcpId(selected.id);
+      setMcpDraft(selected);
+      setMcpEditorMode("edit");
+      setManagerView("mcp");
+    }
+    return result;
   }
 
   function deleteMcpDraft() {
@@ -434,6 +599,13 @@ export function ManagementPage() {
               onClick={() => openToolManager()}
             />
             <NavButton
+              active={managerView === "skills"}
+              icon={<Plug size={17} />}
+              title="Skills"
+              text="管理供 Agent 注入的技能说明"
+              onClick={() => openSkillManager()}
+            />
+            <NavButton
               active={managerView === "mcp"}
               icon={<Server size={17} />}
               title="MCP"
@@ -463,6 +635,7 @@ export function ManagementPage() {
             </div>
             <div className="resource-tabs manager-resource-tabs">
               <TabButton active={resourceTab === "tools"} icon={<Wrench size={15} />} label="Tools" onClick={() => setResourceTab("tools")} />
+              <TabButton active={resourceTab === "skills"} icon={<Plug size={15} />} label="Skills" onClick={() => setResourceTab("skills")} />
               <TabButton active={resourceTab === "mcp"} icon={<Server size={15} />} label="MCP" onClick={() => setResourceTab("mcp")} />
               <TabButton active={resourceTab === "rag"} icon={<Database size={15} />} label="RAG" onClick={() => setResourceTab("rag")} />
               <TabButton active={resourceTab === "models"} icon={<BrainCircuit size={15} />} label="模型" onClick={() => setResourceTab("models")} />
@@ -472,6 +645,12 @@ export function ManagementPage() {
                 items={workspaceTools}
                 onCreate={createToolDraft}
                 onOpen={openToolManager}
+              />
+            ) : resourceTab === "skills" ? (
+              <ReadonlySkillResourceList
+                items={workspaceSkills}
+                onCreate={createSkillDraft}
+                onOpen={openSkillManager}
               />
             ) : resourceTab === "mcp" ? (
               <ReadonlyMcpResourceList
@@ -511,10 +690,35 @@ export function ManagementPage() {
               onChange={(patch) => setToolDraft((current) => ({ ...current, ...patch }))}
               onSave={saveToolDraft}
               onDelete={deleteToolDraft}
+              onImport={importToolConfigs}
+              onUploadFolder={uploadToolFolder}
               onCancel={() => {
                 setSelectedToolId(null);
                 setToolEditorMode("empty");
                 setToolDraft(newTool());
+              }}
+            />
+          ) : managerView === "skills" ? (
+            <SkillManagerContent
+              items={workspaceSkills}
+              draft={skillDraft}
+              editorMode={skillEditorMode}
+              selectedId={selectedSkillId}
+              onSelect={(skill) => {
+                setSelectedSkillId(skill.id);
+                setSkillDraft(skill);
+                setSkillEditorMode("edit");
+              }}
+              onNew={createSkillDraft}
+              onChange={(patch) => setSkillDraft((current) => ({ ...current, ...patch }))}
+              onSave={saveSkillDraft}
+              onDelete={deleteSkillDraft}
+              onImport={importSkillConfigs}
+              onUploadFolder={uploadSkillFolder}
+              onCancel={() => {
+                setSelectedSkillId(null);
+                setSkillEditorMode("empty");
+                setSkillDraft(newSkill());
               }}
             />
           ) : managerView === "mcp" ? (
@@ -532,6 +736,7 @@ export function ManagementPage() {
               onChange={(patch) => setMcpDraft((current) => ({ ...current, ...patch }))}
               onSave={saveMcpDraft}
               onDelete={deleteMcpDraft}
+              onImport={importMcpConfigs}
               onCancel={() => {
                 setSelectedMcpId(null);
                 setMcpEditorMode("empty");
@@ -722,6 +927,8 @@ function ToolManagerContent({
   onChange,
   onSave,
   onDelete,
+  onImport,
+  onUploadFolder,
   onCancel,
 }: {
   items: ToolConfig[];
@@ -733,11 +940,62 @@ function ToolManagerContent({
   onChange: (patch: Partial<ToolConfig>) => void;
   onSave: () => void;
   onDelete: () => void;
+  onImport: (payload: { sourceType: "local" | "github"; source: string; useMirror: boolean }) => Promise<ToolImportResult>;
+  onUploadFolder: (files: File[], rootName: string) => Promise<ToolImportResult>;
   onCancel: () => void;
 }) {
+  const [importType, setImportType] = useState<"local" | "github">("local");
+  const [importSource, setImportSource] = useState("");
+  const [useMirror, setUseMirror] = useState(true);
+  const [importing, setImporting] = useState(false);
+  const [importMessage, setImportMessage] = useState("");
+  const [importError, setImportError] = useState(false);
+
+  async function handleImport() {
+    const source = importSource.trim();
+    if (!source) {
+      setImportMessage(importType === "github" ? "请先输入 GitHub 仓库地址。" : "请先输入本机工具目录或工具文件路径。");
+      setImportError(true);
+      return;
+    }
+    setImporting(true);
+    setImportMessage(importType === "github" ? "正在通过镜像源 clone 并识别工具..." : "正在复制本机文件并识别工具...");
+    setImportError(false);
+    try {
+      const result = await onImport({ sourceType: importType, source, useMirror });
+      setImportMessage(formatToolImportMessage(result));
+      setImportError(false);
+    } catch (error) {
+      setImportMessage(error instanceof Error ? readableApiError(error.message) : "Tools 导入失败。");
+      setImportError(true);
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function handleFolderUpload(files: FileList | null) {
+    const selectedFiles = Array.from(files ?? []);
+    if (!selectedFiles.length) return;
+    const firstPath = selectedFiles[0] && "webkitRelativePath" in selectedFiles[0] ? selectedFiles[0].webkitRelativePath : "";
+    const rootName = firstPath ? firstPath.split(/[\\/]/)[0] : "uploaded-tools";
+    setImporting(true);
+    setImportMessage("正在上传本地文件夹并识别工具...");
+    setImportError(false);
+    try {
+      const result = await onUploadFolder(selectedFiles, rootName);
+      setImportMessage(formatToolImportMessage(result));
+      setImportError(false);
+    } catch (error) {
+      setImportMessage(error instanceof Error ? readableApiError(error.message) : "Tools 文件夹上传失败。");
+      setImportError(true);
+    } finally {
+      setImporting(false);
+    }
+  }
+
   return (
     <div className="model-manager">
-      <ResourceManagerHead title="Tools 配置" text="管理可在节点库 Skill Node 分组中选择的工具资源。" actionText="新增 Tool" onNew={onNew} />
+      <ResourceManagerHead title="Tools 配置" text="管理可在 Tool 节点和 Agent 工具配置中使用的工具资源。" actionText="新增 Tool" onNew={onNew} />
       <div className="model-manager__body">
         <ResourceListPanel
           title="已配置 Tools"
@@ -749,6 +1007,63 @@ function ToolManagerContent({
           renderMark={() => <Wrench size={16} />}
         />
         <section className="model-editor-panel">
+          <div className="model-editor-card mcp-import-card">
+            <div className="mcp-import-head">
+              <strong>一键导入 Tools</strong>
+              <span>支持上传本地文件夹、本机路径复制导入，也支持 GitHub 仓库镜像 clone。</span>
+            </div>
+            <div className="api-key-source">
+              <button className={importType === "local" ? "is-active" : ""} onClick={() => setImportType("local")} type="button">
+                <FolderInput size={14} />
+                <span>本机路径</span>
+              </button>
+              <button className={importType === "github" ? "is-active" : ""} onClick={() => setImportType("github")} type="button">
+                <Github size={14} />
+                <span>GitHub 地址</span>
+              </button>
+            </div>
+            <div className="rag-path-import">
+              <input
+                value={importSource}
+                placeholder={importType === "github" ? "https://github.com/org/repo 或 org/repo" : "粘贴本机工具文件夹或单个 tools.py / openapi.json 路径"}
+                onChange={(event) => setImportSource(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void handleImport();
+                  }
+                }}
+              />
+              <button disabled={importing} onClick={() => void handleImport()} type="button">
+                <Search size={15} />
+                <span>{importing ? "导入中" : "导入"}</span>
+              </button>
+            </div>
+            <div className="tool-import-actions">
+              <label className={`tool-upload-button ${importing ? "is-disabled" : ""}`}>
+                <Upload size={15} />
+                <span>上传本地文件夹</span>
+                <input
+                  type="file"
+                  multiple
+                  disabled={importing}
+                  onChange={(event) => {
+                    void handleFolderUpload(event.target.files);
+                    event.currentTarget.value = "";
+                  }}
+                  {...{ webkitdirectory: "", directory: "" }}
+                />
+              </label>
+              {importType === "github" ? (
+                <label className="mcp-import-toggle">
+                  <input checked={useMirror} onChange={(event) => setUseMirror(event.target.checked)} type="checkbox" />
+                  <span>优先使用国内 GitHub 镜像源 clone，失败后回退原地址。</span>
+                </label>
+              ) : null}
+            </div>
+            <small className="model-config-note">会识别 Python @tool / tool 文件中的函数、OpenAPI operations、tools.json；导入文件统一复制/clone 到后端 config/tools/ 目录。</small>
+            {importMessage ? <small className={`rag-inspect-status ${importError ? "is-error" : ""}`}>{importMessage}</small> : null}
+          </div>
           {editorMode === "empty" ? (
             <ResourceEditorEmpty icon={<Wrench size={24} />} title="未选择 Tool" text="从左侧选择一个已配置 Tool 进行编辑，或点击右上角新增 Tool。" />
           ) : (
@@ -778,6 +1093,212 @@ function ToolManagerContent({
   );
 }
 
+function SkillManagerContent({
+  items,
+  draft,
+  editorMode,
+  selectedId,
+  onSelect,
+  onNew,
+  onChange,
+  onSave,
+  onDelete,
+  onImport,
+  onUploadFolder,
+  onCancel,
+}: {
+  items: SkillConfig[];
+  draft: SkillConfig;
+  editorMode: ResourceEditorMode;
+  selectedId: string | null;
+  onSelect: (item: SkillConfig) => void;
+  onNew: () => void;
+  onChange: (patch: Partial<SkillConfig>) => void;
+  onSave: () => void;
+  onDelete: () => void;
+  onImport: (payload: { sourceType: "local" | "github"; source: string; useMirror: boolean }) => Promise<SkillImportResult>;
+  onUploadFolder: (files: File[], rootName: string) => Promise<SkillImportResult>;
+  onCancel: () => void;
+}) {
+  const [importType, setImportType] = useState<"local" | "github">("local");
+  const [importSource, setImportSource] = useState("");
+  const [useMirror, setUseMirror] = useState(true);
+  const [importing, setImporting] = useState(false);
+  const [importMessage, setImportMessage] = useState("");
+  const [importError, setImportError] = useState(false);
+
+  async function handleImport() {
+    const source = importSource.trim();
+    if (!source) {
+      setImportMessage(importType === "github" ? "请先输入 GitHub 仓库地址。" : "请先输入本机 Skill 文件或目录路径。");
+      setImportError(true);
+      return;
+    }
+    setImporting(true);
+    setImportMessage(importType === "github" ? "正在通过镜像源 clone 并识别 Skills..." : "正在复制本机文件并识别 Skills...");
+    setImportError(false);
+    try {
+      const result = await onImport({ sourceType: importType, source, useMirror });
+      setImportMessage(formatSkillImportMessage(result));
+      setImportError(false);
+    } catch (error) {
+      setImportMessage(error instanceof Error ? readableApiError(error.message) : "Skills 导入失败。");
+      setImportError(true);
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function handleUpload(files: FileList | null, fallbackRootName: string) {
+    const selectedFiles = Array.from(files ?? []);
+    if (!selectedFiles.length) return;
+    const firstPath = selectedFiles[0] && "webkitRelativePath" in selectedFiles[0] ? selectedFiles[0].webkitRelativePath : "";
+    const rootName = firstPath ? firstPath.split(/[\\/]/)[0] : fallbackRootName;
+    setImporting(true);
+    setImportMessage("正在上传并识别 Skills...");
+    setImportError(false);
+    try {
+      const result = await onUploadFolder(selectedFiles, rootName);
+      setImportMessage(formatSkillImportMessage(result));
+      setImportError(false);
+    } catch (error) {
+      setImportMessage(error instanceof Error ? readableApiError(error.message) : "Skills 上传失败。");
+      setImportError(true);
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  return (
+    <div className="model-manager">
+      <ResourceManagerHead title="Skills 配置" text="管理供 Agent system prompt 注入的 Skill 说明和 Markdown 内容。" actionText="新增 Skill" onNew={onNew} />
+      <div className="model-manager__body">
+        <ResourceListPanel
+          title="已配置 Skills"
+          emptyText="还没有 Skill。可从 SKILL.md、普通 Markdown、本地目录或 GitHub 仓库导入。"
+          items={items}
+          selectedId={selectedId}
+          onSelect={onSelect}
+          renderMeta={(item) => `${skillSourceLabel(item.sourceType)} · ${item.description || item.filePath || "未填写描述"}`}
+          renderMark={() => <Plug size={16} />}
+        />
+        <section className="model-editor-panel">
+          <div className="model-editor-card mcp-import-card">
+            <div className="mcp-import-head">
+              <strong>一键导入 Skills</strong>
+              <span>识别目录内 SKILL.md 为 Codex-style Skill；普通 Markdown 会作为独立 Skill。</span>
+            </div>
+            <div className="api-key-source">
+              <button className={importType === "local" ? "is-active" : ""} onClick={() => setImportType("local")} type="button">
+                <FolderInput size={14} />
+                <span>本机路径</span>
+              </button>
+              <button className={importType === "github" ? "is-active" : ""} onClick={() => setImportType("github")} type="button">
+                <Github size={14} />
+                <span>GitHub 地址</span>
+              </button>
+            </div>
+            <div className="rag-path-import">
+              <input
+                value={importSource}
+                placeholder={importType === "github" ? "https://github.com/org/repo 或 org/repo" : "粘贴本机 SKILL.md、Markdown 文件或 skills 目录路径"}
+                onChange={(event) => setImportSource(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void handleImport();
+                  }
+                }}
+              />
+              <button disabled={importing} onClick={() => void handleImport()} type="button">
+                <Search size={15} />
+                <span>{importing ? "导入中" : "导入"}</span>
+              </button>
+            </div>
+            <div className="tool-import-actions">
+              <label className={`tool-upload-button ${importing ? "is-disabled" : ""}`}>
+                <Upload size={15} />
+                <span>上传 Markdown 文件</span>
+                <input
+                  type="file"
+                  multiple
+                  accept=".md,.markdown,text/markdown,text/plain"
+                  disabled={importing}
+                  onChange={(event) => {
+                    void handleUpload(event.target.files, "uploaded-skills");
+                    event.currentTarget.value = "";
+                  }}
+                />
+              </label>
+              <label className={`tool-upload-button ${importing ? "is-disabled" : ""}`}>
+                <Upload size={15} />
+                <span>上传文件夹</span>
+                <input
+                  type="file"
+                  multiple
+                  disabled={importing}
+                  onChange={(event) => {
+                    void handleUpload(event.target.files, "uploaded-skills");
+                    event.currentTarget.value = "";
+                  }}
+                  {...{ webkitdirectory: "", directory: "" }}
+                />
+              </label>
+              {importType === "github" ? (
+                <label className="mcp-import-toggle">
+                  <input checked={useMirror} onChange={(event) => setUseMirror(event.target.checked)} type="checkbox" />
+                  <span>优先使用国内 GitHub 镜像源 clone，失败后回退原地址。</span>
+                </label>
+              ) : null}
+            </div>
+            <small className="model-config-note">导入文件统一复制/clone 到后端 config/skills/ 目录；v1 只读取 Markdown 内容，不执行脚本、不安装依赖。</small>
+            {importMessage ? <small className={`rag-inspect-status ${importError ? "is-error" : ""}`}>{importMessage}</small> : null}
+          </div>
+          {editorMode === "empty" ? (
+            <ResourceEditorEmpty icon={<Plug size={24} />} title="未选择 Skill" text="从左侧选择一个已配置 Skill 进行编辑，或点击右上角新增 Skill。" />
+          ) : (
+            <div className="model-editor-card">
+              <ResourceEditorHead title={editorMode === "create" ? "新增 Skill" : "编辑 Skill"} text="配置 Skill 名称、说明和注入到 Agent 的 Markdown 内容。" mode={editorMode} onCancel={onCancel} onDelete={onDelete} onSave={onSave} />
+              <Field label="名称">
+                <input value={draft.name} onChange={(event) => onChange({ name: event.target.value })} />
+              </Field>
+              <Field label="描述">
+                <textarea rows={3} value={draft.description} onChange={(event) => onChange({ description: event.target.value })} />
+              </Field>
+              <label className="mcp-import-toggle">
+                <input checked={draft.enabled} onChange={(event) => onChange({ enabled: event.target.checked })} type="checkbox" />
+                <span>启用该 Skill</span>
+              </label>
+              <div className="inline-grid">
+                <Field label="来源类型">
+                  <select value={draft.sourceType} onChange={(event) => onChange({ sourceType: event.target.value })}>
+                    <option value="manual">手动</option>
+                    <option value="local">本地导入</option>
+                    <option value="github">GitHub</option>
+                    <option value="upload">上传</option>
+                  </select>
+                </Field>
+                <Field label="文件路径">
+                  <input value={draft.filePath} onChange={(event) => onChange({ filePath: event.target.value })} />
+                </Field>
+              </div>
+              <Field label="导入路径">
+                <input value={draft.sourcePath} onChange={(event) => onChange({ sourcePath: event.target.value })} />
+              </Field>
+              <Field label="Skill 内容">
+                <textarea className="code-area" rows={14} value={draft.content} onChange={(event) => onChange({ content: event.target.value })} />
+              </Field>
+              <Field label="Metadata JSON">
+                <textarea className="code-area" rows={5} value={draft.metadataJson} onChange={(event) => onChange({ metadataJson: event.target.value })} />
+              </Field>
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
 function McpManagerContent({
   items,
   draft,
@@ -788,6 +1309,7 @@ function McpManagerContent({
   onChange,
   onSave,
   onDelete,
+  onImport,
   onCancel,
 }: {
   items: MCPServerConfig[];
@@ -799,8 +1321,39 @@ function McpManagerContent({
   onChange: (patch: Partial<MCPServerConfig>) => void;
   onSave: () => void;
   onDelete: () => void;
+  onImport: (payload: { sourceType: "local" | "github"; source: string; useMirror: boolean }) => Promise<McpImportResult>;
   onCancel: () => void;
 }) {
+  const [importType, setImportType] = useState<"local" | "github">("local");
+  const [importSource, setImportSource] = useState("");
+  const [useMirror, setUseMirror] = useState(true);
+  const [importing, setImporting] = useState(false);
+  const [importMessage, setImportMessage] = useState("");
+  const [importError, setImportError] = useState(false);
+
+  async function handleImport() {
+    const source = importSource.trim();
+    if (!source) {
+      setImportMessage(importType === "github" ? "请先输入 GitHub 仓库地址。" : "请先输入本地 MCP 配置或项目路径。");
+      setImportError(true);
+      return;
+    }
+    setImporting(true);
+    setImportMessage(importType === "github" ? "正在通过镜像源 clone 并识别 MCP 配置..." : "正在复制本地文件并识别 MCP 配置...");
+    setImportError(false);
+    try {
+      const result = await onImport({ sourceType: importType, source, useMirror });
+      const warningText = result.warnings.length ? `；${result.warnings.join("；")}` : "";
+      setImportMessage(`已导入 ${result.imported.length} 个 MCP，文件位于 ${result.importPath}${warningText}`);
+      setImportError(false);
+    } catch (error) {
+      setImportMessage(error instanceof Error ? readableApiError(error.message) : "MCP 导入失败。");
+      setImportError(true);
+    } finally {
+      setImporting(false);
+    }
+  }
+
   return (
     <div className="model-manager">
       <ResourceManagerHead title="MCP 配置" text="管理可在节点库 MCP Node 分组中选择的 MCP Server。" actionText="新增 MCP" onNew={onNew} />
@@ -815,6 +1368,41 @@ function McpManagerContent({
           renderMark={() => <Server size={16} />}
         />
         <section className="model-editor-panel">
+          <div className="model-editor-card mcp-import-card">
+            <div className="mcp-import-head">
+              <strong>一键导入 MCP</strong>
+              <span>支持本地配置/项目目录，也支持 GitHub 仓库镜像 clone。</span>
+            </div>
+            <div className="api-key-source">
+              <button className={importType === "local" ? "is-active" : ""} onClick={() => setImportType("local")} type="button">本地路径</button>
+              <button className={importType === "github" ? "is-active" : ""} onClick={() => setImportType("github")} type="button">GitHub 地址</button>
+            </div>
+            <div className="rag-path-import">
+              <input
+                value={importSource}
+                placeholder={importType === "github" ? "https://github.com/org/repo 或 org/repo" : "粘贴 config.toml、mcp.json 或 MCP 项目目录"}
+                onChange={(event) => setImportSource(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void handleImport();
+                  }
+                }}
+              />
+              <button disabled={importing} onClick={() => void handleImport()} type="button">
+                <Search size={15} />
+                <span>{importing ? "导入中" : "导入"}</span>
+              </button>
+            </div>
+            {importType === "github" ? (
+              <label className="mcp-import-toggle">
+                <input checked={useMirror} onChange={(event) => setUseMirror(event.target.checked)} type="checkbox" />
+                <span>优先使用国内 GitHub 镜像源 clone，失败后回退原地址。</span>
+              </label>
+            ) : null}
+            <small className="model-config-note">会识别 Codex config.toml 中的 [mcp_servers.*]、常见 mcp.json；导入文件统一复制/clone 到后端 config/mcp/ 目录。</small>
+            {importMessage ? <small className={`rag-inspect-status ${importError ? "is-error" : ""}`}>{importMessage}</small> : null}
+          </div>
           {editorMode === "empty" ? (
             <ResourceEditorEmpty icon={<Server size={24} />} title="未选择 MCP" text="从左侧选择一个已配置 MCP 进行编辑，或点击右上角新增 MCP。" />
           ) : (
@@ -825,16 +1413,77 @@ function McpManagerContent({
               </Field>
               <Field label="Transport">
                 <select value={draft.transport} onChange={(event) => onChange({ transport: event.target.value })}>
-                  <option value="stdio">stdio</option>
-                  <option value="http">http</option>
+                  <option value="stdio">STDIO（本地进程）</option>
+                  <option value="http">流式 HTTP（远端服务）</option>
                 </select>
               </Field>
-              <Field label="Command">
-                <input value={draft.command} onChange={(event) => onChange({ command: event.target.value })} />
+              {draft.transport === "http" ? (
+                <>
+                  <Field label="URL">
+                    <input placeholder="https://mcp.example.com/mcp" value={draft.url} onChange={(event) => onChange({ url: event.target.value })} />
+                  </Field>
+                  <Field label="Bearer 令牌环境变量">
+                    <input placeholder="MCP_BEARER_TOKEN" value={draft.bearerTokenEnvVar} onChange={(event) => onChange({ bearerTokenEnvVar: event.target.value })} />
+                    <small className="model-config-note">只保存环境变量名，不保存真实 token。运行时由后端环境读取。</small>
+                  </Field>
+                  <Field label="静态 HTTP Headers JSON">
+                    <textarea className="code-area" rows={4} value={draft.httpHeadersJson} onChange={(event) => onChange({ httpHeadersJson: event.target.value })} />
+                  </Field>
+                  <Field label="来自环境变量的 Headers JSON">
+                    <textarea className="code-area" rows={4} value={draft.envHttpHeadersJson} onChange={(event) => onChange({ envHttpHeadersJson: event.target.value })} />
+                  </Field>
+                </>
+              ) : (
+                <>
+                  <Field label="启动命令">
+                    <input placeholder="npx / python / uvx" value={draft.command} onChange={(event) => onChange({ command: event.target.value })} />
+                  </Field>
+                  <Field label="参数 JSON">
+                    <textarea className="code-area" rows={4} value={draft.argsJson} onChange={(event) => onChange({ argsJson: event.target.value })} />
+                  </Field>
+                  <Field label="环境变量 JSON">
+                    <textarea className="code-area" rows={4} value={draft.envJson} onChange={(event) => onChange({ envJson: event.target.value })} />
+                    <small className="model-config-note">导入时会自动清空疑似 key/token/secret 的明文值；建议改用 env_vars 传递。</small>
+                  </Field>
+                  <Field label="环境变量传递 JSON">
+                    <textarea className="code-area" rows={4} value={draft.envVarsJson} onChange={(event) => onChange({ envVarsJson: event.target.value })} />
+                  </Field>
+                  <Field label="工作目录">
+                    <input placeholder="~/code 或导入后的 config/mcp 子目录" value={draft.cwd} onChange={(event) => onChange({ cwd: event.target.value })} />
+                  </Field>
+                </>
+              )}
+              <div className="inline-grid">
+                <Field label="启动超时（秒）">
+                  <input type="number" min={1} value={draft.startupTimeoutSec} onChange={(event) => onChange({ startupTimeoutSec: Number(event.target.value) || 10 })} />
+                </Field>
+                <Field label="工具超时（秒）">
+                  <input type="number" min={1} value={draft.toolTimeoutSec} onChange={(event) => onChange({ toolTimeoutSec: Number(event.target.value) || 60 })} />
+                </Field>
+              </div>
+              <Field label="工具白名单 JSON">
+                <textarea className="code-area" rows={3} value={draft.enabledToolsJson} onChange={(event) => onChange({ enabledToolsJson: event.target.value })} />
               </Field>
-              <Field label="URL">
-                <input value={draft.url} onChange={(event) => onChange({ url: event.target.value })} />
+              <Field label="工具黑名单 JSON">
+                <textarea className="code-area" rows={3} value={draft.disabledToolsJson} onChange={(event) => onChange({ disabledToolsJson: event.target.value })} />
               </Field>
+              <Field label="默认工具审批模式">
+                <select value={draft.defaultToolsApprovalMode} onChange={(event) => onChange({ defaultToolsApprovalMode: event.target.value })}>
+                  <option value="">使用默认</option>
+                  <option value="auto">auto</option>
+                  <option value="prompt">prompt</option>
+                  <option value="approve">approve</option>
+                </select>
+              </Field>
+              <label className="mcp-import-toggle">
+                <input checked={draft.enabled} onChange={(event) => onChange({ enabled: event.target.checked })} type="checkbox" />
+                <span>启用该 MCP Server</span>
+              </label>
+              {draft.sourcePath ? (
+                <Field label="导入来源">
+                  <input readOnly value={`${draft.sourceType} · ${draft.sourcePath}`} />
+                </Field>
+              ) : null}
               <Field label="描述">
                 <textarea rows={4} value={draft.description} onChange={(event) => onChange({ description: event.target.value })} />
               </Field>
@@ -1157,6 +1806,41 @@ function ModelManagerContent({
   const extraOptions = useMemo(() => readOptionRows(draft.extraOptionsJson), [draft.extraOptionsJson]);
   const modelRows = useMemo(() => readModelRows(draft), [draft]);
   const configJson = useMemo(() => buildConfigJson(draft), [draft]);
+  const apiKeyMode = apiKeyModeOf(draft);
+  const [envCheck, setEnvCheck] = useState<EnvCheckState>({ status: "idle", message: "" });
+
+  useEffect(() => {
+    const envName = draft.apiKeyEnv.trim();
+    if (apiKeyMode !== "env") {
+      setEnvCheck({ status: "idle", message: "" });
+      return;
+    }
+    if (!envName) {
+      setEnvCheck({ status: "idle", message: "输入 .env 中的变量名后会自动检测。" });
+      return;
+    }
+    if (!isEnvName(envName)) {
+      setEnvCheck({ status: "error", message: "环境变量名格式不正确，应类似 MIMO_API_KEY。" });
+      return;
+    }
+    let cancelled = false;
+    setEnvCheck({ status: "checking", message: "正在检测 .env / 后端环境变量..." });
+    const timer = window.setTimeout(() => {
+      void checkWorkspaceEnvVar(envName)
+        .then((result) => {
+          if (cancelled) return;
+          setEnvCheck(envCheckFromResult(result));
+        })
+        .catch((error) => {
+          if (cancelled) return;
+          setEnvCheck({ status: "error", message: error instanceof Error ? error.message : "检测失败。" });
+        });
+    }, 320);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [apiKeyMode, draft.apiKeyEnv]);
 
   return (
     <div className="model-manager">
@@ -1289,13 +1973,48 @@ function ModelManagerContent({
               </select>
             </Field>
 
-            <Field label="API Key 环境变量">
-              <input
-                value={draft.apiKeyEnv}
-                placeholder="例如：OPENAI_API_KEY"
-                onChange={(event) => onChange({ apiKeyEnv: event.target.value, apiKey: "" })}
-              />
-              <small className="model-config-note">这里只能填写变量名，例如 MIMO_API_KEY；真实密钥请放在后端运行环境或导出项目的 .env 文件中。</small>
+            <Field label="API Key 来源">
+              <div className="api-key-source" role="group" aria-label="API Key 来源">
+                <button
+                  className={apiKeyMode === "env" ? "is-active" : ""}
+                  onClick={() => onChange({ apiKeyMode: "env", apiKey: "" })}
+                  type="button"
+                >
+                  从 .env 读取
+                </button>
+                <button
+                  className={apiKeyMode === "direct" ? "is-active" : ""}
+                  onClick={() => onChange({ apiKeyMode: "direct", apiKeyEnv: "" })}
+                  type="button"
+                >
+                  直接写入
+                </button>
+              </div>
+              {apiKeyMode === "env" ? (
+                <>
+                  <input
+                    value={draft.apiKeyEnv}
+                    placeholder="例如：MIMO_API_KEY"
+                    onChange={(event) => onChange({ apiKeyEnv: event.target.value, apiKey: "", apiKeyMode: "env" })}
+                  />
+                  <small className={`env-check-status is-${envCheck.status}`}>{envCheck.message || "输入 .env 中的变量名后会自动检测。"}</small>
+                </>
+              ) : (
+                <>
+                  <div className="secret-input">
+                    <input
+                      type={showApiKey ? "text" : "password"}
+                      value={draft.apiKey}
+                      placeholder="输入 API Key"
+                      onChange={(event) => onChange({ apiKey: event.target.value, apiKeyEnv: "", apiKeyMode: "direct" })}
+                    />
+                    <button className="icon-only" onClick={onToggleApiKey} title={showApiKey ? "隐藏 API Key" : "显示 API Key"} type="button">
+                      {showApiKey ? <EyeOff size={15} /> : <Eye size={15} />}
+                    </button>
+                  </div>
+                  <small className="env-check-status is-warning">直接写入会保存到本地 workspace 配置；仅建议本机调试使用。</small>
+                </>
+              )}
             </Field>
 
             <Field label="Base URL">
@@ -1588,6 +2307,38 @@ function ReadonlyToolResourceList({
   );
 }
 
+function ReadonlySkillResourceList({
+  items,
+  onCreate,
+  onOpen,
+}: {
+  items: SkillConfig[];
+  onCreate: () => void;
+  onOpen: (id?: string) => void;
+}) {
+  return (
+    <div className="resource-list">
+      <button className="resource-add" onClick={onCreate} type="button">
+        <Plus size={15} />
+        <span>去 Skills 管理添加</span>
+      </button>
+      {items.length === 0 ? <div className="resource-empty">还没有 Skill。这里仅展示已配置资源，管理请进入右侧「Skills」区域。</div> : null}
+      {items.map((item) => (
+        <button key={item.id} className="resource-card resource-model-card" onClick={() => onOpen(item.id)} type="button">
+          <span className="resource-model-card__icon">
+            <Plug size={15} />
+          </span>
+          <span>
+            <strong>{item.name}</strong>
+            <small>{skillSourceLabel(item.sourceType)} · {item.description || item.filePath || "未填写描述"}</small>
+          </span>
+          {item.enabled ? null : <em>停用</em>}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function ReadonlyMcpResourceList({
   items,
   onCreate,
@@ -1735,6 +2486,7 @@ function newModelConfig(isDefault: boolean, preset: ModelProviderPreset): ModelC
     baseUrl: preset.baseUrl,
     apiKey: "",
     apiKeyEnv: preset.apiKeyEnv,
+    apiKeyMode: "env",
     apiVersion: "",
     organization: "",
     homepage: preset.homepage,
@@ -1757,6 +2509,7 @@ function applyProviderPreset(config: ModelConfig, preset: ModelProviderPreset): 
     baseUrl: preset.baseUrl,
     apiKey: "",
     apiKeyEnv: preset.apiKeyEnv,
+    apiKeyMode: "env",
     homepage: preset.homepage,
     apiFormat: preset.apiFormat,
     apiVersion: preset.provider === "azure_openai" ? config.apiVersion : "",
@@ -1770,14 +2523,16 @@ function applyProviderPreset(config: ModelConfig, preset: ModelProviderPreset): 
 function normalizeModelDraft(config: ModelConfig): ModelConfig {
   const modelRows = readModelRows(config);
   const models = modelsFromRows(modelRows);
+  const apiKeyMode = apiKeyModeOf(config);
   return {
     ...config,
     name: config.name.trim(),
     provider: normalizeProviderId(config.provider),
     model: config.model.trim(),
     baseUrl: config.baseUrl.trim(),
-    apiKey: "",
-    apiKeyEnv: config.apiKeyEnv.trim(),
+    apiKey: apiKeyMode === "direct" ? config.apiKey.trim() : "",
+    apiKeyEnv: apiKeyMode === "env" ? config.apiKeyEnv.trim() : "",
+    apiKeyMode,
     homepage: config.homepage.trim(),
     apiFormat: config.apiFormat.trim() || "openai_compatible",
     notes: config.notes.trim(),
@@ -1791,9 +2546,11 @@ function getModelConfigError(config: ModelConfig, configs: ModelConfig[]) {
   const provider = normalizeProviderId(config.provider);
   const name = config.name.trim();
   const apiKeyEnv = config.apiKeyEnv.trim();
+  const apiKeyMode = apiKeyModeOf(config);
   if (!provider) return "供应商标识不能为空。";
   if (!name) return "供应商名称不能为空。";
-  if (apiKeyEnv && !isEnvName(apiKeyEnv)) return "API Key 环境变量只能填写变量名，例如 MIMO_API_KEY，不能填写真实密钥。";
+  if (apiKeyMode === "env" && apiKeyEnv && !isEnvName(apiKeyEnv)) return "API Key 环境变量只能填写变量名，例如 MIMO_API_KEY，不能填写真实密钥。";
+  if (apiKeyMode === "direct" && !config.apiKey.trim()) return "直接写入模式下 API Key 不能为空。";
   if (provider === "custom") {
     const duplicate = configs.some((item) => item.id !== config.id && item.provider === "custom" && sameText(item.name, name));
     if (duplicate) return "自定义配置名称不能重复。";
@@ -1814,6 +2571,16 @@ function ensureUniqueCustomName(config: ModelConfig, configs: ModelConfig[]) {
 
 function isEnvName(value: string) {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
+}
+
+function apiKeyModeOf(config: Partial<ModelConfig>): ApiKeyMode {
+  return config.apiKeyMode === "direct" || (config.apiKey && !config.apiKeyEnv) ? "direct" : "env";
+}
+
+function envCheckFromResult(result: EnvVarCheckResult): EnvCheckState {
+  if (!result.valid) return { status: "error", message: result.message };
+  if (!result.exists) return { status: "error", message: result.message };
+  return { status: "success", message: result.message };
 }
 
 function setDefaultModelConfig(items: ModelConfig[], id: string): ModelConfig[] {
@@ -1911,11 +2678,14 @@ function modelsFromRows(rows: ModelRow[]) {
 }
 
 function buildConfigJson(config: ModelConfig) {
+  const apiKeyMode = apiKeyModeOf(config);
   const options: Record<string, unknown> = {
     baseURL: config.baseUrl,
-    apiKeyEnv: config.apiKeyEnv,
+    apiKeyMode,
     ...parseJsonObject(config.extraOptionsJson),
   };
+  if (apiKeyMode === "env") options.apiKeyEnv = config.apiKeyEnv;
+  if (apiKeyMode === "direct") options.apiKey = config.apiKey ? "<direct api key>" : "";
   if (config.apiVersion) options.apiVersion = config.apiVersion;
   return JSON.stringify(
     {
@@ -1979,12 +2749,88 @@ function sameText(left: string, right: string) {
   return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
 
+function formatToolImportMessage(result: ToolImportResult) {
+  const names = result.imported.slice(0, 4).map((tool) => tool.name).join("、");
+  const more = result.imported.length > 4 ? ` 等 ${result.imported.length} 个` : `${result.imported.length} 个`;
+  const warningText = result.warnings.length ? `；${result.warnings.join("；")}` : "";
+  return `已导入 ${more} Tool${names ? `：${names}` : ""}，文件位于 ${result.importPath}${warningText}`;
+}
+
+function formatSkillImportMessage(result: SkillImportResult) {
+  const names = result.imported.slice(0, 4).map((skill) => skill.name).join("、");
+  const more = result.imported.length > 4 ? ` 等 ${result.imported.length} 个` : `${result.imported.length} 个`;
+  const detectedText = result.detectedFiles.length ? `，识别文件 ${result.detectedFiles.length} 个` : "";
+  const warningText = result.warnings.length ? `；${result.warnings.join("；")}` : "";
+  return `已导入 ${more} Skill${names ? `：${names}` : ""}${detectedText}，文件位于 ${result.importPath}${warningText}`;
+}
+
+function readableApiError(message: string) {
+  try {
+    const parsed = JSON.parse(message) as { detail?: unknown };
+    if (typeof parsed.detail === "string") return parsed.detail;
+    if (Array.isArray(parsed.detail)) return parsed.detail.map((item) => String((item as { msg?: unknown }).msg ?? item)).join("；");
+  } catch {
+    // Keep original error text.
+  }
+  return message;
+}
+
 function newTool(): ToolConfig {
   return { id: createId("tool"), name: "新工具", description: "", source: "python", schemaJson: "{}" };
 }
 
+function newSkill(): SkillConfig {
+  return {
+    id: createId("skill"),
+    name: "新 Skill",
+    description: "",
+    sourceType: "manual",
+    sourcePath: "",
+    filePath: "",
+    content: "# 新 Skill\n\n在这里编写要注入 Agent system prompt 的行为说明或上下文。",
+    metadataJson: "{}",
+    enabled: true,
+  };
+}
+
+function normalizeSkillDraft(draft: SkillConfig): SkillConfig {
+  return {
+    ...draft,
+    name: draft.name.trim() || "未命名 Skill",
+    description: draft.description.trim(),
+    sourceType: draft.sourceType.trim() || "manual",
+    sourcePath: draft.sourcePath.trim(),
+    filePath: draft.filePath.trim(),
+    content: draft.content,
+    metadataJson: safeJson(draft.metadataJson),
+    enabled: draft.enabled !== false,
+  };
+}
+
 function newMcpServer(): MCPServerConfig {
-  return { id: createId("mcp"), name: "新 MCP", transport: "stdio", command: "", url: "", description: "" };
+  return {
+    id: createId("mcp"),
+    name: "新 MCP",
+    transport: "stdio",
+    command: "",
+    argsJson: "[]",
+    envJson: "{}",
+    envVarsJson: "[]",
+    cwd: "",
+    url: "",
+    bearerTokenEnvVar: "",
+    httpHeadersJson: "{}",
+    envHttpHeadersJson: "{}",
+    enabled: true,
+    startupTimeoutSec: 10,
+    toolTimeoutSec: 60,
+    enabledToolsJson: "[]",
+    disabledToolsJson: "[]",
+    defaultToolsApprovalMode: "",
+    sourceType: "manual",
+    sourcePath: "",
+    description: "",
+  };
 }
 
 function newRagKnowledgeBase(): RagKnowledgeBaseConfig {
@@ -2031,6 +2877,13 @@ function ragSourceLabel(sourceType: string) {
     default:
       return "本地目录";
   }
+}
+
+function skillSourceLabel(sourceType: string) {
+  if (sourceType === "github") return "GitHub";
+  if (sourceType === "upload") return "上传";
+  if (sourceType === "local") return "本地";
+  return sourceType || "Skill";
 }
 
 function createId(prefix: string) {

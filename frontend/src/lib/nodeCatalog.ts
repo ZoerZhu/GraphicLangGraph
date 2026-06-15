@@ -27,7 +27,7 @@ export const NODE_CATALOG: NodeCatalogItem[] = [
   { type: "start", title: "Start", description: "入口与初始状态", icon: Play },
   { type: "llm", title: "LLM", description: "调用模型生成或抽取", icon: Sparkles },
   { type: "agent", title: "Agent", description: "可用工具的推理节点", icon: BrainCircuit },
-  { type: "tool", title: "Tool", description: "确定性执行工具", icon: Wrench },
+  { type: "tool", title: "Tools", description: "Agent 自主选择并调用工具", icon: Wrench },
   { type: "retriever", title: "Retriever", description: "检索知识库上下文", icon: Database },
   { type: "condition", title: "Condition", description: "规则分支路由", icon: GitBranch },
   { type: "ai_router", title: "AI Router", description: "按意图进行智能路由", icon: Route },
@@ -35,7 +35,7 @@ export const NODE_CATALOG: NodeCatalogItem[] = [
   { type: "http", title: "HTTP", description: "请求外部接口", icon: Globe },
   { type: "direct_reply", title: "Direct Reply", description: "返回最终回复", icon: MessageSquareReply },
   { type: "custom_function", title: "Custom Function", description: "导出 Python 函数", icon: Braces },
-  { type: "skill_node", title: "Skill Node", description: "调用已导入 Tool/Skill", icon: Plug },
+  { type: "skill_node", title: "Skill Node", description: "读取已配置 Skill", icon: Plug },
   { type: "mcp_node", title: "MCP Node", description: "调用已配置 MCP Server", icon: Plug },
   { type: "agent_ref", title: "Agent Ref", description: "引用已实现 Agent 通信", icon: Bot }
 ];
@@ -72,17 +72,20 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         model: "gpt-4.1-mini",
         systemPrompt: "你是一个可靠的业务 Agent，请基于上下文完成任务。",
         tools: "",
+        skillIdsJson: "[]",
         maxIterations: 4,
         outputField: "agent_result",
       };
     case "tool":
       return {
-        toolName: "business_tool",
-        source: "python",
-        description: "执行一个确定性业务工具。",
-        paramsJson: "{}",
-        outputField: "tool_result",
-        requiresApproval: false,
+        provider: "openai",
+        model: "gpt-4.1-mini",
+        systemPrompt: "你是一个可以根据任务自主选择工具的 Agent。",
+        userPrompt: "{{ state.messages }}",
+        toolIdsJson: "[]",
+        toolRegistryJson: "[]",
+        maxIterations: 4,
+        outputField: "tools_result",
       };
     case "retriever":
       return {
@@ -144,8 +147,11 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
       };
     case "skill_node":
       return {
-        toolId: "",
-        toolName: "未选择 Skill",
+        skillId: "",
+        skillName: "未选择 Skill",
+        skillContent: "",
+        sourcePath: "",
+        filePath: "",
         outputField: "skill_result",
       };
     case "mcp_node":
