@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { X } from "lucide-react";
 import { useProjectStore } from "../store/projectStore";
 import type { MCPServerConfig, ModelConfig, RagKnowledgeBaseConfig, SkillConfig, StateField, ToolConfig } from "../types";
@@ -201,7 +201,6 @@ export function Inspector() {
                 });
               }}
             />
-            <small className="model-config-note">从主页面「Tools」中已经配置好的工具里选择；未勾选的工具不会暴露给该节点。</small>
           </Field>
           <div className="inline-grid">
             <Field label="最大调用轮次">
@@ -219,7 +218,6 @@ export function Inspector() {
               />
             </Field>
           </div>
-          <small className="model-config-note">运行到该节点时，模型会读取这里注册的工具信息，并可在多轮内反复调用相同或不同工具。</small>
         </>
       )}
       {node.type === "retriever" && (
@@ -728,30 +726,47 @@ function ToolMultiSelect({
   selectedIds: string[];
   onChange: (ids: string[]) => void;
 }) {
+  const [query, setQuery] = useState("");
   if (tools.length === 0) {
     return <small className="model-config-note">当前还没有可用 Tool。先在主页面「Tools」管理区导入或新增工具。</small>;
   }
   const selected = new Set(selectedIds);
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredTools = normalizedQuery
+    ? tools.filter((tool) => `${tool.name} ${tool.source} ${tool.description}`.toLowerCase().includes(normalizedQuery))
+    : tools;
   return (
-    <div className="inspector-check-list">
-      {tools.map((tool) => (
-        <label key={tool.id} className="checkbox-row">
-          <input
-            type="checkbox"
-            checked={selected.has(tool.id)}
-            onChange={(event) => {
-              const next = event.target.checked
-                ? [...selectedIds, tool.id]
-                : selectedIds.filter((id) => id !== tool.id);
-              onChange(Array.from(new Set(next)));
-            }}
-          />
-          <span>
-            <strong>{tool.name}</strong>
-            <small>{tool.source || "tool"} · {tool.description || "未填写描述"}</small>
-          </span>
-        </label>
-      ))}
+    <div className="tool-picker">
+      <input
+        className="tool-picker__search"
+        value={query}
+        placeholder="搜索 Tool 名称、来源或描述"
+        onChange={(event) => setQuery(event.target.value)}
+      />
+      <div className="tool-picker__list">
+        {filteredTools.length === 0 ? (
+          <div className="tool-picker__empty">没有匹配的 Tool</div>
+        ) : (
+          filteredTools.map((tool) => (
+            <label key={tool.id} className="tool-picker__item">
+              <input
+                type="checkbox"
+                checked={selected.has(tool.id)}
+                onChange={(event) => {
+                  const next = event.target.checked
+                    ? [...selectedIds, tool.id]
+                    : selectedIds.filter((id) => id !== tool.id);
+                  onChange(Array.from(new Set(next)));
+                }}
+              />
+              <span>
+                <strong>{tool.name}</strong>
+                <small>{tool.source || "tool"} · {tool.description || "未填写描述"}</small>
+              </span>
+            </label>
+          ))
+        )}
+      </div>
     </div>
   );
 }
