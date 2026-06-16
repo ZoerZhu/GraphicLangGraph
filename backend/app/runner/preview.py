@@ -1,31 +1,52 @@
 from __future__ import annotations
 
 import asyncio
+import ast
+import fnmatch
+import html as html_lib
 import importlib.util
 import inspect
 import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from urllib import request as urllib_request
 from urllib.error import URLError
 
 import httpx
 
+from app.builtin_tools import builtin_tool_config_by_id
+from app.code_intelligence import (
+    glg_asset_references,
+    glg_chunk_code_semantic,
+    glg_extract_code_symbol,
+    glg_extract_css_for_html,
+    glg_extract_html_by_text,
+    glg_semantic_symbols,
+    glg_summarize_page_structure,
+)
 from app.config import ROOT_DIR, WORKSPACE_TOOLS_FILE
 from app.ir.schemas import EdgeKind, NodeIR, NodeType, ProjectIR
+from app.runtime_environment import default_runtime_environment, resolve_runtime_environment
 
 
 RunMode = Literal["dry", "live"]
 ModelRuntimeConfig = dict[str, Any] | None
+RuntimeEnvironment = dict[str, Any] | None
 SkillRuntimeConfig = dict[str, dict[str, Any]]
 ToolRuntimeConfig = dict[str, dict[str, Any]]
 
 TEMPLATE_RE = re.compile(r"{{\s*state\.([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
 TEXT_SUFFIXES = {".md", ".markdown", ".txt"}
 MAX_STEPS = 80
+TOOL_OBSERVATION_STRING_LIMIT = 12_000
+CODE_TOOL_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "dist", "build", ".venv", "venv", "__pycache__", ".next", ".turbo", "coverage"}
+CODE_TOOL_BINARY_CHECK_BYTES = 4096
 OPENAI_COMPATIBLE_PROVIDERS = {
     "custom",
     "openai_compatible",
@@ -62,8 +83,15 @@ def run_project_preview(
     input_state: dict[str, Any],
     mode: RunMode = "dry",
     model_config: ModelRuntimeConfig = None,
+    runtime_environment: RuntimeEnvironment = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    return _walk_project(project, _normalize_input(input_state), mode, _normalize_model_config(model_config))
+    return _walk_project(
+        project,
+        _normalize_input(input_state),
+        mode,
+        _normalize_model_config(model_config),
+        _normalize_runtime_environment(runtime_environment),
+    )
 
 
 def iter_project_preview_events(
@@ -71,8 +99,15 @@ def iter_project_preview_events(
     input_state: dict[str, Any],
     mode: RunMode = "dry",
     model_config: ModelRuntimeConfig = None,
+    runtime_environment: RuntimeEnvironment = None,
 ):
-    yield from _walk_project_events(project, _normalize_input(input_state), mode, _normalize_model_config(model_config))
+    yield from _walk_project_events(
+        project,
+        _normalize_input(input_state),
+        mode,
+        _normalize_model_config(model_config),
+        _normalize_runtime_environment(runtime_environment),
+    )
 
 
 def _walk_project(
@@ -80,6 +115,7 @@ def _walk_project(
     input_state: dict[str, Any],
     mode: RunMode,
     model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     nodes = {node.id: node for node in project.nodes}
     skills = _enabled_skills_by_id(project)
@@ -102,7 +138,7 @@ def _walk_project(
         before = dict(state)
         started = time.perf_counter()
         try:
-            delta, detail = _execute_node(node, state, mode, model_config, skills, tools)
+            delta, detail = _execute_node(node, state, mode, model_config, runtime_environment, skills, tools)
             state.update(delta)
             status = "ok"
         except Exception as exc:  # Keep the preview response structured instead of surfacing a 500.
@@ -156,6 +192,7 @@ def _walk_project_events(
     input_state: dict[str, Any],
     mode: RunMode,
     model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
 ):
     nodes = {node.id: node for node in project.nodes}
     skills = _enabled_skills_by_id(project)
@@ -190,7 +227,10 @@ def _walk_project_events(
         }
         started = time.perf_counter()
         try:
-            delta, detail = _execute_node(node, state, mode, model_config, skills, tools)
+            if mode == "live" and node.type == NodeType.PARALLEL_TOOLS:
+                delta, detail = yield from _execute_live_parallel_tools_events(node, state, model_config, runtime_environment, tools)
+            else:
+                delta, detail = _execute_node(node, state, mode, model_config, runtime_environment, skills, tools)
             state.update(delta)
             status = "ok"
         except Exception as exc:  # Keep streamed events structured instead of surfacing a 500.
@@ -257,12 +297,13 @@ def _execute_node(
     state: dict[str, Any],
     mode: RunMode,
     model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
     skills: SkillRuntimeConfig,
     tools: ToolRuntimeConfig,
 ) -> tuple[dict[str, Any], str]:
     if mode == "dry":
         return _execute_dry_node(node, state, skills, tools)
-    return _execute_live_node(node, state, model_config, skills, tools)
+    return _execute_live_node(node, state, model_config, runtime_environment, skills, tools)
 
 
 def _execute_dry_node(node: NodeIR, state: dict[str, Any], skills: SkillRuntimeConfig, tools: ToolRuntimeConfig) -> tuple[dict[str, Any], str]:
@@ -282,6 +323,38 @@ def _execute_dry_node(node: NodeIR, state: dict[str, Any], skills: SkillRuntimeC
                 {"tool": tool.get("name") or tool.get("id"), "status": "registered"} for tool in selected_tools
             ],
         }, f"模拟 Tools Agent 注册 {len(selected_tools)} 个 Tool，输出到 state.{field}"
+    if node.type == NodeType.TASK_SPLITTER:
+        field = str(config.get("outputField", "worker_tasks"))
+        max_tasks = min(_positive_int(config.get("maxTasks"), 5), 10)
+        return {
+            field: [
+                {
+                    "id": f"task_{index}",
+                    "title": f"示例子任务 {index}",
+                    "goal": f"[dry-run] 根据规划结果拆分的第 {index} 个代码阅读任务",
+                    "targetFiles": [],
+                    "suggestedTools": [],
+                    "status": "pending",
+                }
+                for index in range(1, min(max_tasks, 3) + 1)
+            ]
+        }, f"模拟拆分 {min(max_tasks, 3)} 个 Worker 任务，输出到 state.{field}"
+    if node.type == NodeType.PARALLEL_TOOLS:
+        field = str(config.get("outputField", "worker_results"))
+        selected_tools = _selected_tool_configs(config, tools)
+        return {
+            field: [
+                {
+                    "taskId": "task_1",
+                    "title": "[dry-run] 示例 Worker",
+                    "status": "ok",
+                    "durationMs": 0,
+                    "summary": f"{node.label} 将并行调用 {len(selected_tools)} 个可用 Tool 完成子任务。",
+                    "evidence": [],
+                    "warnings": [],
+                }
+            ]
+        }, f"模拟 Parallel Tools 并行 Worker，输出到 state.{field}"
     if node.type == NodeType.RETRIEVER:
         field = str(config.get("outputField", "retrieved_context"))
         return {
@@ -308,7 +381,7 @@ def _execute_dry_node(node: NodeIR, state: dict[str, Any], skills: SkillRuntimeC
         return {field: {"url": config.get("url", ""), "status": "dry-run"}}, f"模拟 HTTP 输出到 state.{field}"
     if node.type == NodeType.DIRECT_REPLY:
         field = str(config.get("outputField", "final_answer"))
-        return {field: state.get(field) or "[dry-run] Direct Reply"}, f"终止并返回 state.{field}"
+        return {field: state.get(field) or _fallback_reply_content(state) or "[dry-run] Direct Reply"}, f"终止并返回 state.{field}"
     if node.type == NodeType.SKILL_NODE:
         return _execute_skill_node(node, skills, dry_run=True)
     if node.type in {NodeType.MCP_NODE, NodeType.AGENT_REF, NodeType.CUSTOM_FUNCTION}:
@@ -321,6 +394,7 @@ def _execute_live_node(
     node: NodeIR,
     state: dict[str, Any],
     model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
     skills: SkillRuntimeConfig,
     tools: ToolRuntimeConfig,
 ) -> tuple[dict[str, Any], str]:
@@ -332,7 +406,11 @@ def _execute_live_node(
     if node.type == NodeType.SKILL_NODE:
         return _execute_skill_node(node, skills, dry_run=False)
     if node.type == NodeType.TOOL:
-        return _execute_live_tool(node, state, model_config, tools)
+        return _execute_live_tool(node, state, model_config, runtime_environment, tools)
+    if node.type == NodeType.TASK_SPLITTER:
+        return _execute_live_task_splitter(node, state)
+    if node.type == NodeType.PARALLEL_TOOLS:
+        return _execute_live_parallel_tools(node, state, model_config, runtime_environment, tools)
     if node.type == NodeType.RETRIEVER:
         return _execute_live_retriever(node, state)
     if node.type == NodeType.CONDITION:
@@ -346,12 +424,15 @@ def _execute_live_node(
     if node.type == NodeType.DIRECT_REPLY:
         field = str(config.get("outputField", "final_answer"))
         content = render_template(str(config.get("template", "{{ state.final_answer }}")), state)
+        if not content.strip():
+            content = _fallback_reply_content(state)
         return {field: content}, f"终止并返回 state.{field}"
     raise LiveRunUnsupportedError(f"真实运行 v1 暂不执行 {node.type} 节点；请改用 dry-run，或先使用 LLM/Retriever/Direct Reply 链路。")
 
 
 def _execute_live_llm(node: NodeIR, state: dict[str, Any], model_config: ModelRuntimeConfig) -> tuple[dict[str, Any], str]:
     config = node.config
+    effective_model_config = _effective_model_config(config, model_config)
     provider, model = _resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
     system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip()
     user_prompt = render_template(str(config.get("userPrompt", "{{ state.messages }}")), state).strip()
@@ -359,7 +440,7 @@ def _execute_live_llm(node: NodeIR, state: dict[str, Any], model_config: ModelRu
     if system_prompt:
         messages.append(("system", system_prompt))
     messages.append(("user", user_prompt or _state_value_to_text(state.get("messages", ""))))
-    response = _call_chat_model(provider, model, messages, model_config)
+    response = _call_chat_model(provider, model, messages, effective_model_config)
     content = getattr(response, "content", str(response))
     output_field = str(config.get("outputField", f"{node.id}_output"))
     config_name = _runtime_value(model_config, "name")
@@ -369,6 +450,7 @@ def _execute_live_llm(node: NodeIR, state: dict[str, Any], model_config: ModelRu
 
 def _execute_live_agent(node: NodeIR, state: dict[str, Any], model_config: ModelRuntimeConfig, skills: SkillRuntimeConfig) -> tuple[dict[str, Any], str]:
     config = node.config
+    effective_model_config = _effective_model_config(config, model_config)
     provider, model = _resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
     system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip()
     system_prompt = _append_selected_skills(system_prompt, _selected_skill_configs(config, skills))
@@ -381,7 +463,7 @@ def _execute_live_agent(node: NodeIR, state: dict[str, Any], model_config: Model
     if system_prompt:
         messages.append(("system", system_prompt))
     messages.append(("user", user_text))
-    response = _call_chat_model(provider, model, messages, model_config)
+    response = _call_chat_model(provider, model, messages, effective_model_config)
     content = getattr(response, "content", str(response))
     output_field = str(config.get("outputField", f"{node.id}_result"))
     tools = str(config.get("tools", "")).strip()
@@ -463,6 +545,7 @@ def _json_string_list(value: Any) -> list[str]:
 
 def _execute_live_ai_router(node: NodeIR, state: dict[str, Any], model_config: ModelRuntimeConfig) -> tuple[dict[str, Any], str]:
     config = node.config
+    effective_model_config = _effective_model_config(config, model_config)
     field = str(config.get("routeField", "route_key"))
     fallback = str(config.get("fallback", "other"))
     reason_field = str(config.get("reasonField", "route_reason"))
@@ -474,7 +557,7 @@ def _execute_live_ai_router(node: NodeIR, state: dict[str, Any], model_config: M
     text = render_template(str(config.get("inputText", "{{ state.messages }}")), state)
     prompt = _router_prompt(str(config.get("instruction", "")), text, _parse_router_scenarios(str(config.get("scenarios", ""))), fallback)
     try:
-        response = _call_chat_model(provider, model, [("user", prompt)], model_config)
+        response = _call_chat_model(provider, model, [("user", prompt)], effective_model_config)
     except Exception as exc:
         return {field: keyword_route, reason_field: f"llm router failed, fallback to keyword: {exc}"}, f"LLM 路由失败，回退到 {keyword_route}"
     route = _normalize_route_key(getattr(response, "content", str(response)), config, fallback)
@@ -533,6 +616,7 @@ def _execute_live_tool(
     node: NodeIR,
     state: dict[str, Any],
     model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
     tools: ToolRuntimeConfig,
 ) -> tuple[dict[str, Any], str]:
     config = node.config
@@ -553,17 +637,46 @@ def _execute_live_tool(
     if not selected_tools:
         raise RuntimeError("Tools 节点没有选择任何已配置 Tool。")
 
+    effective_model_config = _effective_model_config(config, model_config)
     provider, model = _resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
     max_iterations = min(_positive_int(config.get("maxIterations", 4), 4), 12)
     system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip()
+    user_prompt = render_template(str(config.get("userPrompt") or _agent_state_prompt(state)), state)
+    final_answer, calls = _run_tools_agent_session(
+        provider,
+        model,
+        effective_model_config,
+        selected_tools,
+        system_prompt,
+        user_prompt,
+        max_iterations,
+        runtime_environment,
+    )
+
+    return {
+        output_field: final_answer,
+        f"{output_field}_tool_calls": calls,
+    }, f"Tools Agent 注册 {len(selected_tools)} 个 Tool，执行 {len(calls)} 次工具调用，输出到 state.{output_field}"
+
+
+def _run_tools_agent_session(
+    provider: str,
+    model: str,
+    effective_model_config: ModelRuntimeConfig,
+    selected_tools: list[dict[str, Any]],
+    system_prompt: str,
+    user_prompt: str,
+    max_iterations: int,
+    runtime_environment: RuntimeEnvironment,
+) -> tuple[str, list[dict[str, Any]]]:
     messages: list[tuple[str, str]] = [
         ("system", _tools_agent_system_prompt(system_prompt, selected_tools, max_iterations)),
-        ("user", render_template(str(config.get("userPrompt") or _agent_state_prompt(state)), state)),
+        ("user", user_prompt),
     ]
     calls: list[dict[str, Any]] = []
     final_answer = ""
     for iteration in range(max_iterations):
-        response = _call_chat_model(provider, model, messages, model_config)
+        response = _call_chat_model(provider, model, messages, effective_model_config)
         content = getattr(response, "content", str(response))
         decision = _parse_tool_agent_decision(content)
         tool_calls = _normalize_tool_calls(decision.get("tool_calls"))
@@ -577,9 +690,12 @@ def _execute_live_tool(
             args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
             tool_config = _find_selected_tool(selected_tools, tool_name)
             if not tool_config:
-                observation = {"ok": False, "error": f"未知 Tool：{tool_name}"}
+                observation = {"ok": False, "error": f"未知 Tool：{tool_name}", "errorType": "tool_args"}
             else:
-                observation = _invoke_registered_tool(tool_config, args)
+                observation = _invoke_registered_tool(tool_config, args, runtime_environment)
+            recommended_next_tools = _recommended_next_tools(tool_name, args, observation)
+            if recommended_next_tools:
+                observation["recommendedNextTools"] = recommended_next_tools
             calls.append(
                 {
                     "iteration": iteration + 1,
@@ -587,18 +703,385 @@ def _execute_live_tool(
                     "tool": tool_name,
                     "args": args,
                     "observation": observation,
+                    "recommendedNextTools": recommended_next_tools,
+                    "errorType": observation.get("errorType") if isinstance(observation, dict) else None,
                 }
             )
             observations.append({"tool": tool_name, "observation": observation})
         messages.append(("assistant", content))
         messages.append(("user", "工具执行结果：\n" + json.dumps(observations, ensure_ascii=False, indent=2) + "\n请继续；如果已经足够，请返回 final_answer。"))
     else:
-        final_answer = f"达到最大工具调用轮次 {max_iterations}，已停止。"
+        final_answer = _finalize_tools_agent_answer(provider, model, messages, effective_model_config, max_iterations)
+    return final_answer, calls
 
+
+def _execute_live_task_splitter(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    config = node.config
+    input_field = str(config.get("inputField", "task_plan")).strip() or "task_plan"
+    output_field = str(config.get("outputField", "worker_tasks")).strip() or "worker_tasks"
+    max_tasks = min(_positive_int(config.get("maxTasks"), 5), 10)
+    fallback_enabled = _truthy(config.get("fallbackToSingleTask", True))
+    value = state.get(input_field)
+    tasks = _normalize_worker_tasks(value, max_tasks=max_tasks, fallback_goal="")
+    if not tasks and fallback_enabled:
+        fallback_goal = _state_value_to_text(state.get("messages")).strip() or _state_value_to_text(value).strip() or "阅读代码并回答用户问题"
+        tasks = _normalize_worker_tasks([{"goal": fallback_goal}], max_tasks=1, fallback_goal=fallback_goal)
+    if not tasks:
+        raise RuntimeError(f"Task Splitter 无法从 state.{input_field} 解析出 tasks。")
+    return {output_field: tasks}, f"解析并标准化 {len(tasks)} 个 Worker 任务，输出到 state.{output_field}"
+
+
+def _execute_live_parallel_tools(
+    node: NodeIR,
+    state: dict[str, Any],
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    tools: ToolRuntimeConfig,
+) -> tuple[dict[str, Any], str]:
+    delta, detail, _events = _run_parallel_tools_node(node, state, model_config, runtime_environment, tools, emit_virtual_events=False)
+    return delta, detail
+
+
+def _execute_live_parallel_tools_events(
+    node: NodeIR,
+    state: dict[str, Any],
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    tools: ToolRuntimeConfig,
+):
+    config = node.config
+    tasks_field = str(config.get("tasksField", "worker_tasks")).strip() or "worker_tasks"
+    output_field = str(config.get("outputField", "worker_results")).strip() or "worker_results"
+    tasks = _normalize_worker_tasks(state.get(tasks_field), max_tasks=10, fallback_goal=_state_value_to_text(state.get("messages")))
+    if not tasks:
+        raise RuntimeError(f"Parallel Tools 未能从 state.{tasks_field} 获取任务列表。")
+    selected_tools = _selected_tool_configs(config, tools)
+    if not selected_tools:
+        raise RuntimeError("Parallel Tools 节点没有选择任何已配置 Tool。")
+
+    effective_model_config = _effective_model_config(config, model_config)
+    provider, model = _resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
+    max_iterations = min(_positive_int(config.get("maxIterationsPerTask"), 6), 12)
+    max_workers = min(_positive_int(config.get("maxConcurrentWorkers"), 3), 6, len(tasks))
+    store_tool_calls = _truthy(config.get("storeToolCalls", False))
+    system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip() or "你是代码阅读 Worker，只完成分配给你的子任务。"
+
+    def worker(index: int, task: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            final_answer, calls = _run_tools_agent_session(
+                provider,
+                model,
+                effective_model_config,
+                selected_tools,
+                _parallel_worker_system_prompt(system_prompt),
+                _parallel_worker_user_prompt(state, task),
+                max_iterations,
+                runtime_environment,
+            )
+            result = _normalize_worker_final_answer(task, final_answer)
+            result["durationMs"] = round((time.perf_counter() - started) * 1000, 2)
+            if store_tool_calls:
+                result["toolCalls"] = _compact_value(calls, string_limit=3000, list_limit=12)
+            return result
+        except Exception as exc:
+            return {
+                "taskId": str(task.get("id") or f"task_{index + 1}"),
+                "title": str(task.get("title") or task.get("goal") or f"任务 {index + 1}")[:120],
+                "status": "error",
+                "durationMs": round((time.perf_counter() - started) * 1000, 2),
+                "summary": "",
+                "evidence": [],
+                "warnings": [],
+                "error": _format_error(exc),
+            }
+
+    for index, task in enumerate(tasks):
+        yield _parallel_virtual_start_event(node, task, index, len(tasks))
+
+    ordered: list[dict[str, Any] | None] = [None] * len(tasks)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_index = {executor.submit(worker, index, task): index for index, task in enumerate(tasks)}
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            result = future.result()
+            ordered[index] = result
+            yield _parallel_virtual_end_event(node, tasks[index], result, index, len(tasks))
+
+    results = [item for item in ordered if isinstance(item, dict)]
+    if results and all(item.get("status") == "error" for item in results):
+        raise RuntimeError("Parallel Tools 所有 Worker 均执行失败。")
+    return {output_field: results}, f"Parallel Tools 并行执行 {len(results)} 个 Worker，输出到 state.{output_field}"
+
+
+def _run_parallel_tools_node(
+    node: NodeIR,
+    state: dict[str, Any],
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    tools: ToolRuntimeConfig,
+    emit_virtual_events: bool,
+) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
+    config = node.config
+    tasks_field = str(config.get("tasksField", "worker_tasks")).strip() or "worker_tasks"
+    output_field = str(config.get("outputField", "worker_results")).strip() or "worker_results"
+    tasks = _normalize_worker_tasks(state.get(tasks_field), max_tasks=10, fallback_goal=_state_value_to_text(state.get("messages")))
+    if not tasks:
+        raise RuntimeError(f"Parallel Tools 未能从 state.{tasks_field} 获取任务列表。")
+    selected_tools = _selected_tool_configs(config, tools)
+    if not selected_tools:
+        raise RuntimeError("Parallel Tools 节点没有选择任何已配置 Tool。")
+
+    effective_model_config = _effective_model_config(config, model_config)
+    provider, model = _resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
+    max_iterations = min(_positive_int(config.get("maxIterationsPerTask"), 6), 12)
+    max_workers = min(_positive_int(config.get("maxConcurrentWorkers"), 3), 6, len(tasks))
+    store_tool_calls = _truthy(config.get("storeToolCalls", False))
+    system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip() or "你是代码阅读 Worker，只完成分配给你的子任务。"
+    events: list[dict[str, Any]] = []
+
+    def worker(index: int, task: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            final_answer, calls = _run_tools_agent_session(
+                provider,
+                model,
+                effective_model_config,
+                selected_tools,
+                _parallel_worker_system_prompt(system_prompt),
+                _parallel_worker_user_prompt(state, task),
+                max_iterations,
+                runtime_environment,
+            )
+            result = _normalize_worker_final_answer(task, final_answer)
+            result["durationMs"] = round((time.perf_counter() - started) * 1000, 2)
+            if store_tool_calls:
+                result["toolCalls"] = _compact_value(calls, string_limit=3000, list_limit=12)
+            return result
+        except Exception as exc:
+            return {
+                "taskId": str(task.get("id") or f"task_{index + 1}"),
+                "title": str(task.get("title") or task.get("goal") or f"任务 {index + 1}")[:120],
+                "status": "error",
+                "durationMs": round((time.perf_counter() - started) * 1000, 2),
+                "summary": "",
+                "evidence": [],
+                "warnings": [],
+                "error": _format_error(exc),
+            }
+
+    for index, task in enumerate(tasks):
+        if emit_virtual_events:
+            events.append(_parallel_virtual_start_event(node, task, index, len(tasks)))
+
+    ordered: list[dict[str, Any] | None] = [None] * len(tasks)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_index = {executor.submit(worker, index, task): index for index, task in enumerate(tasks)}
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            result = future.result()
+            ordered[index] = result
+            if emit_virtual_events:
+                events.append(_parallel_virtual_end_event(node, tasks[index], result, index, len(tasks)))
+
+    results = [item for item in ordered if isinstance(item, dict)]
+    if results and all(item.get("status") == "error" for item in results):
+        raise RuntimeError("Parallel Tools 所有 Worker 均执行失败。")
+    return {output_field: results}, f"Parallel Tools 并行执行 {len(results)} 个 Worker，输出到 state.{output_field}", events
+
+
+def _normalize_worker_tasks(value: Any, max_tasks: int, fallback_goal: str = "") -> list[dict[str, Any]]:
+    parsed = _parse_task_payload(value)
+    raw_tasks: Any
+    if isinstance(parsed, dict):
+        raw_tasks = parsed.get("tasks")
+    else:
+        raw_tasks = parsed
+    if isinstance(raw_tasks, dict):
+        raw_tasks = [raw_tasks]
+    if not isinstance(raw_tasks, list):
+        return []
+    tasks: list[dict[str, Any]] = []
+    max_tasks = max(1, min(int(max_tasks or 5), 10))
+    for index, item in enumerate(raw_tasks[:max_tasks], start=1):
+        if isinstance(item, str):
+            task = {"goal": item}
+        elif isinstance(item, dict):
+            task = dict(item)
+        else:
+            continue
+        goal = _first_text(task.get("goal"), task.get("description"), task.get("task"), fallback_goal).strip()
+        title = _first_text(task.get("title"), task.get("name"), goal, f"任务 {index}").strip()
+        target_files = _normalize_string_list(task.get("targetFiles") if "targetFiles" in task else task.get("target_files"))
+        suggested_tools = _normalize_string_list(task.get("suggestedTools") if "suggestedTools" in task else task.get("suggested_tools"))
+        if not goal and not title:
+            continue
+        tasks.append(
+            {
+                "id": str(task.get("id") or f"task_{index}").strip() or f"task_{index}",
+                "title": title[:160] or f"任务 {index}",
+                "goal": goal or title,
+                "targetFiles": target_files,
+                "suggestedTools": suggested_tools,
+                "status": "pending",
+            }
+        )
+    return tasks
+
+
+def _parse_task_payload(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    text = _state_value_to_text(value).strip()
+    if not text:
+        return None
+    candidates = [text]
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidates.insert(0, fenced.group(1).strip())
+    start = text.find("{")
+    end = text.rfind("}")
+    if 0 <= start < end:
+        candidates.append(text[start : end + 1])
+    list_start = text.find("[")
+    list_end = text.rfind("]")
+    if 0 <= list_start < list_end:
+        candidates.append(text[list_start : list_end + 1])
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return [item.strip() for item in re.split(r"[,，\n]+", text) if item.strip()]
+
+
+def _parallel_worker_system_prompt(base_prompt: str) -> str:
+    return (
+        f"{base_prompt}\n"
+        "你是并行代码阅读 Worker，只完成分配给你的子任务。"
+        "严格控制上下文：先定位，再读取小片段；不要读取完整大文件。"
+        "最终请返回 JSON，格式为："
+        '{"summary":"结论","evidence":[{"path":"文件路径","symbol":"符号或 selector","startLine":1,"endLine":1,"note":"证据说明"}],"warnings":[]}'
+        "。不要输出完整工具调用 JSON。"
+    )
+
+
+def _parallel_worker_user_prompt(state: dict[str, Any], task: dict[str, Any]) -> str:
+    payload = {
+        "userQuestion": _state_value_to_text(state.get("messages")),
+        "task": task,
+    }
+    return "请完成以下代码阅读子任务：\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _normalize_worker_final_answer(task: dict[str, Any], final_answer: str) -> dict[str, Any]:
+    parsed = _parse_task_payload(final_answer)
+    task_id = str(task.get("id") or "")
+    title = str(task.get("title") or task.get("goal") or task_id)
+    if isinstance(parsed, dict):
+        evidence = parsed.get("evidence") if isinstance(parsed.get("evidence"), list) else []
+        warnings = parsed.get("warnings") if isinstance(parsed.get("warnings"), list) else []
+        summary = _state_value_to_text(parsed.get("summary") or parsed.get("final_answer") or parsed.get("answer") or final_answer).strip()
+        return {
+            "taskId": task_id,
+            "title": title[:120],
+            "status": "ok",
+            "durationMs": 0,
+            "summary": summary,
+            "evidence": _compact_value(evidence, string_limit=1200, list_limit=12),
+            "warnings": [str(item) for item in warnings[:8]],
+        }
     return {
-        output_field: final_answer,
-        f"{output_field}_tool_calls": calls,
-    }, f"Tools Agent 注册 {len(selected_tools)} 个 Tool，执行 {len(calls)} 次工具调用，输出到 state.{output_field}"
+        "taskId": task_id,
+        "title": title[:120],
+        "status": "ok",
+        "durationMs": 0,
+        "summary": final_answer.strip(),
+        "evidence": [],
+        "warnings": [],
+    }
+
+
+def _parallel_virtual_start_event(node: NodeIR, task: dict[str, Any], index: int, total: int) -> dict[str, Any]:
+    return {
+        "event": "virtual_node_start",
+        "nodeId": _parallel_virtual_node_id(node, task, index),
+        "parentNodeId": node.id,
+        "type": "tool",
+        "label": f"Worker: {str(task.get('title') or task.get('goal') or f'任务 {index + 1}')[:48]}",
+        "inputState": {"task": task},
+        "position": _parallel_virtual_position(node, index, total),
+    }
+
+
+def _parallel_virtual_end_event(node: NodeIR, task: dict[str, Any], result: dict[str, Any], index: int, total: int) -> dict[str, Any]:
+    status = "error" if result.get("status") == "error" else "ok"
+    return {
+        "event": "virtual_node_end",
+        "traceItem": {
+            "nodeId": _parallel_virtual_node_id(node, task, index),
+            "type": "tool",
+            "label": f"Worker: {str(task.get('title') or task.get('goal') or f'任务 {index + 1}')[:48]}",
+            "status": status,
+            "detail": str(result.get("error") or result.get("summary") or "Worker 完成")[:300],
+            "durationMs": float(result.get("durationMs") or 0),
+            "inputState": {"task": task},
+            "outputDelta": result,
+            "virtual": True,
+            "parentNodeId": node.id,
+            "position": _parallel_virtual_position(node, index, total),
+        },
+    }
+
+
+def _parallel_virtual_node_id(node: NodeIR, task: dict[str, Any], index: int) -> str:
+    raw = str(task.get("id") or f"task_{index + 1}")
+    safe = re.sub(r"[^A-Za-z0-9_:-]+", "_", raw).strip("_") or f"task_{index + 1}"
+    return f"{node.id}::worker_{safe}"
+
+
+def _parallel_virtual_position(node: NodeIR, index: int, total: int) -> dict[str, float]:
+    spacing = 210
+    start_y = float(node.position.y) - ((max(total, 1) - 1) * spacing / 2)
+    return {"x": float(node.position.x) + 330, "y": start_y + index * spacing}
+
+
+def _finalize_tools_agent_answer(
+    provider: str,
+    model: str,
+    messages: list[tuple[str, str]],
+    model_config: ModelRuntimeConfig,
+    max_iterations: int,
+) -> str:
+    messages.append(
+        (
+            "user",
+            f"已经达到最大工具调用轮次 {max_iterations}。不要继续调用工具；请只返回 JSON，tool_calls 为空数组，并基于已有工具结果填写 final_answer。",
+        )
+    )
+    try:
+        response = _call_chat_model(provider, model, messages, model_config)
+    except Exception as exc:
+        return f"达到最大工具调用轮次 {max_iterations}，已停止。最终总结失败：{exc.__class__.__name__}: {exc}"
+    content = getattr(response, "content", str(response))
+    decision = _parse_tool_agent_decision(content)
+    final_answer = _first_config_value(decision.get("final_answer"))
+    return final_answer or content or f"达到最大工具调用轮次 {max_iterations}，已停止。"
 
 
 def _tools_agent_system_prompt(system_prompt: str, selected_tools: list[dict[str, Any]], max_iterations: int) -> str:
@@ -625,6 +1108,47 @@ def _tools_agent_system_prompt(system_prompt: str, selected_tools: list[dict[str
         "如果还需要工具，填写 tool_calls；如果已经完成，tool_calls 为空数组，并填写 final_answer。"
         "不要输出 Markdown。"
     )
+    tool_names = {str(tool.get("name") or tool.get("id") or "") for tool in selected_tools}
+    if tool_names & {"read_file_chunk", "search_code", "list_code_symbols"}:
+        instructions += (
+            "【代码阅读策略】读取代码或大文件时，先用 search_code 或 list_code_symbols 定位文件、函数、类、组件或关键行；"
+            "需要局部内容时使用 read_file_chunk；需要完整符号时使用 extract_code_symbol；需要大文件摘要时使用 chunk_code_semantic。"
+            "如果工具结果 truncated=true，继续使用 nextOffset、start_line/end_line 或更精确的 symbol 读取后续片段。"
+        )
+    if "read_file" in tool_names:
+        instructions += (
+            "【read_file 截断处理】read_file 只适合小文本。"
+            "一旦 read_file 返回 truncated=true，下一轮必须改用 search_code、read_file_chunk 或 chunk_code_semantic，不能反复直接 read_file 同一个大文件。"
+        )
+    if "extract_html" in tool_names:
+        instructions += "读取 HTML 时优先使用 extract_html 按 CSS selector 抽取局部内容，不要直接读取整页。"
+    if "extract_css_rules" in tool_names:
+        instructions += "读取 CSS 时优先使用 extract_css_rules 按 selector、property 或 query 抽取规则。"
+    if tool_names & {"extract_html", "extract_css_rules"}:
+        instructions += "如果抽取结果 truncated=true，请缩小 selector/query 或提高匹配精度。"
+    if tool_names & {"summarize_page_structure", "extract_html_by_text", "extract_css_for_html", "resolve_asset_references"}:
+        instructions += (
+            "【页面分析策略】分析 HTML 页面时先用 summarize_page_structure 获取页面结构；"
+            "要找包含某段可见文本的区块时使用 extract_html_by_text；"
+            "要分析某个 HTML 元素的样式时使用 extract_css_for_html；"
+            "需要检查图片、脚本、样式表等本地资源时使用 resolve_asset_references。"
+        )
+    if tool_names & {"extract_code_symbol", "chunk_code_semantic"}:
+        instructions += (
+            "需要完整函数、类、方法、组件或 CSS/HTML 局部代码时，优先使用 extract_code_symbol；"
+            "面对大代码文件时先用 chunk_code_semantic 或 list_code_symbols 获取语义片段摘要。"
+            "如果 extract_code_symbol 返回 ambiguous=true，请根据 alternatives 再次指定更明确的 symbol 或 kind。"
+        )
+    if tool_names & {"list_directory", "search_code", "read_file_chunk"}:
+        instructions += (
+            "【RAG/知识库文件读取策略】面对本地知识库或资料目录时，先用 list_directory 查看目录，"
+            "再用 search_code 按关键词定位文档，最后用 read_file_chunk 分段读取命中上下文。"
+        )
+    if tool_names & {"web_search", "fetch_url"}:
+        instructions += (
+            "【网络搜索策略】web_search 默认返回 DuckDuckGo SERP 结果；搜索无结果时调整关键词或中英文表达。"
+            "引用网络信息时优先使用结果中的 title、url 和 snippet；fetch_url 只在需要读取已知 URL 页面内容时使用。"
+        )
     registry = "可用工具：\n" + json.dumps(tool_lines, ensure_ascii=False, indent=2)
     return "\n\n".join(part for part in (system_prompt, instructions, registry) if part).strip()
 
@@ -663,12 +1187,16 @@ def _normalize_tool_calls(value: Any) -> list[dict[str, Any]]:
     return calls
 
 
-def _invoke_registered_tool(tool_config: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+def _invoke_registered_tool(tool_config: dict[str, Any], args: dict[str, Any], runtime_environment: RuntimeEnvironment = None) -> dict[str, Any]:
+    tool_config = _fresh_builtin_tool_config(tool_config) or tool_config
     schema = _parse_json_object(str(tool_config.get("schemaJson", "{}")))
     metadata = schema.get("x-graphic") if isinstance(schema.get("x-graphic"), dict) else {}
     kind = str(metadata.get("kind") or "").strip()
     source = str(tool_config.get("source") or "").strip().lower()
     try:
+        if source == "builtin" or kind == "builtin_tool":
+            result = _invoke_builtin_tool(metadata, args, runtime_environment)
+            return {"ok": True, "result": _compact_tool_result(result)}
         if source == "python" or kind == "python_function":
             result = _invoke_python_tool(metadata, args)
             return {"ok": True, "result": _compact_tool_result(result)}
@@ -691,7 +1219,1336 @@ def _invoke_registered_tool(tool_config: dict[str, Any], args: dict[str, Any]) -
             "args": args,
         }
     except Exception as exc:
-        return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+        error = f"{exc.__class__.__name__}: {exc}"
+        return {"ok": False, "error": error, "errorType": _classify_tool_error(error)}
+
+
+def _recommended_next_tools(tool_name: str, args: dict[str, Any], observation: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(observation, dict):
+        return []
+    recommendations: list[dict[str, Any]] = []
+    result = observation.get("result") if isinstance(observation.get("result"), dict) else {}
+    path = _first_text(args.get("path"), args.get("file"), result.get("path") if isinstance(result, dict) else "")
+    language = _language_from_path(path)
+    truncated = _has_truthy_key(result, "truncated") or bool(observation.get("truncated"))
+    ambiguous = _has_truthy_key(result, "ambiguous")
+    tool_key = str(tool_name or "").strip()
+
+    if truncated:
+        if tool_key == "read_file" and path:
+            recommendations.extend(
+                [
+                    _next_tool("read_file_chunk", "read_file 返回已截断，改用 offset 或行号继续读取。", {"path": path, "offset": _content_length(result), "max_chars": 6000}),
+                    _next_tool("search_code", "先用关键词定位需要的片段，避免再次读取整文件。", {"root": _path_parent(path), "query": "<关键词>", "file_glob": _path_name(path)}),
+                ]
+            )
+            if language in {"python", "javascript", "typescript", "html", "css", "scss", "less", "vue", "svelte", "json", "yaml", "markdown"}:
+                recommendations.append(_next_tool("chunk_code_semantic", "按语义片段拆分大文件后再选择具体片段。", {"path": path, "max_chunks": 40}))
+        elif path:
+            recommendations.append(_next_tool("read_file_chunk", "结果被截断，可缩小范围或按片段继续读取。", {"path": path, "max_chars": 6000}))
+
+    if path and language in {"html", "vue", "svelte"} and tool_key in {"read_file", "read_file_chunk", "list_code_symbols"}:
+        recommendations.extend(
+            [
+                _next_tool("summarize_page_structure", "HTML 页面先摘要结构，再选择局部 selector。", {"path": path}),
+                _next_tool("extract_html", "按 CSS selector 抽取局部 HTML，避免读取整页。", {"path": path, "selector": "body", "mode": "html"}),
+            ]
+        )
+    if path and language in {"css", "scss", "less"} and tool_key in {"read_file", "read_file_chunk", "list_code_symbols"}:
+        recommendations.append(_next_tool("extract_css_rules", "样式文件优先按 selector、property 或 query 抽取规则。", {"path": path, "query": "<样式关键词>"}))
+
+    if ambiguous and path:
+        alternatives = result.get("alternatives") if isinstance(result.get("alternatives"), list) else []
+        first = next((item for item in alternatives if isinstance(item, dict)), None)
+        if first:
+            recommendations.append(
+                _next_tool(
+                    "extract_code_symbol",
+                    "当前符号有歧义，使用 alternatives 中更明确的 name/kind 重新抽取。",
+                    {"path": path, "symbol": first.get("name", ""), "kind": first.get("kind", "any")},
+                )
+            )
+
+    if not observation.get("ok"):
+        error_type = str(observation.get("errorType") or _classify_tool_error(str(observation.get("error") or "")))
+        if error_type == "tool_args":
+            recommendations.append(_next_tool(tool_key or "<tool>", "检查必填参数和参数名后重试。", args))
+        elif error_type == "parse_error" and path:
+            recommendations.append(_next_tool("read_file_chunk", "解析失败时先读取相关片段确认语法或内容格式。", {"path": path, "max_chars": 4000}))
+
+    return _dedupe_recommendations(recommendations)
+
+
+def _classify_tool_error(message: str) -> str:
+    text = str(message or "")
+    lower = text.lower()
+    if "允许目录" in text or "路径不在" in text:
+        return "path_permission"
+    if "网络访问" in text or "不允许访问域名" in text or "只允许访问 http/https" in text or "domain" in lower:
+        return "network_permission"
+    if "超过当前运行环境" in text or "文件太大" in text or "max file" in lower:
+        return "file_too_large"
+    if "解析失败" in text or "正则表达式无效" in text or "jsondecode" in lower or "syntaxerror" in lower or "parse" in lower:
+        return "parse_error"
+    if ("需要" in text and "参数" in text) or "missing" in lower or "required" in lower or "未知 Tool" in text:
+        return "tool_args"
+    return "tool_error"
+
+
+def _next_tool(tool: str, reason: str, args: dict[str, Any]) -> dict[str, Any]:
+    return {"tool": tool, "reason": reason, "args": args}
+
+
+def _dedupe_recommendations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        key = f"{item.get('tool')}:{json.dumps(item.get('args', {}), ensure_ascii=False, sort_keys=True, default=str)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+        if len(result) >= 5:
+            break
+    return result
+
+
+def _has_truthy_key(value: Any, key: str) -> bool:
+    if isinstance(value, dict):
+        if bool(value.get(key)):
+            return True
+        return any(_has_truthy_key(item, key) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_truthy_key(item, key) for item in value[:20])
+    return False
+
+
+def _content_length(value: dict[str, Any]) -> int:
+    content = value.get("content")
+    return len(content) if isinstance(content, str) else 0
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _path_name(path: str) -> str:
+    return Path(path).name if path else "*"
+
+
+def _path_parent(path: str) -> str:
+    if not path:
+        return "."
+    parent = Path(path).parent.as_posix()
+    return parent if parent and parent != "." else "."
+
+
+def _language_from_path(path: str) -> str:
+    if not path:
+        return "unknown"
+    return _detect_code_language(Path(path), "")
+
+
+def _invoke_builtin_tool(metadata: dict[str, Any], args: dict[str, Any], runtime_environment: RuntimeEnvironment) -> Any:
+    builtin_id = str(metadata.get("builtinId") or metadata.get("id") or "").strip()
+    runtime = _normalize_runtime_environment(runtime_environment)
+    if builtin_id == "web_search":
+        return _builtin_web_search(args, runtime)
+    if builtin_id == "read_file":
+        return _builtin_read_file(args, runtime)
+    if builtin_id == "list_directory":
+        return _builtin_list_directory(args, runtime)
+    if builtin_id == "read_file_chunk":
+        return _builtin_read_file_chunk(args, runtime)
+    if builtin_id == "search_code":
+        return _builtin_search_code(args, runtime)
+    if builtin_id == "list_code_symbols":
+        return _builtin_list_code_symbols(args, runtime)
+    if builtin_id == "extract_html":
+        return _builtin_extract_html(args, runtime)
+    if builtin_id == "extract_css_rules":
+        return _builtin_extract_css_rules(args, runtime)
+    if builtin_id == "extract_html_by_text":
+        return _builtin_extract_html_by_text(args, runtime)
+    if builtin_id == "extract_css_for_html":
+        return _builtin_extract_css_for_html(args, runtime)
+    if builtin_id == "summarize_page_structure":
+        return _builtin_summarize_page_structure(args, runtime)
+    if builtin_id == "resolve_asset_references":
+        return _builtin_resolve_asset_references(args, runtime)
+    if builtin_id == "extract_code_symbol":
+        return _builtin_extract_code_symbol(args, runtime)
+    if builtin_id == "chunk_code_semantic":
+        return _builtin_chunk_code_semantic(args, runtime)
+    if builtin_id == "fetch_url":
+        return _builtin_fetch_url(args, runtime)
+    raise RuntimeError(f"未知内置 Tool：{builtin_id or '未配置 builtinId'}")
+
+
+def _builtin_web_search(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    query = str(args.get("query") or args.get("q") or "").strip()
+    if not query:
+        raise RuntimeError("web_search 需要 query 参数。")
+    mode = str(args.get("mode") or args.get("search_mode") or "serp").strip().lower()
+    if mode not in {"auto", "instant", "serp"}:
+        mode = "serp"
+    serp_fallback = args.get("serp_fallback", args.get("fallback", True)) is not False
+    max_results = min(_positive_int(args.get("max_results", args.get("limit", 5)), 5), 12)
+
+    data: dict[str, Any] = {}
+    related_topics: list[dict[str, str]] = []
+    if mode != "serp":
+        _assert_network_allowed("https://api.duckduckgo.com/", runtime, extra_allowed_hosts={"api.duckduckgo.com"})
+        params = {
+            "q": query,
+            "format": "json",
+            "no_redirect": "1",
+            "no_html": "1",
+            "skip_disambig": "1",
+        }
+        url = "https://api.duckduckgo.com/?" + urlencode(params)
+        response = httpx.get(url, timeout=12, follow_redirects=True, headers={"Accept": "application/json"})
+        response.raise_for_status()
+        data = response.json()
+        related_topics = _duckduckgo_related_topics(data.get("RelatedTopics"), max_results)
+
+    has_instant_answer = _duckduckgo_has_instant_answer(data, related_topics)
+    should_run_serp = mode == "serp" or (mode == "auto" and serp_fallback and not has_instant_answer)
+    serp_results = _duckduckgo_serp_results(query, max_results, runtime) if should_run_serp else []
+    source = "duckduckgo_serp" if mode == "serp" else "duckduckgo_serp_fallback" if serp_results and not has_instant_answer else "duckduckgo_instant_answer"
+    return {
+        "query": query,
+        "source": source,
+        "searchMode": mode,
+        "serpFallbackUsed": bool(serp_results and mode != "serp" and not has_instant_answer),
+        "answer": data.get("Answer") or "",
+        "abstract": data.get("AbstractText") or data.get("Abstract") or "",
+        "abstractUrl": data.get("AbstractURL") or "",
+        "definition": data.get("Definition") or "",
+        "relatedTopics": related_topics,
+        "serpResults": serp_results,
+        "rawLimited": _compact_value(data),
+    }
+
+
+def _duckduckgo_has_instant_answer(data: dict[str, Any], related_topics: list[dict[str, str]]) -> bool:
+    return bool(
+        str(data.get("Answer") or "").strip()
+        or str(data.get("AbstractText") or data.get("Abstract") or "").strip()
+        or str(data.get("Definition") or "").strip()
+        or related_topics
+    )
+
+
+def _duckduckgo_serp_results(query: str, limit: int, runtime: dict[str, Any]) -> list[dict[str, str]]:
+    _assert_network_allowed(
+        "https://html.duckduckgo.com/html/",
+        runtime,
+        extra_allowed_hosts={"duckduckgo.com", "html.duckduckgo.com"},
+    )
+    params = {"q": query}
+    response = httpx.get(
+        "https://html.duckduckgo.com/html/?" + urlencode(params),
+        timeout=15,
+        follow_redirects=True,
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "User-Agent": "GraphicLangGraph/0.1 (+https://local)",
+        },
+    )
+    response.raise_for_status()
+    parser = DuckDuckGoHtmlResultsParser(limit)
+    parser.feed(response.text)
+    parser.close()
+    return parser.results[:limit]
+
+
+class DuckDuckGoHtmlResultsParser(HTMLParser):
+    def __init__(self, limit: int) -> None:
+        super().__init__(convert_charrefs=True)
+        self.limit = limit
+        self.results: list[dict[str, str]] = []
+        self._active_title: dict[str, Any] | None = None
+        self._active_snippet_index: int | None = None
+        self._snippet_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if len(self.results) >= self.limit:
+            return
+        attr = {key: value or "" for key, value in attrs}
+        class_name = attr.get("class", "")
+        if tag == "a" and "result__a" in class_name:
+            self._active_title = {"href": attr.get("href", ""), "parts": []}
+            return
+        if tag in {"a", "div"} and "result__snippet" in class_name and self.results:
+            self._active_snippet_index = len(self.results) - 1
+            self._snippet_depth = 1
+            return
+        if self._active_snippet_index is not None:
+            self._snippet_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._active_title is not None:
+            title = _clean_search_text(" ".join(self._active_title["parts"]))
+            url = _duckduckgo_result_url(str(self._active_title.get("href") or ""))
+            if title and url and not any(item["url"] == url for item in self.results):
+                self.results.append({"title": title, "url": url, "snippet": ""})
+            self._active_title = None
+            return
+        if self._active_snippet_index is not None:
+            self._snippet_depth -= 1
+            if self._snippet_depth <= 0:
+                self._active_snippet_index = None
+
+    def handle_data(self, data: str) -> None:
+        if self._active_title is not None:
+            self._active_title["parts"].append(data)
+            return
+        if self._active_snippet_index is not None and 0 <= self._active_snippet_index < len(self.results):
+            current = self.results[self._active_snippet_index].get("snippet", "")
+            self.results[self._active_snippet_index]["snippet"] = _clean_search_text(f"{current} {data}")
+
+
+def _duckduckgo_result_url(raw_url: str) -> str:
+    url = html_lib.unescape(raw_url or "").strip()
+    if not url:
+        return ""
+    if url.startswith("//"):
+        url = f"https:{url}"
+    if url.startswith("/"):
+        url = f"https://duckduckgo.com{url}"
+    parsed = urlparse(url)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        return target.strip()
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return url
+    return ""
+
+
+def _clean_search_text(value: str) -> str:
+    return re.sub(r"\s+", " ", html_lib.unescape(value or "")).strip()
+
+
+def _duckduckgo_related_topics(value: Any, limit: int) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+
+    def visit(items: Any) -> None:
+        if len(results) >= limit or not isinstance(items, list):
+            return
+        for item in items:
+            if len(results) >= limit:
+                break
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("Topics"), list):
+                visit(item["Topics"])
+                continue
+            text = str(item.get("Text") or "").strip()
+            url = str(item.get("FirstURL") or "").strip()
+            if text or url:
+                results.append({"title": text[:180], "url": url, "snippet": text})
+
+    visit(value)
+    return results
+
+
+def _builtin_read_file(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    raw_path = str(args.get("path") or args.get("file") or "").strip()
+    if not raw_path:
+        raise RuntimeError("read_file 需要 path 参数。")
+    path = _resolve_runtime_path(raw_path, runtime)
+    if not path.is_file():
+        raise RuntimeError(f"不是可读取文件：{path}")
+    max_bytes = min(_positive_int(args.get("max_bytes", runtime.get("maxFileBytes")), _runtime_max_file_bytes(runtime)), _runtime_max_file_bytes(runtime))
+    encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
+    with path.open("rb") as handle:
+        content = handle.read(max_bytes + 1)
+    truncated = len(content) > max_bytes
+    if truncated:
+        content = content[:max_bytes]
+    text = content.decode(encoding, errors="replace")
+    max_chars = _positive_int(args.get("max_chars"), len(text))
+    if max_chars < len(text):
+        text = text[:max_chars]
+        truncated = True
+    return {
+        "path": str(path),
+        "size": path.stat().st_size,
+        "encoding": encoding,
+        "truncated": truncated,
+        "content": text,
+    }
+
+
+def _builtin_list_directory(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    raw_path = str(args.get("path") or ".").strip() or "."
+    directory = _resolve_runtime_path(raw_path, runtime)
+    if not directory.is_dir():
+        raise RuntimeError(f"不是可列出的目录：{directory}")
+    pattern = str(args.get("pattern") or "*").strip() or "*"
+    recursive = _truthy(args.get("recursive"))
+    max_entries = min(_positive_int(args.get("max_entries"), 100), 500)
+    iterator = directory.rglob(pattern) if recursive else directory.glob(pattern)
+    entries: list[dict[str, Any]] = []
+    for item in iterator:
+        try:
+            resolved = item.resolve()
+        except OSError:
+            continue
+        if not _is_relative_to(resolved, directory):
+            continue
+        stat = resolved.stat()
+        entries.append(
+            {
+                "name": resolved.name,
+                "path": str(resolved),
+                "relativePath": resolved.relative_to(directory).as_posix(),
+                "type": "directory" if resolved.is_dir() else "file",
+                "size": stat.st_size if resolved.is_file() else 0,
+            }
+        )
+        if len(entries) >= max_entries:
+            break
+    return {
+        "path": str(directory),
+        "pattern": pattern,
+        "recursive": recursive,
+        "entries": entries,
+        "truncated": len(entries) >= max_entries,
+    }
+
+
+def _builtin_read_file_chunk(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    raw_path = str(args.get("path") or args.get("file") or "").strip()
+    if not raw_path:
+        raise RuntimeError("read_file_chunk 需要 path 参数。")
+    path = _resolve_runtime_path(raw_path, runtime)
+    if not path.is_file():
+        raise RuntimeError(f"不是可读取文件：{path}")
+    if _is_binary_file(path):
+        raise RuntimeError(f"read_file_chunk 只读取文本文件，疑似二进制文件：{path}")
+    encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
+    max_chars = min(_positive_int(args.get("max_chars"), 4000), _runtime_max_file_bytes(runtime))
+    start_line = _optional_positive_int(args.get("start_line", args.get("startLine")))
+    end_line = _optional_positive_int(args.get("end_line", args.get("endLine")))
+
+    if start_line is not None:
+        return _read_file_chunk_by_lines(path, start_line, end_line, max_chars, encoding)
+
+    offset = _non_negative_int(args.get("offset"), 0)
+    text, source_truncated = _read_text_limited(path, runtime, encoding)
+    total_lines = _count_file_lines(path, encoding)
+    end = min(len(text), offset + max_chars)
+    content = text[offset:end] if offset < len(text) else ""
+    truncated = source_truncated or end < len(text)
+    start_line_for_offset = text[:offset].count("\n") + 1 if text else 1
+    end_line_for_offset = start_line_for_offset + content.count("\n") if content else start_line_for_offset
+    return {
+        "path": str(path),
+        "size": path.stat().st_size,
+        "encoding": encoding,
+        "startLine": start_line_for_offset,
+        "endLine": end_line_for_offset,
+        "totalLines": total_lines,
+        "offset": offset,
+        "nextOffset": end if truncated and end > offset else None,
+        "truncated": truncated,
+        "content": content,
+    }
+
+
+def _read_file_chunk_by_lines(path: Path, start_line: int, end_line: int | None, max_chars: int, encoding: str) -> dict[str, Any]:
+    if end_line is not None and end_line < start_line:
+        raise RuntimeError("read_file_chunk 的 end_line 不能小于 start_line。")
+    content_parts: list[str] = []
+    total_lines = 0
+    last_returned_line: int | None = None
+    truncated = False
+    with path.open("r", encoding=encoding, errors="replace", newline="") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            total_lines = line_no
+            if line_no < start_line:
+                continue
+            if end_line is not None and line_no > end_line:
+                continue
+            current_len = sum(len(part) for part in content_parts)
+            if current_len + len(line) > max_chars:
+                remaining = max_chars - current_len
+                if remaining > 0:
+                    content_parts.append(line[:remaining])
+                    last_returned_line = line_no
+                truncated = True
+                continue
+            content_parts.append(line)
+            last_returned_line = line_no
+    content = "".join(content_parts)
+    if truncated and last_returned_line is not None and last_returned_line < total_lines:
+        next_start_line = last_returned_line + 1
+    elif end_line is not None and end_line < total_lines:
+        next_start_line = end_line + 1
+    else:
+        next_start_line = None
+    return {
+        "path": str(path),
+        "size": path.stat().st_size,
+        "encoding": encoding,
+        "startLine": start_line,
+        "endLine": last_returned_line,
+        "totalLines": total_lines,
+        "offset": None,
+        "nextOffset": None,
+        "nextStartLine": next_start_line,
+        "truncated": truncated,
+        "content": content,
+    }
+
+
+def _builtin_search_code(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        raise RuntimeError("search_code 需要 query 参数。")
+    root = _resolve_runtime_path(str(args.get("root") or args.get("path") or ".").strip() or ".", runtime)
+    encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
+    file_glob = str(args.get("file_glob") or args.get("glob") or "*").strip() or "*"
+    regex = _truthy(args.get("regex"))
+    case_sensitive = _truthy(args.get("case_sensitive", args.get("caseSensitive")))
+    context_lines = min(_positive_int(args.get("context_lines", args.get("contextLines")), 0), 8)
+    max_results = min(_positive_int(args.get("max_results", args.get("limit")), 50), 200)
+    pattern = None
+    if regex:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            pattern = re.compile(query, flags)
+        except re.error as exc:
+            raise RuntimeError(f"search_code 正则表达式无效：{exc}") from exc
+
+    matches: list[dict[str, Any]] = []
+    scanned_files = 0
+    skipped_binary = 0
+    for file_path in _iter_search_files(root, file_glob):
+        if len(matches) >= max_results:
+            break
+        if _is_binary_file(file_path):
+            skipped_binary += 1
+            continue
+        scanned_files += 1
+        try:
+            text, file_truncated = _read_text_limited(file_path, runtime, encoding)
+        except OSError:
+            continue
+        lines = text.splitlines()
+        haystack_query = query if case_sensitive else query.lower()
+        for index, line in enumerate(lines):
+            if pattern:
+                match = pattern.search(line)
+                if not match:
+                    continue
+                column = match.start() + 1
+            else:
+                haystack_line = line if case_sensitive else line.lower()
+                found = haystack_line.find(haystack_query)
+                if found < 0:
+                    continue
+                column = found + 1
+            matches.append(
+                {
+                    "path": str(file_path),
+                    "relativePath": _safe_relative_path(file_path, root),
+                    "line": index + 1,
+                    "column": column,
+                    "text": line,
+                    "before": lines[max(0, index - context_lines) : index] if context_lines else [],
+                    "after": lines[index + 1 : index + 1 + context_lines] if context_lines else [],
+                    "fileTruncated": file_truncated,
+                }
+            )
+            if len(matches) >= max_results:
+                break
+    return {
+        "root": str(root),
+        "query": query,
+        "regex": regex,
+        "fileGlob": file_glob,
+        "matches": matches,
+        "scannedFiles": scanned_files,
+        "skippedBinaryFiles": skipped_binary,
+        "truncated": len(matches) >= max_results,
+    }
+
+
+def _builtin_list_code_symbols(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    raw_path = str(args.get("path") or args.get("file") or "").strip()
+    if not raw_path:
+        raise RuntimeError("list_code_symbols 需要 path 参数。")
+    path = _resolve_runtime_path(raw_path, runtime)
+    if not path.is_file():
+        raise RuntimeError(f"不是可分析文件：{path}")
+    if _is_binary_file(path):
+        return {"path": str(path), "language": "binary", "symbols": [], "warnings": ["疑似二进制文件，已跳过。"]}
+    encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
+    max_symbols = min(_positive_int(args.get("max_symbols", args.get("limit")), 100), 500)
+    language = _detect_code_language(path, str(args.get("language") or ""))
+    text, truncated = _read_text_limited(path, runtime, encoding)
+    symbols, warnings = glg_semantic_symbols(text, language, max_symbols)
+    if truncated:
+        warnings.append("文件内容超过当前运行环境单次读取大小，符号列表可能不完整。")
+    return {
+        "path": str(path),
+        "language": language,
+        "symbols": symbols[:max_symbols],
+        "truncated": truncated or len(symbols) > max_symbols,
+        "warnings": warnings,
+    }
+
+
+def _builtin_extract_html(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    raw_path = str(args.get("path") or args.get("file") or "").strip()
+    selector = str(args.get("selector") or "").strip()
+    if not raw_path:
+        raise RuntimeError("extract_html 需要 path 参数。")
+    if not selector:
+        raise RuntimeError("extract_html 需要 selector 参数。")
+    path = _resolve_runtime_path(raw_path, runtime)
+    if not path.is_file():
+        raise RuntimeError(f"不是可抽取 HTML 的文件：{path}")
+    if _is_binary_file(path):
+        raise RuntimeError(f"extract_html 只读取文本 HTML 文件，疑似二进制文件：{path}")
+    encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
+    mode = str(args.get("mode") or "html").strip().lower()
+    if mode not in {"html", "text", "attributes"}:
+        mode = "html"
+    max_results = min(_positive_int(args.get("max_results", args.get("limit")), 20), 100)
+    max_chars = min(_positive_int(args.get("max_chars"), 4000), _runtime_max_file_bytes(runtime))
+    text, source_truncated = _read_text_limited(path, runtime, encoding)
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as exc:
+        raise RuntimeError("后端缺少 beautifulsoup4，请安装 requirements.txt 后重试。") from exc
+
+    soup = BeautifulSoup(text, "html.parser")
+    try:
+        selected = soup.select(selector)
+    except Exception as exc:
+        raise RuntimeError(f"extract_html selector 无效：{exc}") from exc
+
+    matches: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    search_from = 0
+    truncated = source_truncated or len(selected) > max_results
+    for index, element in enumerate(selected[:max_results], start=1):
+        outer_html = str(element)
+        start_line, end_line, search_from = _best_effort_html_lines(text, outer_html, search_from)
+        if start_line is None:
+            sourceline = getattr(element, "sourceline", None)
+            if isinstance(sourceline, int):
+                start_line = sourceline
+                end_line = sourceline
+        item: dict[str, Any] = {
+            "index": index,
+            "selector": selector,
+            "startLine": start_line,
+            "endLine": end_line,
+        }
+        if mode == "text":
+            value = re.sub(r"\s+", " ", element.get_text(" ", strip=True)).strip()
+            clipped, was_truncated = _clip_text(value, max_chars)
+            item["text"] = clipped
+        elif mode == "attributes":
+            item["attributes"] = {
+                str(key): (" ".join(value) if isinstance(value, list) else str(value))
+                for key, value in element.attrs.items()
+            }
+            was_truncated = False
+        else:
+            clipped, was_truncated = _clip_text(outer_html, max_chars)
+            item["html"] = clipped
+        if was_truncated:
+            item["truncated"] = True
+            truncated = True
+        matches.append(item)
+    if source_truncated:
+        warnings.append("文件内容超过当前运行环境单次读取大小，HTML 抽取结果可能不完整。")
+    return {
+        "path": str(path),
+        "selector": selector,
+        "mode": mode,
+        "matches": matches,
+        "count": len(matches),
+        "totalMatched": len(selected),
+        "truncated": truncated,
+        "warnings": warnings,
+    }
+
+
+def _builtin_extract_css_rules(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    raw_path = str(args.get("path") or args.get("file") or "").strip()
+    selector = str(args.get("selector") or "").strip()
+    property_name = str(args.get("property") or args.get("property_name") or args.get("propertyName") or "").strip()
+    query = str(args.get("query") or "").strip()
+    if not raw_path:
+        raise RuntimeError("extract_css_rules 需要 path 参数。")
+    if not selector and not property_name and not query:
+        raise RuntimeError("extract_css_rules 需要 selector、property 或 query 至少一个参数。")
+    path = _resolve_runtime_path(raw_path, runtime)
+    if not path.is_file():
+        raise RuntimeError(f"不是可抽取 CSS 的文件：{path}")
+    if _is_binary_file(path):
+        raise RuntimeError(f"extract_css_rules 只读取文本 CSS 文件，疑似二进制文件：{path}")
+    encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
+    max_results = min(_positive_int(args.get("max_results", args.get("limit")), 50), 200)
+    text, source_truncated = _read_text_limited(path, runtime, encoding)
+    rules, parse_warnings = _parse_css_rules(text)
+    matched: list[dict[str, Any]] = []
+    total_matched = 0
+    selector_key = _normalize_css_selector(selector) if selector else ""
+    property_key = property_name.lower()
+    query_key = query.lower()
+    for rule in rules:
+        if selector_key and selector_key not in {_normalize_css_selector(item) for item in rule["selectors"]}:
+            continue
+        if property_key and not any(str(name).lower() == property_key for name in rule["declarations"].keys()):
+            continue
+        if query_key and query_key not in str(rule["css"]).lower():
+            continue
+        total_matched += 1
+        if len(matched) < max_results:
+            matched.append(rule)
+    warnings = list(parse_warnings)
+    if source_truncated:
+        warnings.append("文件内容超过当前运行环境单次读取大小，CSS 抽取结果可能不完整。")
+    return {
+        "path": str(path),
+        "selector": selector,
+        "property": property_name,
+        "query": query,
+        "rules": matched,
+        "count": len(matched),
+        "totalMatched": total_matched,
+        "truncated": source_truncated or total_matched > max_results,
+        "warnings": warnings,
+    }
+
+
+def _builtin_extract_html_by_text(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    raw_path = str(args.get("path") or args.get("file") or "").strip()
+    query = str(args.get("query") or args.get("text") or "").strip()
+    if not raw_path:
+        raise RuntimeError("extract_html_by_text 需要 path 参数。")
+    if not query:
+        raise RuntimeError("extract_html_by_text 需要 query 参数。")
+    path = _resolve_runtime_path(raw_path, runtime)
+    if not path.is_file():
+        raise RuntimeError(f"不是可抽取 HTML 的文件：{path}")
+    if _is_binary_file(path):
+        raise RuntimeError(f"extract_html_by_text 只读取文本 HTML 文件，疑似二进制文件：{path}")
+    encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
+    max_results = min(_positive_int(args.get("max_results", args.get("limit")), 20), 100)
+    max_chars = min(_positive_int(args.get("max_chars"), 4000), _runtime_max_file_bytes(runtime))
+    text, source_truncated = _read_text_limited(path, runtime, encoding)
+    result = glg_extract_html_by_text(
+        text=text,
+        query=query,
+        regex=_truthy(args.get("regex")),
+        mode=str(args.get("mode") or "html"),
+        max_results=max_results,
+        max_chars=max_chars,
+        case_sensitive=_truthy(args.get("case_sensitive", args.get("caseSensitive"))),
+    )
+    warnings = list(result.get("warnings") or [])
+    if source_truncated:
+        warnings.append("文件内容超过当前运行环境单次读取大小，HTML 文本抽取结果可能不完整。")
+    result["path"] = str(path)
+    result["encoding"] = encoding
+    result["truncated"] = bool(result.get("truncated") or source_truncated)
+    result["warnings"] = warnings
+    return result
+
+
+def _builtin_extract_css_for_html(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    raw_path = str(args.get("path") or args.get("css_path") or args.get("cssPath") or "").strip()
+    selector = str(args.get("selector") or args.get("html_selector") or args.get("htmlSelector") or "").strip()
+    if not raw_path:
+        raise RuntimeError("extract_css_for_html 需要 path 参数。")
+    if not selector:
+        raise RuntimeError("extract_css_for_html 需要 selector 参数。")
+    path = _resolve_runtime_path(raw_path, runtime)
+    if not path.is_file():
+        raise RuntimeError(f"不是可抽取 CSS 的文件：{path}")
+    if _is_binary_file(path):
+        raise RuntimeError(f"extract_css_for_html 只读取文本 CSS 文件，疑似二进制文件：{path}")
+    encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
+    max_results = min(_positive_int(args.get("max_results", args.get("limit")), 50), 200)
+    css_text, css_truncated = _read_text_limited(path, runtime, encoding)
+    html_text = ""
+    html_path_text = str(args.get("html_path") or args.get("htmlPath") or "").strip()
+    html_path: Path | None = None
+    html_truncated = False
+    if html_path_text:
+        html_path = _resolve_runtime_path(html_path_text, runtime)
+        if not html_path.is_file():
+            raise RuntimeError(f"不是可分析 HTML 的文件：{html_path}")
+        if _is_binary_file(html_path):
+            raise RuntimeError(f"extract_css_for_html 只读取文本 HTML 文件，疑似二进制文件：{html_path}")
+        html_text, html_truncated = _read_text_limited(html_path, runtime, encoding)
+    result = glg_extract_css_for_html(css_text=css_text, selector=selector, html_text=html_text, max_results=max_results)
+    warnings = list(result.get("warnings") or [])
+    if css_truncated:
+        warnings.append("CSS 文件内容超过当前运行环境单次读取大小，样式匹配可能不完整。")
+    if html_truncated:
+        warnings.append("HTML 文件内容超过当前运行环境单次读取大小，元素 token 推导可能不完整。")
+    result["path"] = str(path)
+    result["htmlPath"] = str(html_path) if html_path else ""
+    result["encoding"] = encoding
+    result["truncated"] = bool(result.get("truncated") or css_truncated or html_truncated)
+    result["warnings"] = warnings
+    return result
+
+
+def _builtin_summarize_page_structure(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    raw_path = str(args.get("path") or args.get("file") or "").strip()
+    if not raw_path:
+        raise RuntimeError("summarize_page_structure 需要 path 参数。")
+    path = _resolve_runtime_path(raw_path, runtime)
+    if not path.is_file():
+        raise RuntimeError(f"不是可分析 HTML 的文件：{path}")
+    if _is_binary_file(path):
+        raise RuntimeError(f"summarize_page_structure 只读取文本 HTML 文件，疑似二进制文件：{path}")
+    encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
+    max_items = min(_positive_int(args.get("max_items", args.get("limit")), 50), 200)
+    text, source_truncated = _read_text_limited(path, runtime, encoding)
+    result = glg_summarize_page_structure(text, max_items)
+    warnings = list(result.get("warnings") or [])
+    if source_truncated:
+        warnings.append("文件内容超过当前运行环境单次读取大小，页面结构摘要可能不完整。")
+    result["path"] = str(path)
+    result["encoding"] = encoding
+    result["truncated"] = source_truncated
+    result["warnings"] = warnings
+    return result
+
+
+def _builtin_resolve_asset_references(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    raw_path = str(args.get("path") or args.get("file") or "").strip()
+    if not raw_path:
+        raise RuntimeError("resolve_asset_references 需要 path 参数。")
+    path = _resolve_runtime_path(raw_path, runtime)
+    if not path.is_file():
+        raise RuntimeError(f"不是可扫描资源引用的文件：{path}")
+    if _is_binary_file(path):
+        raise RuntimeError(f"resolve_asset_references 只读取文本 HTML/CSS 文件，疑似二进制文件：{path}")
+    encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
+    language = _detect_code_language(path, str(args.get("language") or ""))
+    max_results = min(_positive_int(args.get("max_results", args.get("limit")), 200), 500)
+    text, source_truncated = _read_text_limited(path, runtime, encoding)
+    result = glg_asset_references(text, language, max_results)
+    references = [_enrich_asset_reference(item, path, runtime) for item in result.get("references", []) if isinstance(item, dict)]
+    warnings = list(result.get("warnings") or [])
+    if source_truncated:
+        warnings.append("文件内容超过当前运行环境单次读取大小，资源引用可能不完整。")
+    return {
+        "path": str(path),
+        "language": language,
+        "references": references,
+        "count": len(references),
+        "totalMatched": result.get("totalMatched", len(references)),
+        "truncated": bool(result.get("truncated") or source_truncated),
+        "warnings": warnings,
+    }
+
+
+def _builtin_extract_code_symbol(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    raw_path = str(args.get("path") or args.get("file") or "").strip()
+    symbol = str(args.get("symbol") or args.get("name") or "").strip()
+    if not raw_path:
+        raise RuntimeError("extract_code_symbol 需要 path 参数。")
+    if not symbol:
+        raise RuntimeError("extract_code_symbol 需要 symbol 参数。")
+    path = _resolve_runtime_path(raw_path, runtime)
+    if not path.is_file():
+        raise RuntimeError(f"不是可分析文件：{path}")
+    if _is_binary_file(path):
+        raise RuntimeError(f"extract_code_symbol 只读取文本代码文件，疑似二进制文件：{path}")
+    encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
+    language = _detect_code_language(path, str(args.get("language") or ""))
+    max_chars = min(_positive_int(args.get("max_chars"), 4000), _runtime_max_file_bytes(runtime))
+    include_context = _truthy(args.get("include_context", args.get("includeContext")))
+    text, source_truncated = _read_text_limited(path, runtime, encoding)
+    result = glg_extract_code_symbol(
+        text=text,
+        language=language,
+        symbol=symbol,
+        kind=str(args.get("kind") or "any"),
+        max_chars=max_chars,
+        include_context=include_context,
+    )
+    if not result.get("found"):
+        alternatives = result.get("alternatives")
+        hint = ""
+        if isinstance(alternatives, list) and alternatives:
+            names = ", ".join(str(item.get("name") or "") for item in alternatives[:8] if isinstance(item, dict))
+            hint = f"。候选符号：{names}" if names else ""
+        raise RuntimeError(f"未找到符号：{symbol}{hint}")
+    warnings = list(result.get("warnings") or [])
+    if source_truncated:
+        warnings.append("文件内容超过当前运行环境单次读取大小，符号抽取结果可能不完整。")
+    result["path"] = str(path)
+    result["encoding"] = encoding
+    result["warnings"] = warnings
+    result["truncated"] = bool(result.get("truncated") or source_truncated)
+    result.pop("found", None)
+    return result
+
+
+def _builtin_chunk_code_semantic(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    raw_path = str(args.get("path") or args.get("file") or "").strip()
+    if not raw_path:
+        raise RuntimeError("chunk_code_semantic 需要 path 参数。")
+    path = _resolve_runtime_path(raw_path, runtime)
+    if not path.is_file():
+        raise RuntimeError(f"不是可分析文件：{path}")
+    if _is_binary_file(path):
+        raise RuntimeError(f"chunk_code_semantic 只读取文本代码文件，疑似二进制文件：{path}")
+    encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
+    language = _detect_code_language(path, str(args.get("language") or ""))
+    max_chars = min(_positive_int(args.get("max_chars"), 4000), _runtime_max_file_bytes(runtime))
+    max_chunks = min(_positive_int(args.get("max_chunks", args.get("limit")), 80), 500)
+    include_content = _truthy(args.get("include_content", args.get("includeContent")))
+    text, source_truncated = _read_text_limited(path, runtime, encoding)
+    result = glg_chunk_code_semantic(
+        text=text,
+        language=language,
+        max_chars=max_chars,
+        max_chunks=max_chunks,
+        include_content=include_content,
+    )
+    warnings = list(result.get("warnings") or [])
+    if source_truncated:
+        warnings.append("文件内容超过当前运行环境单次读取大小，语义分片可能不完整。")
+    result["path"] = str(path)
+    result["encoding"] = encoding
+    result["truncated"] = bool(result.get("truncated") or source_truncated)
+    result["warnings"] = warnings
+    return result
+
+
+def _builtin_fetch_url(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    url = str(args.get("url") or "").strip()
+    if not url:
+        raise RuntimeError("fetch_url 需要 url 参数。")
+    _assert_network_allowed(url, runtime)
+    max_bytes = _runtime_max_http_bytes(runtime)
+    response = httpx.get(url, timeout=15, follow_redirects=True)
+    response.raise_for_status()
+    body = response.content[: max_bytes + 1]
+    truncated = len(body) > max_bytes
+    if truncated:
+        body = body[:max_bytes]
+    encoding = response.encoding or "utf-8"
+    text = body.decode(encoding, errors="replace")
+    max_chars = _positive_int(args.get("max_chars"), len(text))
+    if max_chars < len(text):
+        text = text[:max_chars]
+        truncated = True
+    return {
+        "url": str(response.url),
+        "statusCode": response.status_code,
+        "contentType": response.headers.get("content-type", ""),
+        "truncated": truncated,
+        "text": text,
+    }
+
+
+def _normalize_runtime_environment(runtime_environment: RuntimeEnvironment) -> dict[str, Any]:
+    if runtime_environment:
+        return resolve_runtime_environment(runtime_environment)
+    return default_runtime_environment().model_dump(by_alias=True)
+
+
+def _runtime_allowed_roots(runtime: dict[str, Any]) -> list[Path]:
+    raw_roots = _json_string_list(runtime.get("allowedRootsJson"))
+    if not raw_roots:
+        env_roots = os.getenv("GLG_FILE_TOOL_ROOTS", "")
+        raw_roots = [item.strip() for item in re.split(r"[;\n]+", env_roots) if item.strip()]
+    if not raw_roots:
+        raw_roots = [str(ROOT_DIR)]
+    roots: list[Path] = []
+    for item in raw_roots:
+        try:
+            roots.append(Path(item).expanduser().resolve())
+        except OSError:
+            continue
+    return roots or [ROOT_DIR.resolve()]
+
+
+def _resolve_runtime_path(value: str, runtime: dict[str, Any]) -> Path:
+    raw_path = Path(value).expanduser()
+    roots = _runtime_allowed_roots(runtime)
+    candidates = [raw_path] if raw_path.is_absolute() else [ROOT_DIR / raw_path, *(root / raw_path for root in roots)]
+    allowed: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate.absolute()
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if any(_is_relative_to(resolved, root) for root in roots):
+            allowed.append(resolved)
+    if allowed:
+        return next((path for path in allowed if path.exists()), allowed[0])
+    root_text = "；".join(str(root) for root in roots)
+    first = candidates[0]
+    try:
+        first_resolved = first.resolve()
+    except OSError:
+        first_resolved = first.absolute()
+    raise RuntimeError(f"路径不在当前运行环境允许目录内：{first_resolved}。允许目录：{root_text}")
+
+
+def _enrich_asset_reference(reference: dict[str, Any], base_file: Path, runtime: dict[str, Any]) -> dict[str, Any]:
+    item = dict(reference)
+    raw_url = str(item.get("url") or "").strip()
+    item["url"] = raw_url
+    parsed = urlparse(raw_url)
+    if not raw_url:
+        item.update({"external": False, "allowed": False, "exists": False, "resolvedPath": ""})
+        return item
+    if parsed.scheme in {"http", "https", "data", "blob", "mailto", "tel"} or raw_url.startswith(("#", "//")):
+        item.update({"external": True, "allowed": None, "exists": None, "resolvedPath": ""})
+        return item
+    relative_part = unquote(raw_url.split("?", 1)[0].split("#", 1)[0])
+    if not relative_part:
+        item.update({"external": False, "allowed": False, "exists": False, "resolvedPath": ""})
+        return item
+    candidate = (base_file.parent / relative_part).resolve()
+    allowed = any(_is_relative_to(candidate, root) for root in _runtime_allowed_roots(runtime))
+    item.update(
+        {
+            "external": False,
+            "allowed": allowed,
+            "exists": candidate.exists() if allowed else False,
+            "resolvedPath": str(candidate) if allowed else "",
+        }
+    )
+    return item
+
+
+def _read_text_limited(path: Path, runtime: dict[str, Any], encoding: str) -> tuple[str, bool]:
+    max_bytes = _runtime_max_file_bytes(runtime)
+    with path.open("rb") as handle:
+        content = handle.read(max_bytes + 1)
+    truncated = len(content) > max_bytes
+    if truncated:
+        content = content[:max_bytes]
+    return content.decode(encoding or "utf-8", errors="replace"), truncated
+
+
+def _count_file_lines(path: Path, encoding: str) -> int:
+    count = 0
+    with path.open("r", encoding=encoding or "utf-8", errors="replace", newline="") as handle:
+        for count, _line in enumerate(handle, start=1):
+            pass
+    return count
+
+
+def _is_binary_file(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            sample = handle.read(CODE_TOOL_BINARY_CHECK_BYTES)
+    except OSError:
+        return True
+    return b"\x00" in sample
+
+
+def _iter_search_files(root: Path, file_glob: str):
+    if root.is_file():
+        if fnmatch.fnmatch(root.name, file_glob) or fnmatch.fnmatch(root.as_posix(), file_glob):
+            yield root
+        return
+    if not root.is_dir():
+        raise RuntimeError(f"搜索根路径不存在或不是目录：{root}")
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if name not in CODE_TOOL_EXCLUDED_DIRS and not name.startswith(".")
+        ]
+        current = Path(dirpath)
+        for filename in filenames:
+            path = current / filename
+            rel = _safe_relative_path(path, root)
+            if fnmatch.fnmatch(filename, file_glob) or fnmatch.fnmatch(rel, file_glob):
+                yield path
+
+
+def _safe_relative_path(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root if root.is_dir() else root.parent).as_posix()
+    except ValueError:
+        return path.name
+
+
+def _detect_code_language(path: Path, language_hint: str) -> str:
+    normalized = language_hint.strip().lower().replace("-", "_")
+    aliases = {
+        "py": "python",
+        "python": "python",
+        "html": "html",
+        "htm": "html",
+        "js": "javascript",
+        "jsx": "javascript",
+        "javascript": "javascript",
+        "ts": "typescript",
+        "tsx": "typescript",
+        "typescript": "typescript",
+        "css": "css",
+        "scss": "scss",
+        "sass": "scss",
+        "less": "less",
+        "vue": "vue",
+        "svelte": "svelte",
+        "json": "json",
+        "jsonc": "json",
+        "yaml": "yaml",
+        "yml": "yaml",
+        "md": "markdown",
+        "markdown": "markdown",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    suffix = path.suffix.lower().lstrip(".")
+    return aliases.get(suffix, suffix or "unknown")
+
+
+def _python_symbols(text: str, max_symbols: int) -> list[dict[str, Any]]:
+    tree = ast.parse(text)
+    lines = text.splitlines()
+    symbols: list[dict[str, Any]] = []
+    for item in tree.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            symbols.append(_python_symbol_dict(item.name, "function", item, lines))
+        elif isinstance(item, ast.ClassDef):
+            symbols.append(_python_symbol_dict(item.name, "class", item, lines))
+            for child in item.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    symbols.append(_python_symbol_dict(f"{item.name}.{child.name}", "method", child, lines))
+        if len(symbols) >= max_symbols:
+            break
+    return sorted(symbols, key=lambda symbol: (symbol["startLine"], symbol["name"]))[:max_symbols]
+
+
+def _python_symbol_dict(name: str, kind: str, node: Any, lines: list[str]) -> dict[str, Any]:
+    start = int(getattr(node, "lineno", 1) or 1)
+    end = int(getattr(node, "end_lineno", start) or start)
+    preview = lines[start - 1].strip() if 0 <= start - 1 < len(lines) else name
+    return {"name": name, "kind": kind, "startLine": start, "endLine": end, "preview": preview}
+
+
+class HtmlSymbolParser(HTMLParser):
+    def __init__(self, max_symbols: int) -> None:
+        super().__init__(convert_charrefs=True)
+        self.max_symbols = max_symbols
+        self.symbols: list[dict[str, Any]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if len(self.symbols) >= self.max_symbols:
+            return
+        attr = {key: value or "" for key, value in attrs}
+        line, _column = self.getpos()
+        name_parts = [tag]
+        if attr.get("id"):
+            name_parts.append(f"#{attr['id']}")
+        if attr.get("class"):
+            classes = ".".join(part for part in attr["class"].split() if part)
+            if classes:
+                name_parts.append(f".{classes}")
+        preview_attrs = " ".join(f'{key}="{value}"' for key, value in attr.items() if key in {"id", "class", "name", "src", "href"} and value)
+        self.symbols.append(
+            {
+                "name": "".join(name_parts),
+                "kind": "tag",
+                "startLine": line,
+                "endLine": line,
+                "preview": f"<{tag}{(' ' + preview_attrs) if preview_attrs else ''}>",
+            }
+        )
+
+
+def _html_symbols(text: str, max_symbols: int) -> list[dict[str, Any]]:
+    parser = HtmlSymbolParser(max_symbols)
+    parser.feed(text)
+    parser.close()
+    return parser.symbols[:max_symbols]
+
+
+def _javascript_symbols(text: str, max_symbols: int) -> list[dict[str, Any]]:
+    patterns = [
+        ("class", re.compile(r"\bclass\s+([A-Za-z_$][\w$]*)")),
+        ("function", re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(")),
+        ("function", re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>")),
+        ("function", re.compile(r"\b([A-Za-z_$][\w$]*)\s*:\s*(?:async\s*)?function\s*\(")),
+    ]
+    symbols: list[dict[str, Any]] = []
+    lines = text.splitlines()
+    for line_no, line in enumerate(lines, start=1):
+        for kind, pattern in patterns:
+            match = pattern.search(line)
+            if not match:
+                continue
+            symbols.append({"name": match.group(1), "kind": kind, "startLine": line_no, "endLine": line_no, "preview": line.strip()})
+            break
+        if len(symbols) >= max_symbols:
+            break
+    return symbols
+
+
+def _css_symbols(text: str, max_symbols: int) -> list[dict[str, Any]]:
+    symbols: list[dict[str, Any]] = []
+    pending: list[str] = []
+    start_line = 1
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("/*", "*", "@")):
+            continue
+        if "{" in stripped:
+            before = stripped.split("{", 1)[0].strip() or " ".join(pending).strip()
+            pending = []
+            if before:
+                symbols.append({"name": before, "kind": "css_rule", "startLine": start_line, "endLine": line_no, "preview": before + " {"})
+        elif not pending:
+            pending = [stripped]
+            start_line = line_no
+        else:
+            pending.append(stripped)
+        if len(symbols) >= max_symbols:
+            break
+    return symbols
+
+
+def _clip_text(value: str, max_chars: int) -> tuple[str, bool]:
+    if len(value) <= max_chars:
+        return value, False
+    return value[:max_chars], True
+
+
+def _best_effort_html_lines(source: str, fragment: str, start_offset: int) -> tuple[int | None, int | None, int]:
+    if not fragment:
+        return None, None, start_offset
+    index = source.find(fragment, start_offset)
+    if index < 0:
+        index = source.find(fragment)
+    if index < 0:
+        return None, None, start_offset
+    start_line = source.count("\n", 0, index) + 1
+    end_line = start_line + fragment.count("\n")
+    return start_line, end_line, index + len(fragment)
+
+
+def _strip_css_comments_preserve_lines(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        value = match.group(0)
+        return "".join("\n" if char == "\n" else " " for char in value)
+
+    return re.sub(r"/\*.*?\*/", replace, text, flags=re.DOTALL)
+
+
+def _parse_css_rules(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    warnings: list[str] = []
+    if re.search(r"@[A-Za-z-]+\s+[^{]*{[^{}]*{", text, re.DOTALL):
+        warnings.append("检测到可能的嵌套 at-rule，CSS 解析按普通规则 best-effort 处理。")
+    clean = _strip_css_comments_preserve_lines(text)
+    rules: list[dict[str, Any]] = []
+    for match in re.finditer(r"(?s)([^{}]+)\{([^{}]*)\}", clean):
+        selector_text = match.group(1).strip()
+        body = match.group(2).strip()
+        if not selector_text or not body or selector_text.startswith("@"):
+            continue
+        selectors = [part.strip() for part in selector_text.split(",") if part.strip()]
+        declarations: dict[str, str] = {}
+        for declaration in body.split(";"):
+            if ":" not in declaration:
+                continue
+            name, value = declaration.split(":", 1)
+            name = name.strip()
+            if not name:
+                continue
+            declarations[name] = value.strip()
+        if not declarations:
+            continue
+        selector_start = match.start(1) + (len(match.group(1)) - len(match.group(1).lstrip()))
+        start_line = clean.count("\n", 0, selector_start) + 1
+        end_line = clean.count("\n", 0, match.end()) + 1
+        css = text[selector_start : match.end()].strip()
+        rules.append(
+            {
+                "selector": selector_text,
+                "selectors": selectors,
+                "declarations": declarations,
+                "startLine": start_line,
+                "endLine": end_line,
+                "css": css,
+            }
+        )
+    return rules, warnings
+
+
+def _normalize_css_selector(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip().lower()
+
+
+def _assert_network_allowed(url: str, runtime: dict[str, Any], extra_allowed_hosts: set[str] | None = None) -> None:
+    if runtime.get("networkEnabled") is False:
+        raise RuntimeError("当前运行环境已关闭网络访问。")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("只允许访问 http/https URL。")
+    host = parsed.hostname or ""
+    allowed_hosts = {item.lower() for item in _json_string_list(runtime.get("allowedHostsJson"))}
+    allowed_hosts.update(item.lower() for item in (extra_allowed_hosts or set()))
+    if allowed_hosts and not _host_allowed(host, allowed_hosts):
+        raise RuntimeError(f"当前运行环境不允许访问域名：{host}")
+
+
+def _host_allowed(host: str, allowed_hosts: set[str]) -> bool:
+    normalized = host.lower()
+    for allowed in allowed_hosts:
+        if not allowed:
+            continue
+        if allowed.startswith("*.") and normalized.endswith(allowed[1:]):
+            return True
+        if normalized == allowed:
+            return True
+    return False
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _runtime_max_file_bytes(runtime: dict[str, Any]) -> int:
+    return min(_positive_int(runtime.get("maxFileBytes"), 1_048_576), 16 * 1024 * 1024)
+
+
+def _runtime_max_http_bytes(runtime: dict[str, Any]) -> int:
+    return min(_positive_int(runtime.get("maxHttpBytes"), 262_144), 4 * 1024 * 1024)
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _invoke_python_tool(metadata: dict[str, Any], args: dict[str, Any]) -> Any:
@@ -738,10 +2595,10 @@ def _run_awaitable(value: Any) -> Any:
 
 def _compact_tool_result(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
-        return value if not isinstance(value, str) or len(value) <= 4000 else value[:4000] + "...[truncated]"
+        return value if not isinstance(value, str) or len(value) <= TOOL_OBSERVATION_STRING_LIMIT else value[:TOOL_OBSERVATION_STRING_LIMIT] + "...[truncated]"
     try:
         json.dumps(value, ensure_ascii=False)
-        return _compact_value(value)
+        return _compact_value(value, string_limit=TOOL_OBSERVATION_STRING_LIMIT, list_limit=20)
     except TypeError:
         return str(value)
 
@@ -754,6 +2611,27 @@ def _find_selected_tool(selected_tools: list[dict[str, Any]], name: str) -> dict
         candidates = {str(tool.get("id") or "").lower(), str(tool.get("name") or "").lower()}
         if normalized in candidates:
             return tool
+    return None
+
+
+def _fresh_builtin_tool_config(tool: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(tool, dict):
+        return None
+    schema = _parse_json_object(str(tool.get("schemaJson") or tool.get("tool_schema") or "{}"))
+    metadata = schema.get("x-graphic") if isinstance(schema.get("x-graphic"), dict) else {}
+    source = str(tool.get("source") or "").strip().lower()
+    builtin_id = str(metadata.get("builtinId") or "").strip()
+    candidate_ids: list[str] = []
+    existing_id = str(tool.get("id") or "").strip()
+    if existing_id:
+        candidate_ids.append(existing_id)
+    if builtin_id:
+        candidate_ids.append(f"builtin_{builtin_id}")
+    if source == "builtin" or metadata.get("kind") == "builtin_tool" or builtin_id:
+        for candidate_id in candidate_ids:
+            fresh = builtin_tool_config_by_id(candidate_id)
+            if fresh:
+                return fresh
     return None
 
 
@@ -778,13 +2656,15 @@ def _selected_tool_configs(config: dict[str, Any], tools: ToolRuntimeConfig) -> 
         if key in seen:
             continue
         seen.add(key)
-        result.append(tool)
+        result.append(_fresh_builtin_tool_config(tool) or tool)
     return result
 
 
 def _json_object_list(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, list):
-        return [item for item in value if isinstance(item, dict)]
+        return _flatten_json_object_list(value)
+    if isinstance(value, dict):
+        return [value]
     text = str(value or "").strip()
     if not text:
         return []
@@ -792,7 +2672,19 @@ def _json_object_list(value: Any) -> list[dict[str, Any]]:
         parsed = json.loads(text)
     except json.JSONDecodeError:
         return []
-    return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+    if isinstance(parsed, dict):
+        return [parsed]
+    return _flatten_json_object_list(parsed) if isinstance(parsed, list) else []
+
+
+def _flatten_json_object_list(value: list[Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            result.append(item)
+        elif isinstance(item, list):
+            result.extend(_flatten_json_object_list(item))
+    return result
 
 
 def _tool_configs_by_id(project: ProjectIR) -> ToolRuntimeConfig:
@@ -814,12 +2706,14 @@ def _workspace_tool_dicts() -> list[dict[str, Any]]:
         data = json.loads(WORKSPACE_TOOLS_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return []
-    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+    return _flatten_json_object_list(data) if isinstance(data, list) else []
 
 
 def _model_to_tool_dict(tool: Any) -> dict[str, Any]:
     if isinstance(tool, dict):
         return tool
+    if isinstance(tool, list):
+        return {}
     if hasattr(tool, "model_dump"):
         return tool.model_dump(by_alias=True)
     return {
@@ -832,6 +2726,9 @@ def _model_to_tool_dict(tool: Any) -> dict[str, Any]:
 
 
 def _register_tool_config(registry: ToolRuntimeConfig, tool: dict[str, Any]) -> None:
+    if not isinstance(tool, dict):
+        return
+    tool = _fresh_builtin_tool_config(tool) or tool
     tool_id = str(tool.get("id") or "").strip()
     name = str(tool.get("name") or "").strip()
     if not tool_id and not name:
@@ -1094,6 +2991,7 @@ def _call_chat_model(
 ) -> Any:
     provider_key = _normalize_provider(provider)
     base_url = _runtime_value(runtime_config, "baseUrl", "base_url")
+    api_format = _normalize_provider(_runtime_value(runtime_config, "apiFormat", "api_format"))
     api_key_env = _safe_api_key_env(_runtime_value(runtime_config, "apiKeyEnv", "api_key_env"))
     api_key = _runtime_value(runtime_config, "apiKey", "api_key") or _read_api_key(api_key_env)
     organization = _runtime_value(runtime_config, "organization")
@@ -1102,7 +3000,7 @@ def _call_chat_model(
     try:
         if provider_key == "azure_openai":
             return _call_azure_openai(model, messages, base_url, api_key, api_key_env, api_version)
-        if provider_key in OPENAI_COMPATIBLE_PROVIDERS or base_url:
+        if api_format == "openai_compatible" or provider_key in OPENAI_COMPATIBLE_PROVIDERS or base_url:
             return _call_openai_compatible(provider_key, model, messages, base_url, api_key, api_key_env, organization)
 
         from langchain.chat_models import init_chat_model
@@ -1185,9 +3083,39 @@ def _call_azure_openai(
 def _normalize_model_config(config: ModelRuntimeConfig) -> ModelRuntimeConfig:
     if not config:
         return None
+    if hasattr(config, "model_dump"):
+        config = config.model_dump(by_alias=True)
+    if not isinstance(config, dict):
+        return None
     if config.get("enabled") is False:
         return None
     return {str(key): value for key, value in config.items() if value is not None}
+
+
+def _effective_model_config(node_config: dict[str, Any], runtime_config: ModelRuntimeConfig) -> ModelRuntimeConfig:
+    base = _normalize_model_config(runtime_config) or {}
+    node_fields: dict[str, Any] = {}
+    for key in (
+        "id",
+        "name",
+        "provider",
+        "model",
+        "baseUrl",
+        "base_url",
+        "apiKey",
+        "api_key",
+        "apiKeyEnv",
+        "api_key_env",
+        "apiVersion",
+        "api_version",
+        "organization",
+        "apiFormat",
+        "api_format",
+    ):
+        value = node_config.get(key)
+        if value is not None and str(value).strip():
+            node_fields[key] = value
+    return {**base, **node_fields} if base or node_fields else None
 
 
 def _runtime_value(config: ModelRuntimeConfig, *keys: str) -> str:
@@ -1412,17 +3340,31 @@ def _state_value_to_text(value: Any) -> str:
     return str(value)
 
 
+def _fallback_reply_content(state: dict[str, Any]) -> str:
+    priority = ("final_answer", "tools_result", "agent_result", "llm_result", "http_response", "retrieved_context")
+    for key in priority:
+        text = _state_value_to_text(state.get(key)).strip()
+        if text:
+            return text
+    for key in reversed(list(state.keys())):
+        if key in priority or key.endswith(("_result", "_answer", "_output")):
+            text = _state_value_to_text(state.get(key)).strip()
+            if text:
+                return text
+    return ""
+
+
 def _compact_state(state: dict[str, Any]) -> dict[str, Any]:
     return {key: _compact_value(value) for key, value in state.items()}
 
 
-def _compact_value(value: Any) -> Any:
+def _compact_value(value: Any, string_limit: int = 1200, list_limit: int = 12) -> Any:
     if isinstance(value, dict):
-        return {str(key): _compact_value(child) for key, child in value.items()}
+        return {str(key): _compact_value(child, string_limit=string_limit, list_limit=list_limit) for key, child in value.items()}
     if isinstance(value, list):
-        return [_compact_value(item) for item in value[:12]]
-    if isinstance(value, str) and len(value) > 1200:
-        return value[:1200] + "...[truncated]"
+        return [_compact_value(item, string_limit=string_limit, list_limit=list_limit) for item in value[:list_limit]]
+    if isinstance(value, str) and len(value) > string_limit:
+        return value[:string_limit] + "...[truncated]"
     return value
 
 
@@ -1439,6 +3381,22 @@ def _positive_int(value: Any, fallback: int) -> int:
     except (TypeError, ValueError):
         return fallback
     return parsed if parsed > 0 else fallback
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _non_negative_int(value: Any, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed >= 0 else fallback
 
 
 def _positive_float(value: Any, fallback: float) -> float:

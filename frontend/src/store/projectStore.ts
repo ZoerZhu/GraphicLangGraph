@@ -19,12 +19,14 @@ import {
   listWorkspaceMcpServers,
   listWorkspaceRagKnowledgeBases,
   listWorkspaceModelConfigs,
+  listWorkspaceRuntimeEnvironments,
   listWorkspaceSkills,
   listWorkspaceTools,
   listProjects,
   saveWorkspaceMcpServers,
   saveWorkspaceRagKnowledgeBases,
   saveWorkspaceModelConfigs,
+  saveWorkspaceRuntimeEnvironments,
   saveWorkspaceSkills,
   saveWorkspaceTools,
   saveProject,
@@ -43,10 +45,12 @@ import type {
   NodeRuntimeState,
   NodeIR,
   NodeType,
+  Position,
   ProjectHistoryRecord,
   ProjectIR,
   ProjectListItem,
   RagKnowledgeBaseConfig,
+  RuntimeEnvironmentConfig,
   RunHistoryGraphMismatch,
   RunHistoryGraphSnapshot,
   RunHistoryRecord,
@@ -78,11 +82,13 @@ interface ProjectStore {
   workspaceMcpServers: MCPServerConfig[];
   workspaceModelConfigs: ModelConfig[];
   workspaceRagKnowledgeBases: RagKnowledgeBaseConfig[];
+  workspaceRuntimeEnvironments: RuntimeEnvironmentConfig[];
   selectedNodeId: string | null;
   pendingConnection: PendingConnection | null;
   splitAgentProject: ProjectIR | null;
   splitRatio: number;
   validation: ValidationResult | null;
+  validationOpen: boolean;
   exportResult: ExportResponse | null;
   historyOpen: boolean;
   miniMapOpen: boolean;
@@ -120,6 +126,8 @@ interface ProjectStore {
   updateWorkspaceMcpServers: (servers: MCPServerConfig[]) => Promise<void>;
   updateWorkspaceModelConfigs: (configs: ModelConfig[]) => Promise<void>;
   updateWorkspaceRagKnowledgeBases: (configs: RagKnowledgeBaseConfig[]) => Promise<void>;
+  updateWorkspaceRuntimeEnvironments: (configs: RuntimeEnvironmentConfig[]) => Promise<void>;
+  setProjectRuntimeEnvironmentId: (id: string) => void;
   updateTools: (tools: ToolConfig[]) => void;
   updateSkills: (skills: SkillConfig[]) => void;
   updateMcpServers: (servers: MCPServerConfig[]) => void;
@@ -143,6 +151,7 @@ interface ProjectStore {
   toggleHistory: () => void;
   toggleMiniMap: () => void;
   closeHistory: () => void;
+  closeValidationPanel: () => void;
   selectHistoryRecord: (recordId: string) => void;
   restoreHistoryRecord: (recordId: string) => Promise<void>;
   exportHistoryAsProject: (recordId: string) => Promise<void>;
@@ -164,6 +173,7 @@ interface ProjectStore {
   selectRunHistoryRecord: (recordId: string) => void;
   setRunHistoryReplayMode: (mode: RunHistoryReplayMode) => void;
   clearRunHistory: () => void;
+  cancelRun: () => void;
   runPreview: () => Promise<void>;
   openSplitAgent: (projectId: string) => Promise<void>;
   closeSplitAgent: () => void;
@@ -182,6 +192,8 @@ const WORKSPACE_MCP_KEY = "graphic-langgraph-workspace-mcp";
 const WORKSPACE_MODELS_KEY = "graphic-langgraph-workspace-models";
 const HISTORY_LIMIT = 80;
 const RUN_HISTORY_LIMIT = 30;
+let activeRunAbortController: AbortController | null = null;
+let activeRunToken: string | null = null;
 
 export const useProjectStore = create<ProjectStore>((set, get) => ({
   mode: "manager",
@@ -193,11 +205,13 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   workspaceMcpServers: [],
   workspaceModelConfigs: [],
   workspaceRagKnowledgeBases: [],
+  workspaceRuntimeEnvironments: [],
   selectedNodeId: null,
   pendingConnection: null,
   splitAgentProject: null,
   splitRatio: 0.56,
   validation: null,
+  validationOpen: false,
   exportResult: null,
   historyOpen: false,
   miniMapOpen: true,
@@ -224,19 +238,21 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   async initialize() {
     set({ loading: true, status: "正在加载历史 Agent" });
     try {
-      const [projects, storedTools, storedSkills, storedMcpServers, storedModelConfigs, storedRagKnowledgeBases] = await Promise.all([
+      const [projects, storedTools, storedSkills, storedMcpServers, storedModelConfigs, storedRagKnowledgeBases, storedRuntimeEnvironments] = await Promise.all([
         listProjects(),
         listWorkspaceTools(),
         listWorkspaceSkills(),
         listWorkspaceMcpServers(),
         listWorkspaceModelConfigs(),
         listWorkspaceRagKnowledgeBases(),
+        listWorkspaceRuntimeEnvironments(),
       ]);
       let workspaceTools = normalizeTools(storedTools);
       let workspaceSkills = normalizeSkills(storedSkills);
       let workspaceMcpServers = normalizeMcpServers(storedMcpServers);
       let workspaceModelConfigs = normalizeModelConfigs(storedModelConfigs);
       const workspaceRagKnowledgeBases = normalizeRagKnowledgeBases(storedRagKnowledgeBases);
+      const workspaceRuntimeEnvironments = normalizeRuntimeEnvironments(storedRuntimeEnvironments);
       let migratedResources = false;
       if (workspaceTools.length === 0) {
         const localTools = normalizeTools(readLocalArray<ToolConfig>(WORKSPACE_TOOLS_KEY));
@@ -297,6 +313,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
         workspaceMcpServers,
         workspaceModelConfigs,
         workspaceRagKnowledgeBases,
+        workspaceRuntimeEnvironments,
         selectedRunModelConfigId: pickModelConfigId(workspaceModelConfigs, null),
         status: migratedModels || migratedResources ? "历史 Agent 已加载，资源配置已迁移到后端" : "历史 Agent 已加载",
         loading: false,
@@ -317,7 +334,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
 
   async openProject(projectId) {
     set({ loading: true, status: "正在打开 Agent" });
-    const project = await getProject(projectId);
+    const project = ensureProjectRuntimeEnvironment(await getProject(projectId), get().workspaceRuntimeEnvironments);
     localStorage.setItem(PROJECT_KEY, project.project.id);
     set({
       mode: "editor",
@@ -326,6 +343,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       pendingConnection: null,
       splitAgentProject: null,
       validation: null,
+      validationOpen: false,
       exportResult: null,
       historyRecords: readHistory(project.project.id),
       selectedHistoryId: null,
@@ -352,7 +370,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     set({ loading: true, status: "正在创建 Agent" });
     const projectKind = kind ?? (get().managerView === "agents" ? "agents" : "agent");
     const fallbackName = projectKind === "agents" ? "新建 Agents" : "新建 Agent";
-    const project = await createProject(name.trim() || fallbackName, projectKind);
+    const project = ensureProjectRuntimeEnvironment(await createProject(name.trim() || fallbackName, projectKind), get().workspaceRuntimeEnvironments);
     localStorage.setItem(PROJECT_KEY, project.project.id);
     const projects = await listProjects();
     set({
@@ -363,6 +381,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       pendingConnection: null,
       splitAgentProject: null,
       validation: null,
+      validationOpen: false,
       exportResult: null,
       historyRecords: recordProjectHistory(project, "创建项目"),
       selectedHistoryId: null,
@@ -407,6 +426,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   },
 
   async backToManager() {
+    abortActiveRun();
     const project = get().project;
     if (project) {
       await get().save();
@@ -420,6 +440,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       pendingConnection: null,
       splitAgentProject: null,
       validation: null,
+      validationOpen: false,
       exportResult: null,
       historyOpen: false,
       miniMapOpen: true,
@@ -525,6 +546,36 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     }
   },
 
+  async updateWorkspaceRuntimeEnvironments(configs) {
+    const workspaceRuntimeEnvironments = normalizeRuntimeEnvironments(configs);
+    const project = get().project;
+    const projectPatch = project ? ensureProjectRuntimeEnvironment(project, workspaceRuntimeEnvironments) : null;
+    set({
+      workspaceRuntimeEnvironments,
+      project: projectPatch,
+      status: "正在保存运行环境",
+    });
+    try {
+      const savedRuntimeEnvironments = normalizeRuntimeEnvironments(await saveWorkspaceRuntimeEnvironments(workspaceRuntimeEnvironments));
+      set({
+        workspaceRuntimeEnvironments: savedRuntimeEnvironments,
+        project: projectPatch ? ensureProjectRuntimeEnvironment(projectPatch, savedRuntimeEnvironments) : null,
+        status: "运行环境已保存到后端",
+      });
+    } catch (error) {
+      set({ status: error instanceof Error ? error.message : "运行环境保存失败" });
+    }
+  },
+
+  setProjectRuntimeEnvironmentId(id) {
+    const project = get().project;
+    if (!project) return;
+    set({
+      project: { ...project, project: { ...project.project, runtimeEnvironmentId: id } },
+      status: "已切换运行环境",
+    });
+  },
+
   updateTools(tools) {
     const project = get().project;
     if (!project) return;
@@ -602,8 +653,13 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       set({ status: "一个项目只能有一个 Start 节点" });
       return;
     }
+    const existingNames = collectStateFieldNames(project);
+    const reservedNodeFields = collectNodeWriteFieldNames(project.nodes);
+    const suggestedConfig = uniqueNodeOutputConfig(type, node.config, existingNames, reservedNodeFields);
+    node.config = { ...node.config, ...suggestedConfig };
+    const nextFields = mergeStateFields(project.state.fields, stateFieldsForNode(node));
     set({
-      project: { ...project, nodes: [...project.nodes, node] },
+      project: { ...project, nodes: [...project.nodes, node], state: { ...project.state, fields: nextFields } },
       selectedNodeId: node.id,
       status: `已添加 ${node.label}`,
     });
@@ -631,25 +687,34 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       set({ status: "运行模式下不能编辑节点配置" });
       return;
     }
+    const beforeNode = project.nodes.find((node) => node.id === nodeId) ?? null;
+    let updatedNode: NodeIR | null = null;
+    const nodes = project.nodes.map((node) => {
+      if (node.id !== nodeId) return node;
+      const config = sanitizeNodeWriteConfig(node.type, { ...node.config, ...patch });
+      updatedNode = {
+        ...node,
+        config,
+        outputs:
+          node.type === "condition"
+            ? defaultOutputs("condition")
+            : node.type === "ai_router"
+              ? routerOutputsFromConfig(config)
+              : node.type === "human_approval"
+                ? defaultOutputs("human_approval")
+                : node.outputs,
+      };
+      return updatedNode;
+    });
+    const nextFields =
+      beforeNode && updatedNode
+        ? syncStateFieldsForNodeUpdate(project.state.fields, beforeNode, updatedNode, nodes)
+        : project.state.fields;
     set({
       project: {
         ...project,
-        nodes: project.nodes.map((node) => {
-          if (node.id !== nodeId) return node;
-          const config = { ...node.config, ...patch };
-          return {
-            ...node,
-            config,
-            outputs:
-              node.type === "condition"
-                ? defaultOutputs("condition")
-                : node.type === "ai_router"
-                  ? routerOutputsFromConfig(config)
-                  : node.type === "human_approval"
-                    ? defaultOutputs("human_approval")
-                    : node.outputs,
-          };
-        }),
+        nodes,
+        state: { ...project.state, fields: nextFields },
       },
     });
   },
@@ -703,7 +768,12 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     }
     const edge = buildReactFlowEdge(project, connection.source, connection.sourceHandle, connection.target, connection.targetHandle);
     const next = addEdge(edge, toReactFlowEdges(project));
-    set({ project: { ...project, edges: next.map(fromReactFlowEdge) }, pendingConnection: null, status: "已连接节点" });
+    const connectedProject = applyConnectionInputDefaults(
+      { ...project, edges: next.map(fromReactFlowEdge) },
+      connection.source,
+      connection.target,
+    );
+    set({ project: connectedProject, pendingConnection: null, status: "已连接节点" });
   },
 
   handlePortClick(nodeId, direction, handleId) {
@@ -734,8 +804,13 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
 
     const edge = buildReactFlowEdge(project, pending.source, pending.sourceHandle, nodeId, handleId);
     const next = addEdge(edge, toReactFlowEdges(project));
+    const connectedProject = applyConnectionInputDefaults(
+      { ...project, edges: next.map(fromReactFlowEdge) },
+      pending.source,
+      nodeId,
+    );
     set({
-      project: { ...project, edges: next.map(fromReactFlowEdge) },
+      project: connectedProject,
       pendingConnection: null,
       status: "已连接节点",
     });
@@ -785,6 +860,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     set({ historyOpen: false });
   },
 
+  closeValidationPanel() {
+    set({ validationOpen: false });
+  },
+
   selectHistoryRecord(selectedHistoryId) {
     set({ selectedHistoryId });
   },
@@ -805,6 +884,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       selectedNodeId: null,
       pendingConnection: null,
       validation: null,
+      validationOpen: false,
       exportResult: null,
       historyRecords: readHistory(saved.project.id),
       selectedHistoryId: recordId,
@@ -844,6 +924,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       pendingConnection: null,
       splitAgentProject: null,
       validation: null,
+      validationOpen: false,
       exportResult: null,
       historyOpen: false,
       historyRecords,
@@ -892,6 +973,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       selectedNodeId: null,
       pendingConnection: null,
       validation: null,
+      validationOpen: false,
       exportResult: null,
       historyRecords,
       templatesOpen: false,
@@ -962,6 +1044,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   },
 
   exitRunMode() {
+    abortActiveRun();
     set({
       runActive: false,
       runOpen: false,
@@ -1070,9 +1153,26 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     });
   },
 
+  cancelRun() {
+    if (!get().runRunning) {
+      set({ status: "当前没有正在运行的任务" });
+      return;
+    }
+    abortActiveRun();
+    set((state) => ({
+      runRunning: false,
+      runtimeNodes: markRuntimeNodesInterrupted(state.runtimeNodes),
+      status: "正在中断运行",
+    }));
+  },
+
   async runPreview() {
     const project = get().project;
     if (!project) return;
+    if (get().runRunning) {
+      set({ status: "已有运行任务正在执行" });
+      return;
+    }
     let input: Record<string, unknown>;
     try {
       input = JSON.parse(get().runInput || "{}") as Record<string, unknown>;
@@ -1088,6 +1188,13 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       set({ status: "请先在管理页添加并启用一个模型配置" });
       return;
     }
+    const runtimeEnvironments = normalizeRuntimeEnvironments(get().workspaceRuntimeEnvironments);
+    const selectedRuntimeEnvironment = pickRuntimeEnvironment(runtimeEnvironments, project.project.runtimeEnvironmentId);
+    abortActiveRun();
+    const runToken = nanoid();
+    const abortController = new AbortController();
+    activeRunToken = runToken;
+    activeRunAbortController = abortController;
     set({
       runMode,
       runActive: true,
@@ -1109,10 +1216,20 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       selectedRunModelConfigId,
     });
     try {
-      await streamProjectPreview(saved.project.id, input, runMode, selectedModelConfig, (event) => {
+      await streamProjectPreview(saved.project.id, input, runMode, selectedModelConfig, selectedRuntimeEnvironment ?? undefined, (event) => {
+        if (activeRunToken !== runToken) return;
         set((state) => applyRunStreamEvent(state, event));
-      });
+      }, abortController.signal);
     } catch (error) {
+      if (activeRunToken !== runToken) return;
+      if (isAbortError(error)) {
+        set((state) => ({
+          runRunning: false,
+          runtimeNodes: markRuntimeNodesInterrupted(state.runtimeNodes),
+          status: "运行已中断",
+        }));
+        return;
+      }
       const failedState = get();
       if (failedState.project && failedState.runResult) {
         const runHistoryRecords = recordRunHistory(
@@ -1133,6 +1250,11 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
         runRunning: false,
         status: error instanceof Error ? error.message : "真实运行失败",
       });
+    } finally {
+      if (activeRunToken === runToken) {
+        activeRunToken = null;
+        activeRunAbortController = null;
+      }
     }
   },
 
@@ -1195,6 +1317,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       project: saved,
       historyRecords,
       validation,
+      validationOpen: true,
       status: validation.valid ? "校验通过" : `校验发现 ${validation.issues.length} 个问题`,
     });
   },
@@ -1343,6 +1466,77 @@ function normalizeRagKnowledgeBases(configs: RagKnowledgeBaseConfig[]): RagKnowl
     }));
 }
 
+function normalizeRuntimeEnvironments(configs: RuntimeEnvironmentConfig[]): RuntimeEnvironmentConfig[] {
+  const normalized = configs
+    .filter((config) => config && typeof config.id === "string")
+    .map((config) => ({
+      id: config.id,
+      name: String(config.name || "本地后端"),
+      kind: "local_backend",
+      description: String(config.description || "由当前 FastAPI 后端所在机器执行工具。"),
+      allowedRootsJson: safeJsonList(config.allowedRootsJson, ["./"]),
+      networkEnabled: config.networkEnabled !== false,
+      allowedHostsJson: safeJsonList(config.allowedHostsJson, ["api.duckduckgo.com"]),
+      maxFileBytes: Math.max(1, Number(config.maxFileBytes || 1048576)),
+      maxHttpBytes: Math.max(1, Number(config.maxHttpBytes || 262144)),
+    }));
+  return normalized.length ? normalized : [newDefaultRuntimeEnvironment()];
+}
+
+function safeJsonList(value: unknown, fallback: string[]): string {
+  if (Array.isArray(value)) {
+    const items = value.map((item) => String(item).trim()).filter(Boolean);
+    return JSON.stringify(items.length ? items : fallback, null, 2);
+  }
+  const text = String(value ?? "").trim();
+  if (!text) return JSON.stringify(fallback, null, 2);
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      const items = parsed.map((item) => String(item).trim()).filter(Boolean);
+      return JSON.stringify(items.length ? items : fallback, null, 2);
+    }
+  } catch {
+    const items = text.split(/[;,\n]+/).map((item) => item.trim()).filter(Boolean);
+    return JSON.stringify(items.length ? items : fallback, null, 2);
+  }
+  return JSON.stringify(fallback, null, 2);
+}
+
+function newDefaultRuntimeEnvironment(): RuntimeEnvironmentConfig {
+  return {
+    id: "runtime_local_backend",
+    name: "本地后端",
+    kind: "local_backend",
+    description: "由当前 FastAPI 后端所在机器执行工具。",
+    allowedRootsJson: JSON.stringify(["./"], null, 2),
+    networkEnabled: true,
+    allowedHostsJson: JSON.stringify(["api.duckduckgo.com"], null, 2),
+    maxFileBytes: 1048576,
+    maxHttpBytes: 262144,
+  };
+}
+
+function pickRuntimeEnvironment(configs: RuntimeEnvironmentConfig[], currentId: string | null): RuntimeEnvironmentConfig | null {
+  if (currentId) {
+    const selected = configs.find((config) => config.id === currentId);
+    if (selected) return selected;
+  }
+  return configs[0] ?? null;
+}
+
+function ensureProjectRuntimeEnvironment(project: ProjectIR, configs: RuntimeEnvironmentConfig[]): ProjectIR {
+  const selected = pickRuntimeEnvironment(configs, project.project.runtimeEnvironmentId);
+  const runtimeEnvironmentId = project.project.runtimeEnvironmentId || selected?.id || "";
+  return {
+    ...project,
+    project: {
+      ...project.project,
+      runtimeEnvironmentId,
+    },
+  };
+}
+
 function normalizeModelConfigs(configs: ModelConfig[]): ModelConfig[] {
   const normalized = configs
     .filter((config) => config && typeof config.id === "string")
@@ -1405,6 +1599,303 @@ function inferApiFormat(provider: string) {
   if (provider === "azure_openai") return "azure_openai";
   if (provider === "ollama") return "ollama";
   return "openai_compatible";
+}
+
+function collectStateFieldNames(project: ProjectIR): Set<string> {
+  return new Set(project.state.fields.map((field) => field.name).filter(Boolean));
+}
+
+function collectNodeWriteFieldNames(nodes: NodeIR[]): Set<string> {
+  const names = new Set<string>();
+  for (const node of nodes) {
+    for (const field of stateFieldsForNode(node)) {
+      names.add(field.name);
+    }
+  }
+  return names;
+}
+
+function uniqueNodeOutputConfig(
+  type: NodeType,
+  config: Record<string, unknown>,
+  existingStateNames: Set<string>,
+  reservedNodeFieldNames: Set<string>,
+): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  const keys = stateWriteKeysForNodeType(type);
+  for (const key of keys) {
+    const current = normalizeFieldName(config[key]) || defaultWriteFieldName(type, key);
+    if (!current) continue;
+    if (!existingStateNames.has(current) && !reservedNodeFieldNames.has(current)) {
+      reservedNodeFieldNames.add(current);
+      patch[key] = current;
+      continue;
+    }
+    const unique = nextAvailableFieldName(current, new Set([...existingStateNames, ...reservedNodeFieldNames]));
+    reservedNodeFieldNames.add(unique);
+    patch[key] = unique;
+  }
+  return patch;
+}
+
+function sanitizeNodeWriteConfig(type: NodeType, config: Record<string, unknown>): Record<string, unknown> {
+  const next = { ...config };
+  for (const key of stateWriteKeysForNodeType(type)) {
+    const normalized = normalizeFieldName(next[key]) || defaultWriteFieldName(type, key);
+    if (normalized) {
+      next[key] = normalized;
+    }
+  }
+  return next;
+}
+
+function stateWriteKeysForNodeType(type: NodeType): string[] {
+  switch (type) {
+    case "ai_router":
+      return ["routeField", "reasonField"];
+    case "human_approval":
+      return ["actionField", "outputField"];
+    case "llm":
+    case "agent":
+    case "tool":
+    case "task_splitter":
+    case "parallel_tools":
+    case "retriever":
+    case "http":
+    case "direct_reply":
+    case "custom_function":
+    case "skill_node":
+    case "mcp_node":
+      return ["outputField"];
+    default:
+      return [];
+  }
+}
+
+function defaultWriteFieldName(type: NodeType, key: string): string {
+  if (type === "ai_router" && key === "routeField") return "route_key";
+  if (type === "ai_router" && key === "reasonField") return "route_reason";
+  if (type === "human_approval" && key === "actionField") return "approval_action";
+  if (type === "human_approval" && key === "outputField") return "approval_result";
+  switch (type) {
+    case "llm":
+    case "direct_reply":
+      return "final_answer";
+    case "agent":
+      return "agent_result";
+    case "tool":
+      return "tools_result";
+    case "task_splitter":
+      return "worker_tasks";
+    case "parallel_tools":
+      return "worker_results";
+    case "retriever":
+      return "retrieved_context";
+    case "http":
+      return "http_response";
+    case "custom_function":
+      return "custom_output";
+    case "skill_node":
+      return "skill_result";
+    case "mcp_node":
+      return "mcp_result";
+    default:
+      return "";
+  }
+}
+
+function stateFieldsForNode(node: NodeIR): StateField[] {
+  const config = node.config;
+  switch (node.type) {
+    case "start":
+      return [{ name: "messages", type: "str", description: `${node.label} 输入` }];
+    case "llm":
+      return [stateFieldFromConfig(config, "outputField", "final_answer", "str", `${node.label} 输出`)];
+    case "agent":
+      return [stateFieldFromConfig(config, "outputField", "agent_result", "str", `${node.label} 输出`)];
+    case "tool": {
+      const output = stateFieldFromConfig(config, "outputField", "tools_result", "str", `${node.label} 输出`);
+      return [
+        output,
+        {
+          name: `${output.name}_tool_calls`,
+          type: "list",
+          description: `${node.label} 工具调用记录`,
+        },
+      ];
+    }
+    case "task_splitter":
+      return [stateFieldFromConfig(config, "outputField", "worker_tasks", "list", `${node.label} 任务列表`)];
+    case "parallel_tools":
+      return [stateFieldFromConfig(config, "outputField", "worker_results", "list", `${node.label} Worker 结果`)];
+    case "retriever":
+      return [stateFieldFromConfig(config, "outputField", "retrieved_context", "str", `${node.label} 检索结果`)];
+    case "ai_router":
+      return [
+        stateFieldFromConfig(config, "routeField", "route_key", "str", `${node.label} 路由结果`),
+        stateFieldFromConfig(config, "reasonField", "route_reason", "str", `${node.label} 路由理由`),
+      ];
+    case "human_approval":
+      return [
+        stateFieldFromConfig(config, "actionField", "approval_action", "str", `${node.label} 审批动作`),
+        stateFieldFromConfig(config, "outputField", "approval_result", "dict", `${node.label} 审批结果`),
+      ];
+    case "http":
+      return [stateFieldFromConfig(config, "outputField", "http_response", "dict", `${node.label} 响应`)];
+    case "direct_reply":
+      return [stateFieldFromConfig(config, "outputField", "final_answer", "str", `${node.label} 最终回复`)];
+    case "custom_function":
+      return [stateFieldFromConfig(config, "outputField", "custom_output", "dict", `${node.label} 输出`)];
+    case "skill_node":
+      return [stateFieldFromConfig(config, "outputField", "skill_result", "str", `${node.label} 输出`)];
+    case "mcp_node":
+      return [stateFieldFromConfig(config, "outputField", "mcp_result", "dict", `${node.label} 输出`)];
+    default:
+      return [];
+  }
+}
+
+function stateFieldFromConfig(
+  config: Record<string, unknown>,
+  key: string,
+  fallback: string,
+  type: string,
+  description: string,
+): StateField {
+  return {
+    name: normalizeFieldName(config[key]) || fallback,
+    type,
+    description,
+  };
+}
+
+function mergeStateFields(existing: StateField[], additions: StateField[]): StateField[] {
+  const result = [...existing];
+  const names = new Set(result.map((field) => field.name));
+  for (const addition of additions) {
+    if (!addition.name || names.has(addition.name)) continue;
+    result.push(addition);
+    names.add(addition.name);
+  }
+  return result;
+}
+
+function syncStateFieldsForNodeUpdate(
+  existing: StateField[],
+  beforeNode: NodeIR,
+  afterNode: NodeIR,
+  nodesAfterUpdate: NodeIR[],
+): StateField[] {
+  const beforeFields = stateFieldsForNode(beforeNode);
+  const afterFields = stateFieldsForNode(afterNode);
+  let result = [...existing];
+  for (let index = 0; index < afterFields.length; index += 1) {
+    const beforeField = beforeFields[index];
+    const afterField = afterFields[index];
+    if (!afterField?.name) continue;
+    if (!beforeField?.name || beforeField.name === afterField.name) {
+      result = ensureStateField(result, afterField);
+      continue;
+    }
+
+    const oldIndex = result.findIndex((field) => field.name === beforeField.name);
+    const newExists = result.some((field) => field.name === afterField.name);
+    const oldNameStillUsed = isStateFieldUsedByOtherNodes(beforeField.name, nodesAfterUpdate, afterNode.id);
+    if (oldIndex >= 0 && !newExists && !oldNameStillUsed) {
+      result = result.map((field, fieldIndex) =>
+        fieldIndex === oldIndex
+          ? {
+              ...field,
+              name: afterField.name,
+              type: field.type || afterField.type,
+              description: field.description || afterField.description,
+            }
+          : field,
+      );
+      continue;
+    }
+    result = ensureStateField(result, afterField);
+  }
+  return result;
+}
+
+function ensureStateField(fields: StateField[], field: StateField): StateField[] {
+  if (!field.name) return fields;
+  if (fields.some((item) => item.name === field.name)) return fields;
+  return [...fields, field];
+}
+
+function isStateFieldUsedByOtherNodes(fieldName: string, nodes: NodeIR[], nodeId: string): boolean {
+  return nodes.some((node) => node.id !== nodeId && stateFieldsForNode(node).some((field) => field.name === fieldName));
+}
+
+function nextAvailableFieldName(baseName: string, used: Set<string>): string {
+  const normalized = normalizeFieldName(baseName) || "field";
+  if (!used.has(normalized)) return normalized;
+  for (let index = 1; index < 10000; index += 1) {
+    const candidate = `${normalized}_${index}`;
+    if (!used.has(candidate)) return candidate;
+  }
+  return `${normalized}_${Date.now()}`;
+}
+
+function normalizeFieldName(value: unknown): string {
+  return String(value ?? "").trim().replace(/[^a-zA-Z0-9_]/g, "_").replace(/^([^a-zA-Z_])/, "_$1");
+}
+
+function applyConnectionInputDefaults(project: ProjectIR, sourceId: string, targetId: string): ProjectIR {
+  const source = project.nodes.find((node) => node.id === sourceId);
+  const target = project.nodes.find((node) => node.id === targetId);
+  if (!source || !target) return project;
+  const sourceField = primaryOutputField(source);
+  if (!sourceField) return project;
+  const token = `{{ state.${sourceField} }}`;
+  const nodes = project.nodes.map((node) => {
+    if (node.id !== target.id) return node;
+    const patch = inputPatchForConnectedNode(node, token, sourceField);
+    return Object.keys(patch).length ? { ...node, config: { ...node.config, ...patch } } : node;
+  });
+  return { ...project, nodes };
+}
+
+function primaryOutputField(node: NodeIR): string {
+  if (node.type === "start") return "messages";
+  if (node.type === "ai_router") return normalizeFieldName(node.config.routeField) || "";
+  if (node.type === "human_approval") return normalizeFieldName(node.config.outputField) || "";
+  if (node.type === "condition") return "";
+  return normalizeFieldName(node.config.outputField) || "";
+}
+
+function inputPatchForConnectedNode(node: NodeIR, token: string, sourceField: string): Record<string, unknown> {
+  switch (node.type) {
+    case "llm":
+    case "agent":
+    case "tool":
+      return shouldReplaceStateTemplate(node.config.userPrompt) ? { userPrompt: token } : {};
+    case "retriever":
+      return shouldReplaceStateTemplate(node.config.query) ? { query: token } : {};
+    case "condition":
+      return shouldReplaceStateFieldName(node.config.field) ? { field: sourceField } : {};
+    case "ai_router":
+      return shouldReplaceStateTemplate(node.config.inputText) ? { inputText: token } : {};
+    case "direct_reply":
+      return shouldReplaceStateTemplate(node.config.template) ? { template: token } : {};
+    case "http":
+      return shouldReplaceStateTemplate(node.config.body) ? { body: token } : {};
+    default:
+      return {};
+  }
+}
+
+function shouldReplaceStateTemplate(value: unknown): boolean {
+  const text = String(value ?? "").trim();
+  if (!text) return true;
+  return /^{{\s*state\.[a-zA-Z_][a-zA-Z0-9_]*\s*}}$/.test(text);
+}
+
+function shouldReplaceStateFieldName(value: unknown): boolean {
+  const text = String(value ?? "").trim();
+  return !text || text === "intent";
 }
 
 function pickModelConfigId(configs: ModelConfig[], currentId: string | null): string | null {
@@ -1731,6 +2222,34 @@ function initializeRuntimeNodes(project: ProjectIR): Record<string, NodeRuntimeS
   return nodes;
 }
 
+function abortActiveRun() {
+  if (activeRunAbortController && !activeRunAbortController.signal.aborted) {
+    activeRunAbortController.abort();
+  }
+}
+
+function markRuntimeNodesInterrupted(nodes: Record<string, NodeRuntimeState>): Record<string, NodeRuntimeState> {
+  const now = new Date().toISOString();
+  const next: Record<string, NodeRuntimeState> = {};
+  for (const [nodeId, runtime] of Object.entries(nodes)) {
+    if (runtime.status === "running" || runtime.status === "queued") {
+      next[nodeId] = {
+        ...runtime,
+        status: "skipped",
+        detail: runtime.status === "running" ? "运行已中断" : "未执行，运行已中断",
+        updatedAt: now,
+      };
+    } else {
+      next[nodeId] = runtime;
+    }
+  }
+  return next;
+}
+
+function isAbortError(error: unknown) {
+  return Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
+}
+
 function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partial<ProjectStore> {
   const now = new Date().toISOString();
   if (event.event === "run_start") {
@@ -1796,6 +2315,60 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
       selectedNodeId: event.traceItem.nodeId,
     };
   }
+  if (event.event === "virtual_node_start") {
+    return {
+      runRunning: true,
+      runtimeNodes: {
+        ...state.runtimeNodes,
+        [event.nodeId]: {
+          status: "running",
+          label: event.label,
+          detail: "Worker 运行中",
+          durationMs: 0,
+          inputState: event.inputState,
+          outputDelta: {},
+          updatedAt: now,
+          virtual: true,
+          parentNodeId: event.parentNodeId,
+          nodeType: event.type,
+          position: event.position ?? null,
+        },
+      },
+      runResult: state.runResult
+        ? { ...state.runResult, valid: event.valid, issues: event.issues }
+        : { mode: event.mode, valid: event.valid, issues: event.issues, trace: [], outputState: event.inputState },
+      status: `正在运行：${event.label}`,
+      selectedNodeId: event.nodeId,
+    };
+  }
+  if (event.event === "virtual_node_end") {
+    const trace = upsertTraceItem(state.runResult?.trace ?? [], event.traceItem);
+    const nodeRuntime: NodeRuntimeState = {
+      status: event.traceItem.status,
+      label: event.traceItem.label,
+      detail: event.traceItem.detail,
+      durationMs: event.traceItem.durationMs,
+      inputState: event.traceItem.inputState,
+      outputDelta: event.traceItem.outputDelta,
+      updatedAt: now,
+      virtual: true,
+      parentNodeId: event.traceItem.parentNodeId ?? null,
+      nodeType: event.traceItem.type,
+      position: event.traceItem.position ?? null,
+    };
+    return {
+      runRunning: true,
+      runtimeNodes: {
+        ...state.runtimeNodes,
+        [event.traceItem.nodeId]: nodeRuntime,
+      },
+      runResult: state.runResult
+        ? { ...state.runResult, valid: event.valid, issues: event.issues, trace }
+        : { mode: event.mode, valid: event.valid, issues: event.issues, trace, outputState: {} },
+      status: event.traceItem.status === "error" ? `Worker 失败：${event.traceItem.label}` : `Worker 完成：${event.traceItem.label}`,
+      selectedNodeId: event.traceItem.nodeId,
+    };
+  }
   return {
     ...finalizeRunHistory(state, {
       mode: event.mode,
@@ -1829,10 +2402,11 @@ function formatShortTime(value: string) {
 }
 
 export function toReactFlowNodes(project: ProjectIR, runtimeNodes: Record<string, NodeRuntimeState> = {}): Node[] {
-  return project.nodes.map((node) => ({
+  const realNodes = project.nodes.map((node) => ({
     id: node.id,
     type: "agentNode",
     position: node.position,
+    zIndex: 2,
     data: {
       id: node.id,
       label: node.label,
@@ -1843,10 +2417,29 @@ export function toReactFlowNodes(project: ProjectIR, runtimeNodes: Record<string
       runtime: runtimeNodes[node.id] ?? null,
     },
   }));
+  const virtualEntries = Object.entries(runtimeNodes).filter(([, runtime]) => runtime.virtual);
+  const virtualPositions = layoutVirtualRuntimeNodes(project, virtualEntries);
+  const virtualNodes = virtualEntries
+    .map(([id, runtime], index) => ({
+      id,
+      type: "agentNode",
+      position: virtualPositions.get(id) ?? runtime.position ?? fallbackVirtualPosition(project, runtime.parentNodeId ?? "", index),
+      zIndex: 1,
+      data: {
+        id,
+        label: runtime.label,
+        nodeType: runtime.nodeType ?? "tool",
+        config: {},
+        inputs: [{ id: "in", type: "control", label: "任务" }],
+        outputs: [{ id: "out", type: "control", label: "结果" }],
+        runtime,
+      },
+    }));
+  return [...realNodes, ...virtualNodes];
 }
 
-export function toReactFlowEdges(project: ProjectIR): Edge[] {
-  return project.edges.map((edge) => ({
+export function toReactFlowEdges(project: ProjectIR, runtimeNodes: Record<string, NodeRuntimeState> = {}): Edge[] {
+  const realEdges = project.edges.map((edge) => ({
     id: edge.id,
     source: edge.source,
     sourceHandle: edge.sourceHandle ?? undefined,
@@ -1860,6 +2453,119 @@ export function toReactFlowEdges(project: ProjectIR): Edge[] {
       targetHandle: edge.targetHandle ?? null,
     },
   }));
+  const nextTargets = new Map<string, string>();
+  for (const edge of project.edges) {
+    if (!nextTargets.has(edge.source)) nextTargets.set(edge.source, edge.target);
+  }
+  const virtualEdges: Edge[] = [];
+  for (const [id, runtime] of Object.entries(runtimeNodes)) {
+    if (!runtime.virtual || !runtime.parentNodeId) continue;
+    virtualEdges.push({
+      id: `${runtime.parentNodeId}->${id}`,
+      source: runtime.parentNodeId,
+      target: id,
+      type: "smoothstep",
+      style: { stroke: "#0a0a0a", strokeDasharray: "5 5", strokeWidth: 1.4 },
+    });
+    const target = nextTargets.get(runtime.parentNodeId);
+    if (target) {
+      virtualEdges.push({
+        id: `${id}->${target}`,
+        source: id,
+        target,
+        type: "smoothstep",
+        style: { stroke: "#0a0a0a", strokeDasharray: "5 5", strokeWidth: 1.4 },
+      });
+    }
+  }
+  return [...realEdges, ...virtualEdges];
+}
+
+function fallbackVirtualPosition(project: ProjectIR, parentNodeId: string, index: number) {
+  const parent = project.nodes.find((node) => node.id === parentNodeId);
+  return {
+    x: (parent?.position.x ?? 360) + 120,
+    y: (parent?.position.y ?? 220) + 280 + index * 240,
+  };
+}
+
+const REAL_NODE_WIDTH = 300;
+const REAL_NODE_HEIGHT = 230;
+const VIRTUAL_NODE_WIDTH = 310;
+const VIRTUAL_NODE_HEIGHT = 230;
+const VIRTUAL_NODE_GAP = 28;
+const VIRTUAL_SAFE_PADDING = 88;
+
+function layoutVirtualRuntimeNodes(project: ProjectIR, entries: Array<[string, NodeRuntimeState]>): Map<string, Position> {
+  const positions = new Map<string, Position>();
+  const occupied = project.nodes.map((node) => rectFromPosition(node.position, REAL_NODE_WIDTH, REAL_NODE_HEIGHT, VIRTUAL_SAFE_PADDING));
+  const groups = new Map<string, Array<[string, NodeRuntimeState]>>();
+  for (const entry of entries) {
+    const parentId = entry[1].parentNodeId ?? "";
+    if (!groups.has(parentId)) groups.set(parentId, []);
+    groups.get(parentId)?.push(entry);
+  }
+  for (const [parentId, group] of groups) {
+    const parent = project.nodes.find((node) => node.id === parentId);
+    const ordered = [...group].sort(([left], [right]) => left.localeCompare(right));
+    const chosen = chooseVirtualGroupPositions(project, parent?.position ?? { x: 360, y: 220 }, ordered.length, occupied);
+    ordered.forEach(([id], index) => {
+      const position = chosen[index] ?? fallbackVirtualPosition(project, parentId, index);
+      positions.set(id, position);
+      occupied.push(rectFromPosition(position, VIRTUAL_NODE_WIDTH, VIRTUAL_NODE_HEIGHT, VIRTUAL_SAFE_PADDING));
+    });
+  }
+  return positions;
+}
+
+function chooseVirtualGroupPositions(project: ProjectIR, parent: Position, count: number, occupied: Rect[]): Position[] {
+  const totalHeight = count * VIRTUAL_NODE_HEIGHT + Math.max(0, count - 1) * VIRTUAL_NODE_GAP;
+  const maxRealX = Math.max(...project.nodes.map((node) => node.position.x), parent.x);
+  const maxRealY = Math.max(...project.nodes.map((node) => node.position.y), parent.y);
+  const minRealY = Math.min(...project.nodes.map((node) => node.position.y), parent.y);
+  const candidates = [
+    stackCandidate(parent.x + 360, parent.y - (totalHeight - VIRTUAL_NODE_HEIGHT) / 2, count),
+    stackCandidate(parent.x + 80, parent.y + REAL_NODE_HEIGHT + 150, count),
+    stackCandidate(parent.x + 80, parent.y - totalHeight - 150, count),
+    stackCandidate(maxRealX + 360, parent.y - (totalHeight - VIRTUAL_NODE_HEIGHT) / 2, count),
+    stackCandidate(parent.x + 80, maxRealY + REAL_NODE_HEIGHT + 160, count),
+    stackCandidate(parent.x + 80, minRealY - totalHeight - 160, count),
+  ];
+  return candidates.find((candidate) => !candidateCollides(candidate, occupied)) ?? candidates[1];
+}
+
+function stackCandidate(x: number, y: number, count: number): Position[] {
+  return Array.from({ length: count }, (_item, index) => ({
+    x,
+    y: y + index * (VIRTUAL_NODE_HEIGHT + VIRTUAL_NODE_GAP),
+  }));
+}
+
+function candidateCollides(candidate: Position[], occupied: Rect[]) {
+  return candidate.some((position) => {
+    const rect = rectFromPosition(position, VIRTUAL_NODE_WIDTH, VIRTUAL_NODE_HEIGHT, VIRTUAL_SAFE_PADDING);
+    return occupied.some((item) => rectsOverlap(rect, item));
+  });
+}
+
+interface Rect {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+}
+
+function rectFromPosition(position: Position, width: number, height: number, padding = 0): Rect {
+  return {
+    left: position.x - padding,
+    right: position.x + width + padding,
+    top: position.y - padding,
+    bottom: position.y + height + padding,
+  };
+}
+
+function rectsOverlap(a: Rect, b: Rect) {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
 }
 
 function fromReactFlowEdge(edge: Edge): EdgeIR {

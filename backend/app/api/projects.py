@@ -14,6 +14,7 @@ from app.config import EXPORTS_DIR, STORAGE_DIR, ensure_runtime_dirs
 from app.ir.sanitization import sanitized_project, sanitize_project_payload
 from app.ir.schemas import ProjectIR, create_default_project
 from app.ir.validation import validate_project
+from app.runtime_environment import RuntimeEnvironmentConfig, resolve_runtime_environment
 from app.runner import iter_project_preview_events, run_project_preview as run_project_preview_engine
 
 
@@ -67,6 +68,7 @@ class RunPreviewRequest(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     mode: Literal["dry", "live"] = "dry"
     modelConfig: RunModelConfig | None = None
+    runtimeEnvironment: RuntimeEnvironmentConfig | None = None
 
 
 class RunTraceItem(BaseModel):
@@ -78,6 +80,9 @@ class RunTraceItem(BaseModel):
     durationMs: float = 0
     inputState: dict[str, Any] = Field(default_factory=dict)
     outputDelta: dict[str, Any] = Field(default_factory=dict)
+    virtual: bool = False
+    parentNodeId: str | None = None
+    position: dict[str, float] | None = None
 
 
 class RunPreviewResponse(BaseModel):
@@ -181,6 +186,7 @@ def compile_saved_project(project_id: str) -> CompileResponse:
 def run_project_preview(project_id: str, payload: RunPreviewRequest | None = None) -> RunPreviewResponse:
     project = _read_project(project_id)
     request = payload or RunPreviewRequest()
+    runtime_environment = resolve_runtime_environment(request.runtimeEnvironment, project.project.runtime_environment_id)
     result = validate_project(project)
     if request.mode == "live" and not result.valid:
         trace: list[dict[str, Any]] = []
@@ -191,6 +197,7 @@ def run_project_preview(project_id: str, payload: RunPreviewRequest | None = Non
             request.input,
             request.mode,
             request.modelConfig.model_dump(by_alias=True) if request.modelConfig else None,
+            runtime_environment,
         )
     return RunPreviewResponse(
         mode=request.mode,
@@ -205,6 +212,7 @@ def run_project_preview(project_id: str, payload: RunPreviewRequest | None = Non
 def stream_project_preview(project_id: str, payload: RunPreviewRequest | None = None) -> StreamingResponse:
     project = _read_project(project_id)
     request = payload or RunPreviewRequest(mode="live")
+    runtime_environment = resolve_runtime_environment(request.runtimeEnvironment, project.project.runtime_environment_id)
 
     def events():
         result = validate_project(project)
@@ -235,6 +243,7 @@ def stream_project_preview(project_id: str, payload: RunPreviewRequest | None = 
             request.input,
             request.mode,
             request.modelConfig.model_dump(by_alias=True) if request.modelConfig else None,
+            runtime_environment,
         ):
             event["mode"] = request.mode
             event["valid"] = result.valid

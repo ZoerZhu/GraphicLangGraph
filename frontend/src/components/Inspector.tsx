@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
-import { X } from "lucide-react";
+import { Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { useProjectStore } from "../store/projectStore";
-import type { MCPServerConfig, ModelConfig, RagKnowledgeBaseConfig, SkillConfig, StateField, ToolConfig } from "../types";
+import type { MCPServerConfig, ModelConfig, NodeIR, RagKnowledgeBaseConfig, SkillConfig, StateField, ToolConfig } from "../types";
 import { FloatingPanel } from "./FloatingPanel";
 
 export function Inspector() {
@@ -34,6 +34,7 @@ export function Inspector() {
   );
   const availableModelConfigs = useMemo(() => buildModelConfigOptions(workspaceModelConfigs), [workspaceModelConfigs]);
   const availableRagKnowledgeBases = useMemo(() => workspaceRagKnowledgeBases.filter((item) => item.enabled), [workspaceRagKnowledgeBases]);
+  const detectedStateFields = useMemo(() => detectStateFieldsFromNodes(project?.nodes ?? []), [project?.nodes]);
 
   if (!project || !node || runActive) {
     return null;
@@ -70,14 +71,11 @@ export function Inspector() {
               <option value="webhook">Webhook</option>
             </select>
           </Field>
-          <Field label="State 字段">
-            <textarea
-              rows={6}
-              value={stateFieldsToText(project.state.fields)}
-              onChange={(event) => setStateFields(parseStateFields(event.target.value))}
-              placeholder="final_answer:str&#10;intent:str&#10;order_info:dict"
-            />
-          </Field>
+          <StateFieldEditor
+            fields={project.state.fields}
+            detectedFields={detectedStateFields}
+            onChange={setStateFields}
+          />
         </>
       )}
       {node.type === "llm" && (
@@ -218,6 +216,123 @@ export function Inspector() {
               />
             </Field>
           </div>
+        </>
+      )}
+      {node.type === "task_splitter" && (
+        <>
+          <Field label="规划输入字段">
+            <input
+              value={String(node.config.inputField ?? "task_plan")}
+              onChange={(event) => updateNodeConfig(node.id, { inputField: event.target.value })}
+            />
+          </Field>
+          <div className="inline-grid">
+            <Field label="任务输出字段">
+              <input
+                value={String(node.config.outputField ?? "worker_tasks")}
+                onChange={(event) => updateNodeConfig(node.id, { outputField: event.target.value })}
+              />
+            </Field>
+            <Field label="最大任务数">
+              <input
+                type="number"
+                min={1}
+                max={10}
+                value={String(node.config.maxTasks ?? 5)}
+                onChange={(event) => updateNodeConfig(node.id, { maxTasks: Number(event.target.value) })}
+              />
+            </Field>
+          </div>
+          <Field label="解析失败兜底">
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={node.config.fallbackToSingleTask !== false}
+                onChange={(event) => updateNodeConfig(node.id, { fallbackToSingleTask: event.target.checked })}
+              />
+              <span>无法解析任务 JSON 时，用用户问题生成一个单任务</span>
+            </label>
+          </Field>
+        </>
+      )}
+      {node.type === "parallel_tools" && (
+        <>
+          <ModelSelectionFields
+            config={node.config}
+            defaultModel="gpt-4.1-mini"
+            defaultProvider="openai"
+            modelConfigs={availableModelConfigs}
+            nodeId={node.id}
+            providerLabel="Worker 模型配置"
+            providerManualLabel="Worker 模型供应商标识"
+            providerNote="每个并行 Worker 都会使用这个模型自主选择并调用已选 Tools。"
+            updateNodeConfig={updateNodeConfig}
+          />
+          <Field label="Worker 指令">
+            <textarea
+              rows={5}
+              value={String(node.config.systemPrompt ?? "")}
+              onChange={(event) => updateNodeConfig(node.id, { systemPrompt: event.target.value })}
+            />
+          </Field>
+          <Field label="可用 Tools">
+            <ToolMultiSelect
+              tools={availableTools}
+              selectedIds={parseStringList(node.config.toolIdsJson)}
+              onChange={(ids) => {
+                const selectedTools = availableTools.filter((tool) => ids.includes(tool.id));
+                updateNodeConfig(node.id, {
+                  toolIdsJson: JSON.stringify(ids),
+                  toolRegistryJson: JSON.stringify(selectedTools),
+                  tools: selectedTools.map((tool) => tool.name).join(","),
+                });
+              }}
+            />
+          </Field>
+          <div className="inline-grid">
+            <Field label="任务字段">
+              <input
+                value={String(node.config.tasksField ?? "worker_tasks")}
+                onChange={(event) => updateNodeConfig(node.id, { tasksField: event.target.value })}
+              />
+            </Field>
+            <Field label="输出字段">
+              <input
+                value={String(node.config.outputField ?? "worker_results")}
+                onChange={(event) => updateNodeConfig(node.id, { outputField: event.target.value })}
+              />
+            </Field>
+          </div>
+          <div className="inline-grid">
+            <Field label="每任务轮次">
+              <input
+                type="number"
+                min={1}
+                max={12}
+                value={String(node.config.maxIterationsPerTask ?? 6)}
+                onChange={(event) => updateNodeConfig(node.id, { maxIterationsPerTask: Number(event.target.value) })}
+              />
+            </Field>
+            <Field label="并发 Worker">
+              <input
+                type="number"
+                min={1}
+                max={6}
+                value={String(node.config.maxConcurrentWorkers ?? 3)}
+                onChange={(event) => updateNodeConfig(node.id, { maxConcurrentWorkers: Number(event.target.value) })}
+              />
+            </Field>
+          </div>
+          <Field label="保存调用记录">
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={Boolean(node.config.storeToolCalls)}
+                onChange={(event) => updateNodeConfig(node.id, { storeToolCalls: event.target.checked })}
+              />
+              <span>仅调试时开启，会增加 worker_results 的体积</span>
+            </label>
+          </Field>
         </>
       )}
       {node.type === "retriever" && (
@@ -683,6 +798,126 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+interface DetectedStateField extends StateField {
+  sourceNodeId: string;
+  sourceLabel: string;
+}
+
+const STATE_TYPE_OPTIONS = ["str", "int", "float", "bool", "dict", "list", "Any"];
+
+function StateFieldEditor({
+  fields,
+  detectedFields,
+  onChange,
+}: {
+  fields: StateField[];
+  detectedFields: DetectedStateField[];
+  onChange: (fields: StateField[]) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const existingNames = new Set(fields.map((field) => field.name).filter(Boolean));
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredDetected = normalizedQuery
+    ? detectedFields.filter((field) =>
+        `${field.name} ${field.type} ${field.sourceLabel} ${field.description ?? ""}`.toLowerCase().includes(normalizedQuery),
+      )
+    : detectedFields;
+
+  const updateField = (index: number, patch: Partial<StateField>) => {
+    onChange(fields.map((field, fieldIndex) => (fieldIndex === index ? { ...field, ...patch } : field)));
+  };
+
+  const addField = (field?: StateField) => {
+    const next = field ?? { name: nextManualStateFieldName(fields), type: "str", description: "" };
+    onChange(mergeInspectorStateFields(fields, [next]));
+  };
+
+  return (
+    <div className="state-field-editor">
+      <div className="state-field-editor__header">
+        <span>State 字段</span>
+        <div className="state-field-editor__actions">
+          <button type="button" onClick={() => addField()}>
+            <Plus size={14} />
+            添加字段
+          </button>
+          <button type="button" onClick={() => onChange(mergeInspectorStateFields(fields, detectedFields))}>
+            <RefreshCw size={14} />
+            同步识别字段
+          </button>
+        </div>
+      </div>
+
+      <div className="state-field-editor__rows">
+        {fields.length === 0 ? (
+          <div className="state-field-editor__empty">当前还没有声明 State 字段。</div>
+        ) : (
+          fields.map((field, index) => (
+            <div key={`${field.name}-${index}`} className="state-field-row">
+              <input
+                value={field.name}
+                onChange={(event) => updateField(index, { name: normalizeStateFieldName(event.target.value) })}
+                placeholder="字段名"
+              />
+              <select value={field.type || "str"} onChange={(event) => updateField(index, { type: event.target.value })}>
+                {STATE_TYPE_OPTIONS.map((type) => (
+                  <option key={type} value={type}>
+                    {type}
+                  </option>
+                ))}
+              </select>
+              <button
+                className="icon-only state-field-row__delete"
+                type="button"
+                title="删除字段"
+                onClick={() => onChange(fields.filter((_field, fieldIndex) => fieldIndex !== index))}
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))
+        )}
+      </div>
+
+      <div className="state-detected">
+        <div className="state-detected__title">
+          <span>可识别字段</span>
+          <small>{detectedFields.length} 个</small>
+        </div>
+        <input
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="搜索字段、类型或节点"
+        />
+        <div className="state-detected__list">
+          {filteredDetected.length === 0 ? (
+            <div className="state-field-editor__empty">没有匹配字段</div>
+          ) : (
+            filteredDetected.map((field) => {
+              const exists = existingNames.has(field.name);
+              return (
+                <button
+                  key={`${field.sourceNodeId}-${field.name}`}
+                  className={exists ? "is-added" : ""}
+                  type="button"
+                  disabled={exists}
+                  onClick={() => addField(field)}
+                >
+                  <span>
+                    <strong>{field.name}</strong>
+                    <small>{field.sourceLabel}</small>
+                  </span>
+                  <em>{exists ? "已添加" : field.type || "str"}</em>
+                </button>
+              );
+            })
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SkillMultiSelect({
   skills,
   selectedIds,
@@ -762,11 +997,24 @@ function ToolMultiSelect({
               <span>
                 <strong>{tool.name}</strong>
                 <small>{tool.source || "tool"} · {tool.description || "未填写描述"}</small>
+                <ToolUsageTags tool={tool} />
               </span>
             </label>
           ))
         )}
       </div>
+    </div>
+  );
+}
+
+function ToolUsageTags({ tool }: { tool: ToolConfig }) {
+  const tags = toolUsageTags(tool);
+  if (!tags.length) return null;
+  return (
+    <div className="tool-usage-tags">
+      {tags.map((tag) => (
+        <em key={tag}>{tag}</em>
+      ))}
     </div>
   );
 }
@@ -783,6 +1031,129 @@ function parseStringList(value: unknown): string[] {
   } catch {
     return text.split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean);
   }
+}
+
+function toolUsageTags(tool: ToolConfig): string[] {
+  const builtinId = toolBuiltinId(tool);
+  const text = `${builtinId} ${tool.name} ${tool.description} ${tool.source}`.toLowerCase();
+  const tags: string[] = [];
+  if (/(read_file|list_directory|file|directory|asset|resolve_asset|文件|目录|资源)/.test(text)) tags.push("文件");
+  if (/(code|symbol|chunk|search_code|python|javascript|typescript|代码|符号)/.test(text)) tags.push("代码");
+  if (/(html|page|selector|页面)/.test(text)) tags.push("HTML");
+  if (/(css|style|scss|less|样式)/.test(text)) tags.push("CSS");
+  if (/(web_search|fetch_url|duckduckgo|http|network|搜索|网络)/.test(text)) tags.push("网络");
+  return Array.from(new Set(tags));
+}
+
+function toolBuiltinId(tool: ToolConfig): string {
+  try {
+    const schema = JSON.parse(tool.schemaJson || "{}");
+    const metadata = schema && typeof schema === "object" && !Array.isArray(schema) ? schema["x-graphic"] : null;
+    return metadata && typeof metadata === "object" && "builtinId" in metadata ? String((metadata as { builtinId?: unknown }).builtinId || "") : "";
+  } catch {
+    return "";
+  }
+}
+
+function detectStateFieldsFromNodes(nodes: NodeIR[]): DetectedStateField[] {
+  const fields: DetectedStateField[] = [];
+  for (const node of nodes) {
+    switch (node.type) {
+      case "start":
+        fields.push(detectedField(node, "messages", "str", "聊天输入"));
+        break;
+      case "llm":
+        fields.push(detectedFieldFromConfig(node, "outputField", "final_answer", "str", "模型输出"));
+        break;
+      case "agent":
+        fields.push(detectedFieldFromConfig(node, "outputField", "agent_result", "str", "Agent 输出"));
+        break;
+      case "tool": {
+        const output = detectedFieldFromConfig(node, "outputField", "tools_result", "str", "Tools 输出");
+        fields.push(output);
+        fields.push(detectedField(node, `${output.name}_tool_calls`, "list", "工具调用记录"));
+        break;
+      }
+      case "retriever":
+        fields.push(detectedFieldFromConfig(node, "outputField", "retrieved_context", "str", "检索结果"));
+        break;
+      case "ai_router":
+        fields.push(detectedFieldFromConfig(node, "routeField", "route_key", "str", "路由结果"));
+        fields.push(detectedFieldFromConfig(node, "reasonField", "route_reason", "str", "路由理由"));
+        break;
+      case "human_approval":
+        fields.push(detectedFieldFromConfig(node, "actionField", "approval_action", "str", "审批动作"));
+        fields.push(detectedFieldFromConfig(node, "outputField", "approval_result", "dict", "审批结果"));
+        break;
+      case "http":
+        fields.push(detectedFieldFromConfig(node, "outputField", "http_response", "dict", "HTTP 响应"));
+        break;
+      case "direct_reply":
+        fields.push(detectedFieldFromConfig(node, "outputField", "final_answer", "str", "最终回复"));
+        break;
+      case "custom_function":
+        fields.push(detectedFieldFromConfig(node, "outputField", "custom_output", "dict", "函数输出"));
+        break;
+      case "skill_node":
+        fields.push(detectedFieldFromConfig(node, "outputField", "skill_result", "str", "Skill 输出"));
+        break;
+      case "mcp_node":
+        fields.push(detectedFieldFromConfig(node, "outputField", "mcp_result", "dict", "MCP 输出"));
+        break;
+      default:
+        break;
+    }
+  }
+  return fields.filter((field) => Boolean(field.name));
+}
+
+function detectedFieldFromConfig(
+  node: NodeIR,
+  configKey: string,
+  fallback: string,
+  type: string,
+  description: string,
+): DetectedStateField {
+  return detectedField(node, normalizeStateFieldName(node.config[configKey]) || fallback, type, description);
+}
+
+function detectedField(node: NodeIR, name: string, type: string, description: string): DetectedStateField {
+  return {
+    name: normalizeStateFieldName(name),
+    type,
+    description,
+    sourceNodeId: node.id,
+    sourceLabel: node.label || node.type,
+  };
+}
+
+function mergeInspectorStateFields(existing: StateField[], additions: StateField[]): StateField[] {
+  const result = [...existing];
+  const names = new Set(result.map((field) => field.name).filter(Boolean));
+  for (const addition of additions) {
+    const name = normalizeStateFieldName(addition.name);
+    if (!name || names.has(name)) continue;
+    result.push({
+      name,
+      type: addition.type || "str",
+      description: addition.description || "",
+    });
+    names.add(name);
+  }
+  return result;
+}
+
+function nextManualStateFieldName(fields: StateField[]): string {
+  const used = new Set(fields.map((field) => field.name));
+  for (let index = 1; index < 10000; index += 1) {
+    const candidate = `field_${index}`;
+    if (!used.has(candidate)) return candidate;
+  }
+  return `field_${Date.now()}`;
+}
+
+function normalizeStateFieldName(value: unknown): string {
+  return String(value ?? "").trim().replace(/[^a-zA-Z0-9_]/g, "_").replace(/^([^a-zA-Z_])/, "_$1");
 }
 
 function inspectorInitialRect() {
@@ -933,22 +1304,6 @@ function ModelSelectionFields({
       )}
     </>
   );
-}
-
-function stateFieldsToText(fields: StateField[]): string {
-  return fields.map((field) => `${field.name}:${field.type}`).join("\n");
-}
-
-function parseStateFields(value: string): StateField[] {
-  return value
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [name, type = "str"] = line.split(":");
-      return { name: name.trim(), type: type.trim(), description: "" };
-    })
-    .filter((field) => Boolean(field.name));
 }
 
 function mergeById<T extends ToolConfig | MCPServerConfig>(items: T[]): T[] {

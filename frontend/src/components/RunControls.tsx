@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef } from "react";
-import { LoaderCircle, Play } from "lucide-react";
+import { LoaderCircle, Play, Square } from "lucide-react";
 import type { ModelConfig, ProjectIR, StateField } from "../types";
 
 export interface RunInputField {
@@ -81,11 +81,27 @@ export function RunStartButton({
   disabled = false,
   running = false,
   onRun,
+  onStop,
 }: {
   disabled?: boolean;
   running?: boolean;
   onRun: () => void;
+  onStop?: () => void;
 }) {
+  if (running && onStop) {
+    return (
+      <button
+        aria-label="中断运行"
+        className="run-button run-button--icon is-stop"
+        onClick={onStop}
+        title="中断当前运行"
+        type="button"
+      >
+        <Square size={15} />
+      </button>
+    );
+  }
+
   return (
     <button
       aria-label={running ? "运行中" : "开始真实运行"}

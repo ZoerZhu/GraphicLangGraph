@@ -25,6 +25,7 @@ export function RunPreviewPanel() {
   const setRunInput = useProjectStore((state) => state.setRunInput);
   const setSelectedRunModelConfigId = useProjectStore((state) => state.setSelectedRunModelConfigId);
   const runPreview = useProjectStore((state) => state.runPreview);
+  const cancelRun = useProjectStore((state) => state.cancelRun);
   const selectNode = useProjectStore((state) => state.selectNode);
   const selectRunHistoryRecord = useProjectStore((state) => state.selectRunHistoryRecord);
   const setRunHistoryReplayMode = useProjectStore((state) => state.setRunHistoryReplayMode);
@@ -95,7 +96,12 @@ export function RunPreviewPanel() {
               selectedModelId={selectedRunModelConfigId}
               onChange={setSelectedRunModelConfigId}
             />
-            <RunStartButton disabled={enabledModels.length === 0} running={runRunning} onRun={() => void runPreview()} />
+            <RunStartButton
+              disabled={enabledModels.length === 0}
+              running={runRunning}
+              onRun={() => void runPreview()}
+              onStop={cancelRun}
+            />
           </div>
         </section>
 

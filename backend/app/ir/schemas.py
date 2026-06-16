@@ -12,6 +12,8 @@ class NodeType(StrEnum):
     LLM = "llm"
     AGENT = "agent"
     TOOL = "tool"
+    TASK_SPLITTER = "task_splitter"
+    PARALLEL_TOOLS = "parallel_tools"
     RETRIEVER = "retriever"
     CONDITION = "condition"
     AI_ROUTER = "ai_router"
@@ -60,6 +62,7 @@ class ProjectMeta(BaseModel):
     name: str = "Untitled Agent"
     description: str = ""
     kind: str = "agent"
+    runtime_environment_id: str = Field("", alias="runtimeEnvironmentId")
     schema_version: str = Field("0.1.0", alias="schemaVersion")
 
 

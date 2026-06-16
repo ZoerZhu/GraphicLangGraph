@@ -5,6 +5,8 @@ export const NodeTypeSchema = z.enum([
   "llm",
   "agent",
   "tool",
+  "task_splitter",
+  "parallel_tools",
   "retriever",
   "condition",
   "ai_router",
@@ -23,6 +25,7 @@ export const ProjectSchema = z.object({
       name: z.string(),
       description: z.string(),
       kind: z.enum(["agent", "agents"]).default("agent"),
+      runtimeEnvironmentId: z.string().default(""),
       schemaVersion: z.string(),
   }),
   state: z.object({
@@ -193,6 +196,20 @@ export const ModelConfigSchema = z.object({
 
 export const ModelConfigListSchema = z.array(ModelConfigSchema);
 
+export const RuntimeEnvironmentConfigSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  kind: z.string(),
+  description: z.string(),
+  allowedRootsJson: z.string(),
+  networkEnabled: z.boolean(),
+  allowedHostsJson: z.string(),
+  maxFileBytes: z.number(),
+  maxHttpBytes: z.number(),
+});
+
+export const RuntimeEnvironmentConfigListSchema = z.array(RuntimeEnvironmentConfigSchema);
+
 export const EnvVarCheckSchema = z.object({
   valid: z.boolean(),
   exists: z.boolean(),
@@ -319,6 +336,9 @@ export const RunPreviewResultSchema = z.object({
       durationMs: z.number(),
       inputState: z.record(z.unknown()),
       outputDelta: z.record(z.unknown()),
+      virtual: z.boolean().optional().default(false),
+      parentNodeId: z.string().nullable().optional(),
+      position: z.object({ x: z.number(), y: z.number() }).nullable().optional(),
     }),
   ),
   outputState: z.record(z.unknown()),

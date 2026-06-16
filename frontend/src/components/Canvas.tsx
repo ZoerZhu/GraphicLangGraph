@@ -89,7 +89,7 @@ function CanvasInner() {
     >
       <ReactFlow
         nodes={nodes}
-        edges={toReactFlowEdges(project)}
+        edges={toReactFlowEdges(project, runActive ? runtimeNodes : {})}
         nodeTypes={nodeTypes}
         onNodesChange={runActive ? undefined : onNodesChange}
         onEdgesChange={runActive ? undefined : onEdgesChange}

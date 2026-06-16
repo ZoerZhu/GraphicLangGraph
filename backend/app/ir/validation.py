@@ -96,6 +96,10 @@ def validate_project(project: ProjectIR) -> ValidationResult:
             _validate_agent(node.id, node.config, issues)
         if node.type == NodeType.TOOL:
             _validate_tool(node.id, node.config, issues)
+        if node.type == NodeType.TASK_SPLITTER:
+            _validate_task_splitter(node.id, node.config, issues)
+        if node.type == NodeType.PARALLEL_TOOLS:
+            _validate_parallel_tools(node.id, node.config, issues)
         if node.type == NodeType.HTTP:
             _validate_http(node.id, node.config, issues)
         if node.type == NodeType.CUSTOM_FUNCTION:
@@ -355,6 +359,40 @@ def _validate_tool(node_id: str, config: dict, issues: list[ValidationIssue]) ->
         issues.append(_issue("TOOL_PARAMS_OBJECT", "Tool 参数 Schema 必须是 JSON object。", nodeId=node_id, field="paramsJson"))
 
 
+def _validate_task_splitter(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
+    if not _clean_field(config.get("inputField")):
+        issues.append(_issue("TASK_SPLITTER_INPUT_FIELD", "Task Splitter 必须配置输入字段。", nodeId=node_id, field="inputField"))
+    if not _clean_field(config.get("outputField")):
+        issues.append(_issue("TASK_SPLITTER_OUTPUT_FIELD", "Task Splitter 必须配置输出字段。", nodeId=node_id, field="outputField"))
+    try:
+        max_tasks = int(config.get("maxTasks", 5))
+    except (TypeError, ValueError):
+        max_tasks = 0
+    if max_tasks < 1 or max_tasks > 10:
+        issues.append(_issue("TASK_SPLITTER_MAX_TASKS", "Task Splitter 最大任务数必须在 1-10 之间。", nodeId=node_id, field="maxTasks"))
+
+
+def _validate_parallel_tools(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
+    if not _clean_field(config.get("tasksField")):
+        issues.append(_issue("PARALLEL_TOOLS_TASKS_FIELD", "Parallel Tools 必须配置任务字段。", nodeId=node_id, field="tasksField"))
+    if not _clean_field(config.get("outputField")):
+        issues.append(_issue("PARALLEL_TOOLS_OUTPUT_FIELD", "Parallel Tools 必须配置输出字段。", nodeId=node_id, field="outputField"))
+    try:
+        max_iterations = int(config.get("maxIterationsPerTask", 6))
+    except (TypeError, ValueError):
+        max_iterations = 0
+    if max_iterations < 1:
+        issues.append(_issue("PARALLEL_TOOLS_MAX_ITERATIONS", "Parallel Tools 每个任务最大调用轮次必须大于 0。", nodeId=node_id, field="maxIterationsPerTask"))
+    try:
+        max_concurrent = int(config.get("maxConcurrentWorkers", 3))
+    except (TypeError, ValueError):
+        max_concurrent = 0
+    if max_concurrent < 1 or max_concurrent > 6:
+        issues.append(_issue("PARALLEL_TOOLS_CONCURRENCY", "Parallel Tools 并发数必须在 1-6 之间。", nodeId=node_id, field="maxConcurrentWorkers"))
+    if not _has_selected_tools(config):
+        issues.append(_issue("PARALLEL_TOOLS_REQUIRED", "Parallel Tools 至少需要选择一个 Tool。", nodeId=node_id, field="toolIdsJson"))
+
+
 def _validate_custom_function(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
     code = str(config.get("code", "return {}"))
     try:
@@ -395,6 +433,10 @@ def _state_writes_for_node(node_type: NodeType, config: dict[str, Any]) -> set[s
         return {_clean_field(config.get("outputField", ""))}
     if node_type == NodeType.TOOL:
         return {_clean_field(config.get("outputField", ""))}
+    if node_type == NodeType.TASK_SPLITTER:
+        return {_clean_field(config.get("outputField", ""))}
+    if node_type == NodeType.PARALLEL_TOOLS:
+        return {_clean_field(config.get("outputField", ""))}
     if node_type == NodeType.RETRIEVER:
         return {_clean_field(config.get("outputField", ""))}
     if node_type == NodeType.HTTP:
@@ -408,6 +450,23 @@ def _state_writes_for_node(node_type: NodeType, config: dict[str, Any]) -> set[s
     if node_type in {NodeType.CUSTOM_FUNCTION, NodeType.SKILL_NODE, NodeType.MCP_NODE}:
         return {_clean_field(config.get("outputField", ""))}
     return set()
+
+
+def _has_selected_tools(config: dict[str, Any]) -> bool:
+    for key in ("toolIdsJson", "toolRegistryJson"):
+        value = config.get(key)
+        if isinstance(value, list) and value:
+            return True
+        text = str(value or "").strip()
+        if not text:
+            continue
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(parsed, list) and parsed:
+            return True
+    return bool(str(config.get("tools", "")).strip())
 
 
 def _clean_field(value: Any) -> str:

@@ -39,6 +39,8 @@ const ICONS = {
   llm: Sparkles,
   agent: BrainCircuit,
   tool: Wrench,
+  task_splitter: Route,
+  parallel_tools: Wrench,
   retriever: Database,
   condition: GitBranch,
   ai_router: Route,
@@ -58,19 +60,21 @@ export function AgentNode({ id, data, selected }: { id: string; data: AgentNodeD
   const selectNode = useProjectStore((state) => state.selectNode);
   const runActive = useProjectStore((state) => state.runActive);
   const summary = nodeSummary(data.nodeType, data.config);
-  const selectedTools = data.nodeType === "tool" ? selectedToolNames(data.config) : [];
+  const selectedTools = data.nodeType === "tool" || data.nodeType === "parallel_tools" ? selectedToolNames(data.config) : [];
   const runtime = data.runtime ?? null;
   const [runtimeOpen, setRuntimeOpen] = useState(false);
   const hasRuntimeOutput = Boolean(runtime && Object.keys(runtime.outputDelta).length);
   const runtimeClass = runtime ? `is-runtime-${runtime.status}` : "";
+  const virtualClass = runtime?.virtual ? "is-virtual-worker" : "";
   const nodeRunning = runtime?.status === "running";
   return (
     <div
-      className={`agent-node-frame ${runtimeClass}`}
+      className={`agent-node-frame ${runtimeClass} ${virtualClass}`}
     >
       <div
-        className={`agent-node ${hasManyOutputs ? "has-ports" : ""} ${selected ? "is-selected" : ""} ${runtimeClass}`}
+        className={`agent-node ${hasManyOutputs ? "has-ports" : ""} ${selected ? "is-selected" : ""} ${runtimeClass} ${virtualClass}`}
         data-node-type={data.nodeType}
+        data-virtual={runtime?.virtual ? "true" : "false"}
         onClick={() => selectNode(id)}
       >
         {data.inputs.map((port, index) => (
@@ -234,6 +238,7 @@ function StartNodeRunControls() {
   const setRunInput = useProjectStore((state) => state.setRunInput);
   const setSelectedRunModelConfigId = useProjectStore((state) => state.setSelectedRunModelConfigId);
   const runPreview = useProjectStore((state) => state.runPreview);
+  const cancelRun = useProjectStore((state) => state.cancelRun);
 
   return (
     <div className={`agent-node__start-run nodrag nopan ${open ? "is-open" : "is-collapsed"}`} onClick={(event) => event.stopPropagation()}>
@@ -258,7 +263,7 @@ function StartNodeRunControls() {
           selectedModelId={selectedRunModelConfigId}
           onChange={setSelectedRunModelConfigId}
         />
-        <RunStartButton running={runRunning} onRun={() => void runPreview()} />
+        <RunStartButton running={runRunning} onRun={() => void runPreview()} onStop={cancelRun} />
       </div>
     </div>
   );
@@ -287,6 +292,18 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
         { label: "Tools", value: selectedToolNames(config).length ? `${selectedToolNames(config).length} 个` : "未绑定" },
         { label: "轮次", value: text(config.maxIterations, "4") },
         { label: "输出", value: text(config.outputField, "tools_result") },
+      ];
+    case "task_splitter":
+      return [
+        { label: "输入", value: text(config.inputField, "task_plan") },
+        { label: "任务", value: `最多 ${text(config.maxTasks, "5")} 个` },
+        { label: "输出", value: text(config.outputField, "worker_tasks") },
+      ];
+    case "parallel_tools":
+      return [
+        { label: "任务", value: text(config.tasksField, "worker_tasks") },
+        { label: "并发", value: text(config.maxConcurrentWorkers, "3") },
+        { label: "输出", value: text(config.outputField, "worker_results") },
       ];
     case "retriever":
       return [
@@ -424,6 +441,10 @@ function nodeTypeLabel(type: NodeType): string {
       return "AGENT";
     case "tool":
       return "TOOL";
+    case "task_splitter":
+      return "TASKS";
+    case "parallel_tools":
+      return "PARALLEL";
     case "retriever":
       return "RAG";
     case "condition":

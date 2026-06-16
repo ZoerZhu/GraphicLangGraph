@@ -28,6 +28,8 @@ export const NODE_CATALOG: NodeCatalogItem[] = [
   { type: "llm", title: "LLM", description: "调用模型生成或抽取", icon: Sparkles },
   { type: "agent", title: "Agent", description: "可用工具的推理节点", icon: BrainCircuit },
   { type: "tool", title: "Tools", description: "Agent 自主选择并调用工具", icon: Wrench },
+  { type: "task_splitter", title: "Task Splitter", description: "解析规划并生成任务列表", icon: Route },
+  { type: "parallel_tools", title: "Parallel Tools", description: "并行启动多个工具 Worker", icon: Wrench },
   { type: "retriever", title: "Retriever", description: "检索知识库上下文", icon: Database },
   { type: "condition", title: "Condition", description: "规则分支路由", icon: GitBranch },
   { type: "ai_router", title: "AI Router", description: "按意图进行智能路由", icon: Route },
@@ -86,6 +88,26 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         toolRegistryJson: "[]",
         maxIterations: 4,
         outputField: "tools_result",
+      };
+    case "task_splitter":
+      return {
+        inputField: "task_plan",
+        outputField: "worker_tasks",
+        maxTasks: 5,
+        fallbackToSingleTask: true,
+      };
+    case "parallel_tools":
+      return {
+        provider: "openai",
+        model: "gpt-4.1-mini",
+        systemPrompt: "你是代码阅读 Worker，只完成分配给你的子任务。",
+        tasksField: "worker_tasks",
+        toolIdsJson: "[]",
+        toolRegistryJson: "[]",
+        maxIterationsPerTask: 6,
+        maxConcurrentWorkers: 3,
+        storeToolCalls: false,
+        outputField: "worker_results",
       };
     case "retriever":
       return {
@@ -197,6 +219,9 @@ export function defaultOutputs(type: NodeType): Port[] {
       { id: "rejected", type: "condition", label: "拒绝" },
       { id: "edit", type: "condition", label: "修改" },
     ];
+  }
+  if (type === "parallel_tools") {
+    return [{ id: "out", type: "control", label: "汇总" }];
   }
   return [{ id: "out", type: "control", label: "输出" }];
 }

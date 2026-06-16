@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 import app.config as app_config
 import app.api.workspace as workspace_api
+import app.runtime_environment as runtime_environment
 from app.main import app
 
 
@@ -401,6 +402,73 @@ def test_workspace_tools_and_mcp_are_persisted(tmp_path, monkeypatch):
     assert mcp_file.exists()
     assert saved_mcp.json()[0]["command"] == "python -m docs_mcp"
     assert client.get("/api/workspace/mcp").json() == saved_mcp.json()
+
+
+def test_workspace_runtime_environments_are_persisted(tmp_path, monkeypatch):
+    runtime_file = tmp_path / "runtime_environments.json"
+    monkeypatch.setattr(runtime_environment, "WORKSPACE_RUNTIME_ENVIRONMENTS_FILE", runtime_file)
+    client = TestClient(app)
+
+    default_response = client.get("/api/workspace/runtime-environments")
+    assert default_response.status_code == 200
+    assert default_response.json()[0]["kind"] == "local_backend"
+
+    payload = [
+        {
+            "id": "runtime_docs",
+            "name": "本地文档环境",
+            "kind": "local_backend",
+            "description": "只允许 docs",
+            "allowedRootsJson": json.dumps([str(tmp_path / "docs")]),
+            "networkEnabled": False,
+            "allowedHostsJson": "[]",
+            "maxFileBytes": 4096,
+            "maxHttpBytes": 8192,
+        }
+    ]
+    saved = client.put("/api/workspace/runtime-environments", json=payload)
+
+    assert saved.status_code == 200
+    assert runtime_file.exists()
+    assert saved.json()[0]["name"] == "本地文档环境"
+    assert saved.json()[0]["networkEnabled"] is False
+    assert client.get("/api/workspace/runtime-environments").json() == saved.json()
+
+
+def test_builtin_tool_presets_can_be_installed(tmp_path, monkeypatch):
+    tools_file = tmp_path / "tools.json"
+    monkeypatch.setattr(workspace_api, "WORKSPACE_TOOLS_FILE", tools_file)
+    client = TestClient(app)
+
+    presets = client.get("/api/workspace/tools/presets")
+    assert presets.status_code == 200
+    preset_ids = {item["id"] for item in presets.json()}
+    assert {
+        "builtin_web_search",
+        "builtin_read_file",
+        "builtin_list_directory",
+        "builtin_read_file_chunk",
+        "builtin_search_code",
+        "builtin_list_code_symbols",
+        "builtin_extract_html",
+        "builtin_extract_css_rules",
+        "builtin_extract_html_by_text",
+        "builtin_extract_css_for_html",
+        "builtin_summarize_page_structure",
+        "builtin_resolve_asset_references",
+        "builtin_extract_code_symbol",
+        "builtin_chunk_code_semantic",
+        "builtin_fetch_url",
+    }.issubset(preset_ids)
+
+    installed = client.post("/api/workspace/tools/presets/install", json={"ids": ["builtin_read_file"]})
+    assert installed.status_code == 200
+    body = installed.json()
+    assert body["imported"][0]["source"] == "builtin"
+    assert body["imported"][0]["name"] == "read_file"
+    schema = json.loads(body["imported"][0]["schemaJson"])
+    assert schema["x-graphic"]["builtinId"] == "read_file"
+    assert client.get("/api/workspace/tools").json() == body["allConfigs"]
 
 
 def test_workspace_skills_are_persisted_and_imported_from_local_markdown(tmp_path, monkeypatch):

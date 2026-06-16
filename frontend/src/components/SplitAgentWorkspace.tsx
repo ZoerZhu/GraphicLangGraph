@@ -227,6 +227,12 @@ function nodeTypeLabel(type: string) {
       return "START";
     case "llm":
       return "LLM";
+    case "tool":
+      return "TOOL";
+    case "task_splitter":
+      return "TASKS";
+    case "parallel_tools":
+      return "PARALLEL";
     case "condition":
       return "CONDITION";
     case "http":

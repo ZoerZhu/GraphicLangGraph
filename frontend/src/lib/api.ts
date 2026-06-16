@@ -8,6 +8,7 @@ import type {
   ProjectListItem,
   RagKnowledgeBaseInspection,
   RagKnowledgeBaseConfig,
+  RuntimeEnvironmentConfig,
   RunMode,
   RunPreviewResult,
   RunStreamEvent,
@@ -27,6 +28,7 @@ import {
   ProjectSchema,
   RagKnowledgeBaseInspectionSchema,
   RagKnowledgeBaseListSchema,
+  RuntimeEnvironmentConfigListSchema,
   RunPreviewResultSchema,
   SkillConfigListSchema,
   SkillImportResultSchema,
@@ -156,6 +158,19 @@ export async function uploadWorkspaceToolFolder(files: File[], rootName: string)
   return ToolImportResultSchema.parse(data) as ToolImportResult;
 }
 
+export async function listBuiltinToolPresets(): Promise<ToolConfig[]> {
+  const data = await request("/api/workspace/tools/presets");
+  return ToolConfigListSchema.parse(data) as ToolConfig[];
+}
+
+export async function installBuiltinToolPresets(ids: string[]): Promise<ToolImportResult> {
+  const data = await request("/api/workspace/tools/presets/install", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
+  return ToolImportResultSchema.parse(data) as ToolImportResult;
+}
+
 export async function listWorkspaceSkills(): Promise<SkillConfig[]> {
   const data = await request("/api/workspace/skills");
   return SkillConfigListSchema.parse(data) as SkillConfig[];
@@ -231,6 +246,19 @@ export async function saveWorkspaceModelConfigs(configs: ModelConfig[]): Promise
   return ModelConfigListSchema.parse(data) as ModelConfig[];
 }
 
+export async function listWorkspaceRuntimeEnvironments(): Promise<RuntimeEnvironmentConfig[]> {
+  const data = await request("/api/workspace/runtime-environments");
+  return RuntimeEnvironmentConfigListSchema.parse(data) as RuntimeEnvironmentConfig[];
+}
+
+export async function saveWorkspaceRuntimeEnvironments(configs: RuntimeEnvironmentConfig[]): Promise<RuntimeEnvironmentConfig[]> {
+  const data = await request("/api/workspace/runtime-environments", {
+    method: "PUT",
+    body: JSON.stringify(configs),
+  });
+  return RuntimeEnvironmentConfigListSchema.parse(data) as RuntimeEnvironmentConfig[];
+}
+
 export async function checkWorkspaceEnvVar(name: string): Promise<EnvVarCheckResult> {
   const data = await request("/api/workspace/env/check", {
     method: "POST",
@@ -265,10 +293,11 @@ export async function runProjectPreview(
   input: Record<string, unknown>,
   mode: RunMode,
   modelConfig?: ModelConfig,
+  runtimeEnvironment?: RuntimeEnvironmentConfig,
 ): Promise<RunPreviewResult> {
   const data = await request(`/api/projects/${projectId}/run`, {
     method: "POST",
-    body: JSON.stringify({ input, mode, modelConfig }),
+    body: JSON.stringify({ input, mode, modelConfig, runtimeEnvironment }),
   });
   return RunPreviewResultSchema.parse(data) as RunPreviewResult;
 }
@@ -278,12 +307,15 @@ export async function streamProjectPreview(
   input: Record<string, unknown>,
   mode: RunMode,
   modelConfig: ModelConfig | undefined,
+  runtimeEnvironment: RuntimeEnvironmentConfig | undefined,
   onEvent: (event: RunStreamEvent) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const response = await fetch(`${API_BASE}/api/projects/${projectId}/run/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ input, mode, modelConfig }),
+    body: JSON.stringify({ input, mode, modelConfig, runtimeEnvironment }),
+    signal,
   });
   if (!response.ok) {
     const detail = await response.text();

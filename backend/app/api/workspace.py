@@ -27,6 +27,13 @@ from app.config import (
     ensure_runtime_dirs,
     load_runtime_env,
 )
+from app.builtin_tools import builtin_tool_config_dicts
+from app.runtime_environment import (
+    RuntimeEnvironmentConfig,
+    normalize_runtime_environments,
+    read_runtime_environments,
+    write_runtime_environments,
+)
 
 
 router = APIRouter(prefix="/api/workspace", tags=["workspace"])
@@ -149,6 +156,10 @@ class ToolImportRequest(BaseModel):
     use_mirror: bool = Field(True, alias="useMirror")
 
 
+class BuiltinToolInstallRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+
+
 class SkillImportRequest(BaseModel):
     source_type: str = Field("local", alias="sourceType")
     source: str
@@ -211,6 +222,30 @@ def save_tool_configs(configs: list[WorkspaceToolConfig]) -> list[WorkspaceToolC
     normalized = _normalize_tool_configs(configs)
     _write_tool_configs(normalized)
     return normalized
+
+
+@router.get("/tools/presets", response_model=list[WorkspaceToolConfig])
+def list_builtin_tool_presets() -> list[WorkspaceToolConfig]:
+    return [WorkspaceToolConfig.model_validate(config) for config in builtin_tool_config_dicts()]
+
+
+@router.post("/tools/presets/install", response_model=ToolImportResponse)
+def install_builtin_tool_presets(payload: BuiltinToolInstallRequest) -> ToolImportResponse:
+    presets = [WorkspaceToolConfig.model_validate(config) for config in builtin_tool_config_dicts()]
+    requested = set(payload.ids or [preset.id for preset in presets])
+    imported = [preset for preset in presets if preset.id in requested]
+    if not imported:
+        raise HTTPException(status_code=400, detail="请选择要安装的预设 Tool。")
+    existing = _read_tool_configs()
+    merged = _merge_tool_configs(existing, imported)
+    _write_tool_configs(merged)
+    return ToolImportResponse(
+        imported=imported,
+        allConfigs=merged,
+        importPath="builtin://tools",
+        detectedFiles=[],
+        warnings=[],
+    )
 
 
 @router.post("/tools/import", response_model=ToolImportResponse)
@@ -292,6 +327,18 @@ async def upload_tool_folder(
         detectedFiles=_dedupe_strings([*saved_files, *detected_files]),
         warnings=warnings,
     )
+
+
+@router.get("/runtime-environments", response_model=list[RuntimeEnvironmentConfig])
+def list_runtime_environments() -> list[RuntimeEnvironmentConfig]:
+    return read_runtime_environments()
+
+
+@router.put("/runtime-environments", response_model=list[RuntimeEnvironmentConfig])
+def save_runtime_environments(items: list[RuntimeEnvironmentConfig]) -> list[RuntimeEnvironmentConfig]:
+    normalized = normalize_runtime_environments(items)
+    write_runtime_environments(normalized)
+    return normalized
 
 
 @router.get("/skills", response_model=list[WorkspaceSkillConfig])

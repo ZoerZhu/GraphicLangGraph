@@ -3,6 +3,8 @@ export type NodeType =
   | "llm"
   | "agent"
   | "tool"
+  | "task_splitter"
+  | "parallel_tools"
   | "retriever"
   | "condition"
   | "ai_router"
@@ -164,6 +166,18 @@ export interface ModelConfig {
   notes: string;
 }
 
+export interface RuntimeEnvironmentConfig {
+  id: string;
+  name: string;
+  kind: string;
+  description: string;
+  allowedRootsJson: string;
+  networkEnabled: boolean;
+  allowedHostsJson: string;
+  maxFileBytes: number;
+  maxHttpBytes: number;
+}
+
 export interface EnvVarCheckResult {
   valid: boolean;
   exists: boolean;
@@ -222,6 +236,7 @@ export interface ProjectIR {
     name: string;
     description: string;
     kind: "agent" | "agents";
+    runtimeEnvironmentId: string;
     schemaVersion: string;
   };
   state: {
@@ -356,6 +371,9 @@ export interface RunTraceItem {
   durationMs: number;
   inputState: Record<string, unknown>;
   outputDelta: Record<string, unknown>;
+  virtual?: boolean;
+  parentNodeId?: string | null;
+  position?: Position | null;
 }
 
 export type RunTraceStatus = "ok" | "skipped" | "error";
@@ -369,6 +387,10 @@ export interface NodeRuntimeState {
   inputState: Record<string, unknown>;
   outputDelta: Record<string, unknown>;
   updatedAt: string;
+  virtual?: boolean;
+  parentNodeId?: string | null;
+  nodeType?: NodeType;
+  position?: Position | null;
 }
 
 export interface RunPreviewResult {
@@ -404,6 +426,25 @@ export type RunStreamEvent =
       issues: ValidationIssue[];
       traceItem: RunTraceItem;
       outputState: Record<string, unknown>;
+    }
+  | {
+      event: "virtual_node_start";
+      mode: RunMode;
+      valid: boolean;
+      issues: ValidationIssue[];
+      nodeId: string;
+      parentNodeId: string;
+      type: NodeType;
+      label: string;
+      inputState: Record<string, unknown>;
+      position?: Position | null;
+    }
+  | {
+      event: "virtual_node_end";
+      mode: RunMode;
+      valid: boolean;
+      issues: ValidationIssue[];
+      traceItem: RunTraceItem;
     }
   | {
       event: "run_end";

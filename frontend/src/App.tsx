@@ -8,6 +8,7 @@ import { RunPreviewPanel } from "./components/RunPreviewPanel";
 import { SplitAgentWorkspace } from "./components/SplitAgentWorkspace";
 import { TemplatePanel } from "./components/TemplatePanel";
 import { TopBar } from "./components/TopBar";
+import { ValidationPanel } from "./components/ValidationPanel";
 import { useProjectStore } from "./store/projectStore";
 import "./styles.css";
 
@@ -43,6 +44,7 @@ export default function App() {
       <TopBar />
       <TemplatePanel />
       <AssistantPanel />
+      <ValidationPanel />
       <RunPreviewPanel />
       <NodePalette />
       <Inspector />

@@ -22,10 +22,12 @@ import {
 } from "lucide-react";
 import {
   checkWorkspaceEnvVar,
+  installBuiltinToolPresets,
   importWorkspaceMcpServers,
   importWorkspaceSkillsFromSource,
   importWorkspaceToolsFromSource,
   inspectRagKnowledgeBasePath,
+  listBuiltinToolPresets,
   uploadWorkspaceSkillFolder,
   uploadWorkspaceToolFolder,
 } from "../lib/api";
@@ -51,6 +53,23 @@ type EnvCheckState = {
   status: "idle" | "checking" | "success" | "error" | "warning";
   message: string;
 };
+
+const CODE_READING_TOOL_SUITE_IDS = [
+  "builtin_read_file",
+  "builtin_list_directory",
+  "builtin_read_file_chunk",
+  "builtin_search_code",
+  "builtin_list_code_symbols",
+  "builtin_extract_html",
+  "builtin_extract_css_rules",
+  "builtin_extract_html_by_text",
+  "builtin_extract_css_for_html",
+  "builtin_summarize_page_structure",
+  "builtin_resolve_asset_references",
+  "builtin_extract_code_symbol",
+  "builtin_chunk_code_semantic",
+];
+
 type DialogState =
   | {
       kind: "alert";
@@ -249,6 +268,13 @@ export function ManagementPage() {
 
   async function uploadToolFolder(files: File[], rootName: string): Promise<ToolImportResult> {
     const result = await uploadWorkspaceToolFolder(files, rootName);
+    await updateWorkspaceTools(result.allConfigs);
+    selectImportedTool(result);
+    return result;
+  }
+
+  async function installPresetTools(ids: string[]): Promise<ToolImportResult> {
+    const result = await installBuiltinToolPresets(ids);
     await updateWorkspaceTools(result.allConfigs);
     selectImportedTool(result);
     return result;
@@ -692,6 +718,7 @@ export function ManagementPage() {
               onDelete={deleteToolDraft}
               onImport={importToolConfigs}
               onUploadFolder={uploadToolFolder}
+              onInstallPresets={installPresetTools}
               onCancel={() => {
                 setSelectedToolId(null);
                 setToolEditorMode("empty");
@@ -929,6 +956,7 @@ function ToolManagerContent({
   onDelete,
   onImport,
   onUploadFolder,
+  onInstallPresets,
   onCancel,
 }: {
   items: ToolConfig[];
@@ -942,14 +970,73 @@ function ToolManagerContent({
   onDelete: () => void;
   onImport: (payload: { sourceType: "local" | "github"; source: string; useMirror: boolean }) => Promise<ToolImportResult>;
   onUploadFolder: (files: File[], rootName: string) => Promise<ToolImportResult>;
+  onInstallPresets: (ids: string[]) => Promise<ToolImportResult>;
   onCancel: () => void;
 }) {
+  const [presets, setPresets] = useState<ToolConfig[]>([]);
+  const [presetMessage, setPresetMessage] = useState("");
+  const [presetError, setPresetError] = useState(false);
+  const [installingPreset, setInstallingPreset] = useState<string | null>(null);
   const [importType, setImportType] = useState<"local" | "github">("local");
   const [importSource, setImportSource] = useState("");
   const [useMirror, setUseMirror] = useState(true);
   const [importing, setImporting] = useState(false);
   const [importMessage, setImportMessage] = useState("");
   const [importError, setImportError] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    listBuiltinToolPresets()
+      .then((configs) => {
+        if (!cancelled) setPresets(configs);
+      })
+      .catch(() => {
+        if (!cancelled) setPresets([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function handleInstallPreset(id: string) {
+    setInstallingPreset(id);
+    setPresetMessage("正在安装预设 Tool...");
+    setPresetError(false);
+    try {
+      const result = await onInstallPresets([id]);
+      setPresetMessage(formatToolImportMessage(result));
+      setPresetError(false);
+    } catch (error) {
+      setPresetMessage(error instanceof Error ? readableApiError(error.message) : "预设 Tool 安装失败。");
+      setPresetError(true);
+    } finally {
+      setInstallingPreset(null);
+    }
+  }
+
+  async function handleInstallCodeReadingSuite() {
+    const availableIds = new Set(presets.map((preset) => preset.id));
+    const installedIds = new Set(items.map((item) => item.id));
+    const ids = CODE_READING_TOOL_SUITE_IDS.filter((id) => availableIds.has(id) && !installedIds.has(id));
+    if (!ids.length) {
+      setPresetMessage("代码读取套装已经全部安装。");
+      setPresetError(false);
+      return;
+    }
+    setInstallingPreset("code-reading-suite");
+    setPresetMessage("正在安装代码读取套装...");
+    setPresetError(false);
+    try {
+      const result = await onInstallPresets(ids);
+      setPresetMessage(formatToolImportMessage(result));
+      setPresetError(false);
+    } catch (error) {
+      setPresetMessage(error instanceof Error ? readableApiError(error.message) : "代码读取套装安装失败。");
+      setPresetError(true);
+    } finally {
+      setInstallingPreset(null);
+    }
+  }
 
   async function handleImport() {
     const source = importSource.trim();
@@ -1007,6 +1094,47 @@ function ToolManagerContent({
           renderMark={() => <Wrench size={16} />}
         />
         <section className="model-editor-panel">
+          <div className="model-editor-card preset-tools-card">
+            <div className="mcp-import-head">
+              <strong>预设 Tools</strong>
+              <span>安装后会出现在已配置 Tools 中，可在 Tools 节点里选择。</span>
+            </div>
+            <div className="preset-suite-card">
+              <span>
+                <strong>代码读取套装</strong>
+                <small>一次安装文件读取、代码搜索、语义分片、HTML/CSS 抽取和页面分析工具。</small>
+              </span>
+              <button
+                disabled={Boolean(installingPreset) || CODE_READING_TOOL_SUITE_IDS.every((id) => items.some((item) => item.id === id))}
+                onClick={() => void handleInstallCodeReadingSuite()}
+                type="button"
+              >
+                {installingPreset === "code-reading-suite" ? "安装中" : "安装套装"}
+              </button>
+            </div>
+            <div className="preset-tools-grid">
+              {presets.map((preset) => {
+                const installed = items.some((item) => item.id === preset.id);
+                return (
+                  <button
+                    key={preset.id}
+                    className={installed ? "is-installed" : ""}
+                    disabled={Boolean(installingPreset) || installed}
+                    onClick={() => void handleInstallPreset(preset.id)}
+                    type="button"
+                  >
+                    <Wrench size={15} />
+                    <span>
+                      <strong>{preset.name}</strong>
+                      <small>{preset.description}</small>
+                    </span>
+                    <em>{installed ? "已安装" : installingPreset === preset.id ? "安装中" : "安装"}</em>
+                  </button>
+                );
+              })}
+            </div>
+            {presetMessage ? <small className={`rag-inspect-status ${presetError ? "is-error" : ""}`}>{presetMessage}</small> : null}
+          </div>
           <div className="model-editor-card mcp-import-card">
             <div className="mcp-import-head">
               <strong>一键导入 Tools</strong>
@@ -1074,6 +1202,7 @@ function ToolManagerContent({
               </Field>
               <Field label="来源">
                 <select value={draft.source} onChange={(event) => onChange({ source: event.target.value })}>
+                  <option value="builtin">Builtin</option>
                   <option value="python">Python</option>
                   <option value="http">HTTP</option>
                   <option value="openapi">OpenAPI</option>
