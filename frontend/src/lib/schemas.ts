@@ -206,9 +206,50 @@ export const RuntimeEnvironmentConfigSchema = z.object({
   allowedHostsJson: z.string(),
   maxFileBytes: z.number(),
   maxHttpBytes: z.number(),
+  allowDirectEdits: z.boolean().default(false),
+  allowedCommandProfilesJson: z.string().default("[]"),
+  maxPatchBytes: z.number().default(524288),
+  maxCommandOutputBytes: z.number().default(262144),
 });
 
 export const RuntimeEnvironmentConfigListSchema = z.array(RuntimeEnvironmentConfigSchema);
+
+export const CommandRunResultSchema = z.object({
+  command: z.array(z.string()),
+  cwd: z.string(),
+  exitCode: z.number(),
+  stdout: z.string(),
+  stderr: z.string(),
+  durationMs: z.number(),
+  timedOut: z.boolean(),
+  truncated: z.boolean(),
+});
+
+export const EditSessionSchema = z.object({
+  patchId: z.string(),
+  projectId: z.string(),
+  runId: z.string(),
+  status: z.string(),
+  files: z.array(
+    z.object({
+      path: z.string(),
+      absolutePath: z.string(),
+      exists: z.boolean(),
+      baseHash: z.string(),
+      changeKind: z.string(),
+      hunkCount: z.number(),
+      summary: z.string(),
+    }),
+  ),
+  diff: z.string(),
+  conflicts: z.array(z.string()),
+  rollbackId: z.string(),
+  createdAt: z.string(),
+  appliedAt: z.string(),
+  discardedAt: z.string(),
+  rolledBackAt: z.string().optional(),
+  commandResults: z.array(CommandRunResultSchema),
+});
 
 export const EnvVarCheckSchema = z.object({
   valid: z.boolean(),
@@ -257,6 +298,16 @@ export const SkillImportResultSchema = z.object({
   detectedFiles: z.array(z.string()),
   warnings: z.array(z.string()),
 });
+
+export const ResourceGroupConfigSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().default(""),
+  resourceType: z.string().default("tool"),
+  itemIds: z.array(z.string()).default([]),
+});
+
+export const ResourceGroupConfigListSchema = z.array(ResourceGroupConfigSchema);
 
 export const McpServerConfigSchema = z.object({
   id: z.string(),

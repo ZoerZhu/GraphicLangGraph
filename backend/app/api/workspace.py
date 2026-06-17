@@ -22,6 +22,7 @@ from app.config import (
     WORKSPACE_MCP_FILE,
     WORKSPACE_MODELS_FILE,
     WORKSPACE_RAG_FILE,
+    WORKSPACE_RESOURCE_GROUPS_FILE,
     WORKSPACE_SKILLS_FILE,
     WORKSPACE_TOOLS_FILE,
     ensure_runtime_dirs,
@@ -37,6 +38,12 @@ from app.runtime_environment import (
 
 
 router = APIRouter(prefix="/api/workspace", tags=["workspace"])
+
+SKILL_RELATED_MARKDOWN_MAX_FILES = 80
+SKILL_RELATED_MARKDOWN_MAX_CHARS_PER_FILE = 6000
+SKILL_RELATED_MARKDOWN_MAX_TOTAL_CHARS = 50000
+SKILL_SUPPORT_FILE_MAX_ITEMS = 160
+SKILL_SUPPORT_FILE_PREVIEW_CHARS = 3000
 
 
 class WorkspaceToolConfig(BaseModel):
@@ -126,6 +133,16 @@ class WorkspaceRagKnowledgeBase(BaseModel):
     top_k: int = Field(4, alias="topK")
     metadata_json: str = Field("{}", alias="metadataJson")
     enabled: bool = True
+
+
+class WorkspaceResourceGroupConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    id: str = Field(default_factory=lambda: f"group_{uuid4().hex[:8]}")
+    name: str = "未命名预设组"
+    description: str = ""
+    resource_type: str = Field("tool", alias="resourceType")
+    item_ids: list[str] = Field(default_factory=list, alias="itemIds")
 
 
 class RagPathInspectRequest(BaseModel):
@@ -338,6 +355,18 @@ def list_runtime_environments() -> list[RuntimeEnvironmentConfig]:
 def save_runtime_environments(items: list[RuntimeEnvironmentConfig]) -> list[RuntimeEnvironmentConfig]:
     normalized = normalize_runtime_environments(items)
     write_runtime_environments(normalized)
+    return normalized
+
+
+@router.get("/resource-groups", response_model=list[WorkspaceResourceGroupConfig])
+def list_resource_groups() -> list[WorkspaceResourceGroupConfig]:
+    return _read_resource_groups()
+
+
+@router.put("/resource-groups", response_model=list[WorkspaceResourceGroupConfig])
+def save_resource_groups(groups: list[WorkspaceResourceGroupConfig]) -> list[WorkspaceResourceGroupConfig]:
+    normalized = _normalize_resource_groups(groups)
+    _write_resource_groups(normalized)
     return normalized
 
 
@@ -1178,15 +1207,21 @@ def _skill_config_from_markdown(
     frontmatter, body = _parse_markdown_frontmatter(content)
     relative_path = _relative_import_path(path, source_root)
     related_relative_paths = [_relative_import_path(item, source_root) for item in related_files]
+    package_metadata_path = skill_root / "metadata.json"
+    package_metadata = _read_json_object(package_metadata_path) if package_metadata_path.exists() else {}
+    related_markdown, related_truncated = _skill_related_markdown_payload(related_files, source_root)
+    support_files = _skill_support_files_payload(skill_root, source_root, path, related_files)
     name = _first_non_empty(
         frontmatter.get("name"),
         frontmatter.get("title"),
+        str(package_metadata.get("name") or "").strip(),
         _first_markdown_heading(body),
         _humanize_skill_name(skill_root.name if kind == "codex_skill" else path.stem),
     )
     description = _first_non_empty(
         frontmatter.get("description"),
         frontmatter.get("summary"),
+        str(package_metadata.get("description") or package_metadata.get("abstract") or "").strip(),
         _markdown_description(body),
         f"从 {relative_path} 导入的 Skill",
     )
@@ -1195,6 +1230,11 @@ def _skill_config_from_markdown(
         "relativePath": relative_path,
         "skillRoot": _relative_import_path(skill_root, source_root),
         "relatedFiles": related_relative_paths,
+        "frontmatter": frontmatter,
+        "packageMetadata": package_metadata,
+        "relatedMarkdown": related_markdown,
+        "relatedMarkdownTruncated": related_truncated,
+        "supportFiles": support_files,
     }
     return WorkspaceSkillConfig(
         id=f"skill_{_slugify(name)}_{uuid4().hex[:6]}",
@@ -1207,6 +1247,87 @@ def _skill_config_from_markdown(
         metadataJson=_json_dumps(metadata),
         enabled=True,
     )
+
+
+def _skill_related_markdown_payload(related_files: list[Path], source_root: Path) -> tuple[list[dict[str, Any]], bool]:
+    payload: list[dict[str, Any]] = []
+    total_chars = 0
+    truncated = len(related_files) > SKILL_RELATED_MARKDOWN_MAX_FILES
+    for path in related_files[:SKILL_RELATED_MARKDOWN_MAX_FILES]:
+        raw_content = _read_text_file(path)
+        content = raw_content[:SKILL_RELATED_MARKDOWN_MAX_CHARS_PER_FILE]
+        item_truncated = len(raw_content) > len(content)
+        remaining = SKILL_RELATED_MARKDOWN_MAX_TOTAL_CHARS - total_chars
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(content) > remaining:
+            content = content[:remaining]
+            item_truncated = True
+            truncated = True
+        total_chars += len(content)
+        _frontmatter, body = _parse_markdown_frontmatter(raw_content)
+        payload.append(
+            {
+                "path": _relative_import_path(path, source_root),
+                "title": _first_markdown_heading(body) or _humanize_skill_name(path.stem),
+                "description": _markdown_description(body),
+                "content": content,
+                "truncated": item_truncated,
+            }
+        )
+    return payload, truncated
+
+
+def _skill_support_files_payload(skill_root: Path, source_root: Path, skill_file: Path, related_files: list[Path]) -> list[dict[str, Any]]:
+    ignored_paths = {skill_file.resolve(), *(path.resolve() for path in related_files)}
+    result: list[dict[str, Any]] = []
+    try:
+        files = sorted((path for path in skill_root.rglob("*") if path.is_file()), key=lambda item: item.as_posix().lower())
+    except OSError:
+        return result
+
+    for path in files:
+        if len(result) >= SKILL_SUPPORT_FILE_MAX_ITEMS:
+            break
+        if path.resolve() in ignored_paths or path.name.lower() == "skill.md" or _should_skip_import_path(path):
+            continue
+        kind = _skill_support_file_kind(path, skill_root)
+        if kind == "metadata":
+            continue
+        item: dict[str, Any] = {
+            "path": _relative_import_path(path, source_root),
+            "kind": kind,
+            "size": _safe_file_size(path),
+        }
+        if kind == "script" or path.suffix.lower() in {".txt", ".json", ".toml", ".yaml", ".yml"}:
+            preview = _read_text_file(path)[:SKILL_SUPPORT_FILE_PREVIEW_CHARS]
+            if preview:
+                item["preview"] = preview
+                item["truncated"] = _safe_file_size(path) > len(preview.encode("utf-8", errors="ignore"))
+        result.append(item)
+    return result
+
+
+def _skill_support_file_kind(path: Path, skill_root: Path) -> str:
+    relative_parts = {part.lower() for part in path.relative_to(skill_root).parts[:-1]} if _is_relative_to(path, skill_root) else set()
+    suffix = path.suffix.lower()
+    if path.name.lower() == "metadata.json":
+        return "metadata"
+    if "scripts" in relative_parts or suffix in {".sh", ".ps1", ".py", ".js", ".ts", ".mjs", ".cjs"}:
+        return "script"
+    if "assets" in relative_parts or suffix in {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".tar", ".gz", ".zip"}:
+        return "asset"
+    if suffix in {".md", ".markdown", ".txt", ".json", ".yaml", ".yml", ".toml"}:
+        return "document"
+    return "other"
+
+
+def _safe_file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def _parse_markdown_frontmatter(content: str) -> tuple[dict[str, str], str]:
@@ -1624,6 +1745,23 @@ def _write_rag_knowledge_bases(items: list[WorkspaceRagKnowledgeBase]) -> None:
     _write_workspace_list(WORKSPACE_RAG_FILE, [item.model_dump(by_alias=True) for item in items])
 
 
+def _read_resource_groups() -> list[WorkspaceResourceGroupConfig]:
+    ensure_runtime_dirs()
+    if not WORKSPACE_RESOURCE_GROUPS_FILE.exists():
+        return []
+    try:
+        raw = json.loads(WORKSPACE_RESOURCE_GROUPS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return _normalize_resource_groups([WorkspaceResourceGroupConfig.model_validate(item) for item in raw if isinstance(item, dict)])
+
+
+def _write_resource_groups(groups: list[WorkspaceResourceGroupConfig]) -> None:
+    _write_workspace_list(WORKSPACE_RESOURCE_GROUPS_FILE, [group.model_dump(by_alias=True) for group in groups])
+
+
 def _write_workspace_list(path, payload: list[dict]) -> None:
     ensure_runtime_dirs()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1662,6 +1800,31 @@ def _normalize_skill_configs(configs: list[WorkspaceSkillConfig]) -> list[Worksp
                     "file_path": config.file_path.strip(),
                     "metadata_json": _ensure_json_text(config.metadata_json, {}),
                     "enabled": config.enabled is not False,
+                },
+            ),
+        )
+    return normalized
+
+
+def _normalize_resource_groups(groups: list[WorkspaceResourceGroupConfig]) -> list[WorkspaceResourceGroupConfig]:
+    normalized: list[WorkspaceResourceGroupConfig] = []
+    seen: set[str] = set()
+    for group in groups:
+        group_id = group.id.strip() or f"group_{uuid4().hex[:8]}"
+        if group_id in seen:
+            group_id = f"group_{uuid4().hex[:8]}"
+        seen.add(group_id)
+        resource_type = group.resource_type.strip().lower()
+        if resource_type not in {"tool", "skill"}:
+            resource_type = "tool"
+        normalized.append(
+            group.model_copy(
+                update={
+                    "id": group_id,
+                    "name": group.name.strip() or ("预设工具组" if resource_type == "tool" else "预设技能组"),
+                    "description": group.description.strip(),
+                    "resource_type": resource_type,
+                    "item_ids": _dedupe_strings([str(item).strip() for item in group.item_ids if str(item).strip()]),
                 },
             ),
         )

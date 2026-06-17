@@ -1,7 +1,7 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { useProjectStore } from "../store/projectStore";
-import type { MCPServerConfig, ModelConfig, NodeIR, RagKnowledgeBaseConfig, SkillConfig, StateField, ToolConfig } from "../types";
+import type { MCPServerConfig, ModelConfig, NodeIR, RagKnowledgeBaseConfig, ResourceGroupConfig, SkillConfig, StateField, ToolConfig } from "../types";
 import { FloatingPanel } from "./FloatingPanel";
 
 export function Inspector() {
@@ -11,11 +11,14 @@ export function Inspector() {
   const selectNode = useProjectStore((state) => state.selectNode);
   const projects = useProjectStore((state) => state.projects);
   const workspaceTools = useProjectStore((state) => state.workspaceTools);
+  const workspaceSkills = useProjectStore((state) => state.workspaceSkills);
   const workspaceMcpServers = useProjectStore((state) => state.workspaceMcpServers);
   const workspaceModelConfigs = useProjectStore((state) => state.workspaceModelConfigs);
   const workspaceRagKnowledgeBases = useProjectStore((state) => state.workspaceRagKnowledgeBases);
+  const workspaceResourceGroups = useProjectStore((state) => state.workspaceResourceGroups);
   const updateNode = useProjectStore((state) => state.updateNode);
   const updateNodeConfig = useProjectStore((state) => state.updateNodeConfig);
+  const updateSkills = useProjectStore((state) => state.updateSkills);
   const setStateFields = useProjectStore((state) => state.setStateFields);
 
   const node = useMemo(
@@ -23,7 +26,18 @@ export function Inspector() {
     [project?.nodes, selectedNodeId],
   );
   const availableTools = useMemo(() => mergeById([...(project?.tools ?? []), ...workspaceTools]), [project?.tools, workspaceTools]);
-  const availableSkills = useMemo(() => (project?.skills ?? []).filter((skill) => skill.enabled), [project?.skills]);
+  const availableSkills = useMemo(
+    () => mergeById([...(project?.skills ?? []), ...workspaceSkills]).filter((skill) => skill.enabled),
+    [project?.skills, workspaceSkills],
+  );
+  const availableToolGroups = useMemo(
+    () => workspaceResourceGroups.filter((group) => group.resourceType === "tool"),
+    [workspaceResourceGroups],
+  );
+  const availableSkillGroups = useMemo(
+    () => workspaceResourceGroups.filter((group) => group.resourceType === "skill"),
+    [workspaceResourceGroups],
+  );
   const availableMcpServers = useMemo(
     () => mergeById([...(project?.mcpServers ?? []), ...workspaceMcpServers]),
     [project?.mcpServers, workspaceMcpServers],
@@ -35,6 +49,42 @@ export function Inspector() {
   const availableModelConfigs = useMemo(() => buildModelConfigOptions(workspaceModelConfigs), [workspaceModelConfigs]);
   const availableRagKnowledgeBases = useMemo(() => workspaceRagKnowledgeBases.filter((item) => item.enabled), [workspaceRagKnowledgeBases]);
   const detectedStateFields = useMemo(() => detectStateFieldsFromNodes(project?.nodes ?? []), [project?.nodes]);
+  const resourceInspector = Boolean(node && ["agent", "tool", "parallel_tools"].includes(node.type));
+
+  function updateToolSelection(targetNode: NodeIR, directIds: string[], groupIds: string[]) {
+    const availableIds = new Set(availableTools.map((tool) => tool.id));
+    const groupIdsSet = new Set(groupIds);
+    const groupedToolIds = availableToolGroups
+      .filter((group) => groupIdsSet.has(group.id))
+      .flatMap((group) => group.itemIds);
+    const ids = uniqueStrings([...groupedToolIds, ...directIds]).filter((id) => availableIds.has(id));
+    const selectedTools = availableTools.filter((tool) => ids.includes(tool.id));
+    updateNodeConfig(targetNode.id, {
+      toolDirectIdsJson: JSON.stringify(directIds.filter((id) => availableIds.has(id))),
+      toolGroupIdsJson: JSON.stringify(groupIds),
+      toolIdsJson: JSON.stringify(ids),
+      toolRegistryJson: JSON.stringify(selectedTools),
+      tools: selectedTools.map((tool) => tool.name).join(","),
+    });
+  }
+
+  function updateSkillSelection(targetNode: NodeIR, directIds: string[], groupIds: string[]) {
+    const availableIds = new Set(availableSkills.map((skill) => skill.id));
+    const groupIdsSet = new Set(groupIds);
+    const groupedSkillIds = availableSkillGroups
+      .filter((group) => groupIdsSet.has(group.id))
+      .flatMap((group) => group.itemIds);
+    const ids = uniqueStrings([...groupedSkillIds, ...directIds]).filter((id) => availableIds.has(id));
+    if (project) {
+      const selectedSkillConfigs = availableSkills.filter((skill) => ids.includes(skill.id));
+      updateSkills(mergeById([...(project.skills ?? []), ...selectedSkillConfigs]));
+    }
+    updateNodeConfig(targetNode.id, {
+      skillDirectIdsJson: JSON.stringify(directIds.filter((id) => availableIds.has(id))),
+      skillGroupIdsJson: JSON.stringify(groupIds),
+      skillIdsJson: JSON.stringify(ids),
+    });
+  }
 
   if (!project || !node || runActive) {
     return null;
@@ -45,10 +95,10 @@ export function Inspector() {
       title="检查器"
       subtitle={node.type}
       className="inspector-panel"
-      initialRect={inspectorInitialRect}
-      minWidth={320}
+      initialRect={resourceInspector ? resourceInspectorInitialRect : inspectorInitialRect}
+      minWidth={resourceInspector ? 560 : 320}
       minHeight={320}
-      maxWidth={560}
+      maxWidth={resourceInspector ? 820 : 560}
       actions={
         <button className="icon-only panel-close" onClick={() => selectNode(null)} title="关闭检查器" type="button">
           <X size={15} />
@@ -111,7 +161,21 @@ export function Inspector() {
         </>
       )}
       {node.type === "agent" && (
-        <>
+        <InspectorSplit
+          left={
+            <ResourceSelectionRail
+              title="Skill 配置"
+              itemLabel="Skill"
+              groups={availableSkillGroups}
+              items={availableSkills}
+              selectedGroupIds={parseStringList(node.config.skillGroupIdsJson)}
+              selectedDirectIds={directResourceIdsFromConfig(node.config, "skillIdsJson", "skillDirectIdsJson", "skillGroupIdsJson", availableSkillGroups)}
+              emptyText="还没有可用 Skill。请先在管理页 Skills 中新增或导入。"
+              onChange={(directIds, groupIds) => updateSkillSelection(node, directIds, groupIds)}
+              renderItemMeta={(skill) => skill.description || skill.filePath || "未填写描述"}
+            />
+          }
+        >
           <ModelSelectionFields
             config={node.config}
             defaultModel="gpt-4.1-mini"
@@ -134,13 +198,6 @@ export function Inspector() {
               placeholder="get_order,refund_policy"
             />
           </Field>
-          <Field label="注入 Skills">
-            <SkillMultiSelect
-              skills={availableSkills}
-              selectedIds={parseStringList(node.config.skillIdsJson)}
-              onChange={(ids) => updateNodeConfig(node.id, { skillIdsJson: JSON.stringify(ids) })}
-            />
-          </Field>
           <div className="inline-grid">
             <Field label="最大迭代">
               <input
@@ -157,10 +214,25 @@ export function Inspector() {
               />
             </Field>
           </div>
-        </>
+        </InspectorSplit>
       )}
       {node.type === "tool" && (
-        <>
+        <InspectorSplit
+          left={
+            <ResourceSelectionRail
+              title="Tool 配置"
+              itemLabel="Tool"
+              groups={availableToolGroups}
+              items={availableTools}
+              selectedGroupIds={parseStringList(node.config.toolGroupIdsJson)}
+              selectedDirectIds={directResourceIdsFromConfig(node.config, "toolIdsJson", "toolDirectIdsJson", "toolGroupIdsJson", availableToolGroups)}
+              emptyText="还没有可用 Tool。请先在管理页 Tools 中导入、安装或新增。"
+              onChange={(directIds, groupIds) => updateToolSelection(node, directIds, groupIds)}
+              renderItemMeta={(tool) => `${tool.source || "tool"} · ${tool.description || "未填写描述"}`}
+              renderItemExtra={(tool) => <ToolUsageTags tool={tool} />}
+            />
+          }
+        >
           <ModelSelectionFields
             config={node.config}
             defaultModel="gpt-4.1-mini"
@@ -186,20 +258,6 @@ export function Inspector() {
               onChange={(event) => updateNodeConfig(node.id, { userPrompt: event.target.value })}
             />
           </Field>
-          <Field label="可用 Tools">
-            <ToolMultiSelect
-              tools={availableTools}
-              selectedIds={parseStringList(node.config.toolIdsJson)}
-              onChange={(ids) => {
-                const selectedTools = availableTools.filter((tool) => ids.includes(tool.id));
-                updateNodeConfig(node.id, {
-                  toolIdsJson: JSON.stringify(ids),
-                  toolRegistryJson: JSON.stringify(selectedTools),
-                  tools: selectedTools.map((tool) => tool.name).join(","),
-                });
-              }}
-            />
-          </Field>
           <div className="inline-grid">
             <Field label="最大调用轮次">
               <input
@@ -216,7 +274,7 @@ export function Inspector() {
               />
             </Field>
           </div>
-        </>
+        </InspectorSplit>
       )}
       {node.type === "task_splitter" && (
         <>
@@ -256,7 +314,22 @@ export function Inspector() {
         </>
       )}
       {node.type === "parallel_tools" && (
-        <>
+        <InspectorSplit
+          left={
+            <ResourceSelectionRail
+              title="Tool 配置"
+              itemLabel="Tool"
+              groups={availableToolGroups}
+              items={availableTools}
+              selectedGroupIds={parseStringList(node.config.toolGroupIdsJson)}
+              selectedDirectIds={directResourceIdsFromConfig(node.config, "toolIdsJson", "toolDirectIdsJson", "toolGroupIdsJson", availableToolGroups)}
+              emptyText="还没有可用 Tool。请先在管理页 Tools 中导入、安装或新增。"
+              onChange={(directIds, groupIds) => updateToolSelection(node, directIds, groupIds)}
+              renderItemMeta={(tool) => `${tool.source || "tool"} · ${tool.description || "未填写描述"}`}
+              renderItemExtra={(tool) => <ToolUsageTags tool={tool} />}
+            />
+          }
+        >
           <ModelSelectionFields
             config={node.config}
             defaultModel="gpt-4.1-mini"
@@ -273,20 +346,6 @@ export function Inspector() {
               rows={5}
               value={String(node.config.systemPrompt ?? "")}
               onChange={(event) => updateNodeConfig(node.id, { systemPrompt: event.target.value })}
-            />
-          </Field>
-          <Field label="可用 Tools">
-            <ToolMultiSelect
-              tools={availableTools}
-              selectedIds={parseStringList(node.config.toolIdsJson)}
-              onChange={(ids) => {
-                const selectedTools = availableTools.filter((tool) => ids.includes(tool.id));
-                updateNodeConfig(node.id, {
-                  toolIdsJson: JSON.stringify(ids),
-                  toolRegistryJson: JSON.stringify(selectedTools),
-                  tools: selectedTools.map((tool) => tool.name).join(","),
-                });
-              }}
             />
           </Field>
           <div className="inline-grid">
@@ -333,7 +392,7 @@ export function Inspector() {
               <span>仅调试时开启，会增加 worker_results 的体积</span>
             </label>
           </Field>
-        </>
+        </InspectorSplit>
       )}
       {node.type === "retriever" && (
         <>
@@ -368,7 +427,7 @@ export function Inspector() {
                 </option>
               ))}
             </select>
-            <small className="model-config-note">从管理页「节点资源 / RAG」导入的知识库中选择。</small>
+            <small className="model-config-note">从管理页「RAG」中已配置的知识库选择。</small>
           </Field>
           <Field label="数据源类型">
             <select value={String(node.config.source ?? "local")} onChange={(event) => updateNodeConfig(node.id, { source: event.target.value })}>
@@ -918,6 +977,142 @@ function StateFieldEditor({
   );
 }
 
+function InspectorSplit({ left, children }: { left: ReactNode; children: ReactNode }) {
+  return (
+    <div className="inspector-split">
+      <aside className="inspector-resource-rail">{left}</aside>
+      <div className="inspector-main-fields">{children}</div>
+    </div>
+  );
+}
+
+function ResourceSelectionRail<T extends { id: string; name: string; description?: string }>({
+  title,
+  itemLabel,
+  groups,
+  items,
+  selectedGroupIds,
+  selectedDirectIds,
+  emptyText,
+  onChange,
+  renderItemMeta,
+  renderItemExtra,
+}: {
+  title: string;
+  itemLabel: string;
+  groups: ResourceGroupConfig[];
+  items: T[];
+  selectedGroupIds: string[];
+  selectedDirectIds: string[];
+  emptyText: string;
+  onChange: (directIds: string[], groupIds: string[]) => void;
+  renderItemMeta: (item: T) => string;
+  renderItemExtra?: (item: T) => ReactNode;
+}) {
+  const [query, setQuery] = useState("");
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  const selectedGroups = new Set(selectedGroupIds);
+  const selectedDirect = new Set(selectedDirectIds);
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredItems = normalizedQuery
+    ? items.filter((item) => `${item.name} ${item.description ?? ""} ${renderItemMeta(item)}`.toLowerCase().includes(normalizedQuery))
+    : items;
+  const itemById = new Map(items.map((item) => [item.id, item]));
+
+  function toggleGroup(groupId: string, checked: boolean) {
+    const next = checked ? [...selectedGroupIds, groupId] : selectedGroupIds.filter((id) => id !== groupId);
+    onChange(selectedDirectIds, uniqueStrings(next));
+  }
+
+  function toggleItem(itemId: string, checked: boolean) {
+    const next = checked ? [...selectedDirectIds, itemId] : selectedDirectIds.filter((id) => id !== itemId);
+    onChange(uniqueStrings(next), selectedGroupIds);
+  }
+
+  function toggleExpanded(groupId: string) {
+    setExpandedIds((current) => {
+      const next = new Set(current);
+      if (next.has(groupId)) {
+        next.delete(groupId);
+      } else {
+        next.add(groupId);
+      }
+      return next;
+    });
+  }
+
+  return (
+    <div className="inspector-resource-picker">
+      <div className="inspector-resource-picker__head">
+        <strong>{title}</strong>
+        <small>{selectedGroupIds.length} 组 · {selectedDirectIds.length} 个单选</small>
+      </div>
+      <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`搜索 ${itemLabel}`} />
+      <div className="inspector-resource-section">
+        <div className="inspector-resource-section__title">
+          <span>预设组</span>
+          <small>{groups.length}</small>
+        </div>
+        {groups.length === 0 ? (
+          <div className="inspector-resource-empty">管理页还没有配置预设组。</div>
+        ) : (
+          groups.map((group) => {
+            const expanded = expandedIds.has(group.id);
+            const includedItems = group.itemIds.map((id) => itemById.get(id)).filter(Boolean) as T[];
+            return (
+              <div key={group.id} className="inspector-resource-group">
+                <label className="inspector-resource-row">
+                  <input type="checkbox" checked={selectedGroups.has(group.id)} onChange={(event) => toggleGroup(group.id, event.target.checked)} />
+                  <span>
+                    <strong>{group.name}</strong>
+                    <small>{includedItems.length} 个{itemLabel}{group.description ? ` · ${group.description}` : ""}</small>
+                  </span>
+                </label>
+                <button className="inspector-resource-expand" type="button" onClick={() => toggleExpanded(group.id)}>
+                  {expanded ? "收起组内容" : "展开组内容"}
+                </button>
+                {expanded ? (
+                  <div className="inspector-resource-group__items">
+                    {includedItems.length === 0 ? (
+                      <span>组内没有可用{itemLabel}</span>
+                    ) : (
+                      includedItems.map((item) => <span key={item.id}>{item.name}</span>)
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })
+        )}
+      </div>
+      <div className="inspector-resource-section">
+        <div className="inspector-resource-section__title">
+          <span>单个{itemLabel}</span>
+          <small>{items.length}</small>
+        </div>
+        {items.length === 0 ? (
+          <div className="inspector-resource-empty">{emptyText}</div>
+        ) : filteredItems.length === 0 ? (
+          <div className="inspector-resource-empty">没有匹配的{itemLabel}</div>
+        ) : (
+          <div className="inspector-resource-list">
+            {filteredItems.map((item) => (
+              <label key={item.id} className="inspector-resource-row">
+                <input type="checkbox" checked={selectedDirect.has(item.id)} onChange={(event) => toggleItem(item.id, event.target.checked)} />
+                <span>
+                  <strong>{item.name}</strong>
+                  <small>{renderItemMeta(item)}</small>
+                  {renderItemExtra?.(item)}
+                </span>
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SkillMultiSelect({
   skills,
   selectedIds,
@@ -1033,6 +1228,27 @@ function parseStringList(value: unknown): string[] {
   }
 }
 
+function directResourceIdsFromConfig(
+  config: Record<string, unknown>,
+  finalKey: string,
+  directKey: string,
+  groupKey: string,
+  groups: ResourceGroupConfig[],
+): string[] {
+  if (Object.prototype.hasOwnProperty.call(config, directKey)) {
+    return parseStringList(config[directKey]);
+  }
+  const finalIds = parseStringList(config[finalKey]);
+  const groupIds = new Set(parseStringList(config[groupKey]));
+  if (groupIds.size === 0) return finalIds;
+  const groupedIds = new Set(groups.filter((group) => groupIds.has(group.id)).flatMap((group) => group.itemIds));
+  return finalIds.filter((id) => !groupedIds.has(id));
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
 function toolUsageTags(tool: ToolConfig): string[] {
   const builtinId = toolBuiltinId(tool);
   const text = `${builtinId} ${tool.name} ${tool.description} ${tool.source}`.toLowerCase();
@@ -1042,6 +1258,9 @@ function toolUsageTags(tool: ToolConfig): string[] {
   if (/(html|page|selector|页面)/.test(text)) tags.push("HTML");
   if (/(css|style|scss|less|样式)/.test(text)) tags.push("CSS");
   if (/(web_search|fetch_url|duckduckgo|http|network|搜索|网络)/.test(text)) tags.push("网络");
+  if (/(propose_patch|replace_in_file|write_file|apply_patch|rollback_patch|patch|编辑|补丁|回滚|写入|替换)/.test(text)) tags.push("编辑");
+  if (/(run_whitelisted_command|command|pytest|npm|git diff|命令|验证)/.test(text)) tags.push("命令");
+  if (/(replace_in_file|write_file|apply_patch|rollback_patch|高风险|直接写入|覆盖)/.test(text)) tags.push("高风险");
   return Array.from(new Set(tags));
 }
 
@@ -1164,6 +1383,17 @@ function inspectorInitialRect() {
     y: 98,
     width: 360,
     height: Math.min(720, Math.max(420, viewportHeight - 118)),
+  };
+}
+
+function resourceInspectorInitialRect() {
+  const viewportWidth = typeof window === "undefined" ? 1440 : window.innerWidth;
+  const viewportHeight = typeof window === "undefined" ? 900 : window.innerHeight;
+  return {
+    x: Math.max(16, viewportWidth - 680),
+    y: 98,
+    width: 640,
+    height: Math.min(760, Math.max(480, viewportHeight - 118)),
   };
 }
 
@@ -1306,7 +1536,7 @@ function ModelSelectionFields({
   );
 }
 
-function mergeById<T extends ToolConfig | MCPServerConfig>(items: T[]): T[] {
+function mergeById<T extends { id: string }>(items: T[]): T[] {
   const map = new Map<string, T>();
   for (const item of items) {
     map.set(item.id, item);

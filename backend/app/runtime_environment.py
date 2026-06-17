@@ -24,12 +24,17 @@ class RuntimeEnvironmentConfig(BaseModel):
     allowed_hosts_json: str = Field("[]", alias="allowedHostsJson")
     max_file_bytes: int = Field(1_048_576, alias="maxFileBytes")
     max_http_bytes: int = Field(262_144, alias="maxHttpBytes")
+    allow_direct_edits: bool = Field(False, alias="allowDirectEdits")
+    allowed_command_profiles_json: str = Field("[]", alias="allowedCommandProfilesJson")
+    max_patch_bytes: int = Field(524_288, alias="maxPatchBytes")
+    max_command_output_bytes: int = Field(262_144, alias="maxCommandOutputBytes")
 
 
 def default_runtime_environment() -> RuntimeEnvironmentConfig:
     return RuntimeEnvironmentConfig(
         allowedRootsJson=json.dumps([str(ROOT_DIR)], ensure_ascii=False, indent=2),
         allowedHostsJson=json.dumps(["api.duckduckgo.com"], ensure_ascii=False, indent=2),
+        allowedCommandProfilesJson=json.dumps(default_command_profiles(), ensure_ascii=False, indent=2),
     )
 
 
@@ -81,10 +86,28 @@ def normalize_runtime_environments(items: list[RuntimeEnvironmentConfig]) -> lis
                     "allowed_hosts_json": _ensure_json_list_text(item.allowed_hosts_json, ["api.duckduckgo.com"]),
                     "max_file_bytes": _positive_int(item.max_file_bytes, 1_048_576),
                     "max_http_bytes": _positive_int(item.max_http_bytes, 262_144),
+                    "allow_direct_edits": item.allow_direct_edits is True,
+                    "allowed_command_profiles_json": _ensure_json_list_text(item.allowed_command_profiles_json, default_command_profiles()),
+                    "max_patch_bytes": _positive_int(item.max_patch_bytes, 524_288),
+                    "max_command_output_bytes": _positive_int(item.max_command_output_bytes, 262_144),
                 }
             )
         )
     return normalized
+
+
+def default_command_profiles() -> list[str]:
+    return [
+        "git status",
+        "git diff",
+        "git diff --check",
+        "npm run build",
+        "npm test",
+        "npm run lint",
+        "python -m pytest",
+        "pytest",
+        "python -m compileall",
+    ]
 
 
 def resolve_runtime_environment(value: Any = None, project_runtime_environment_id: str = "") -> dict[str, Any]:

@@ -39,14 +39,14 @@ import type {
   ModelConfig,
   ProjectListItem,
   RagKnowledgeBaseConfig,
+  ResourceGroupConfig,
   SkillConfig,
   SkillImportResult,
   ToolConfig,
   ToolImportResult,
 } from "../types";
 
-type ResourceTab = "tools" | "skills" | "mcp" | "rag" | "models";
-type ManagerView = "agent" | "agents" | "tools" | "skills" | "mcp" | "rag" | "models";
+type ManagerView = "agent" | "agents" | "tools" | "toolGroups" | "skills" | "skillGroups" | "mcp" | "rag" | "models";
 type ResourceEditorMode = "empty" | "create" | "edit";
 type ApiKeyMode = "env" | "direct";
 type EnvCheckState = {
@@ -68,6 +68,16 @@ const CODE_READING_TOOL_SUITE_IDS = [
   "builtin_resolve_asset_references",
   "builtin_extract_code_symbol",
   "builtin_chunk_code_semantic",
+];
+
+const CODE_EDITING_TOOL_SUITE_IDS = [
+  ...CODE_READING_TOOL_SUITE_IDS,
+  "builtin_propose_patch",
+  "builtin_apply_patch_set",
+  "builtin_rollback_patch_set",
+  "builtin_replace_in_file",
+  "builtin_write_file",
+  "builtin_run_whitelisted_command",
 ];
 
 type DialogState =
@@ -95,6 +105,7 @@ export function ManagementPage() {
   const workspaceMcpServers = useProjectStore((state) => state.workspaceMcpServers);
   const workspaceModelConfigs = useProjectStore((state) => state.workspaceModelConfigs);
   const workspaceRagKnowledgeBases = useProjectStore((state) => state.workspaceRagKnowledgeBases);
+  const workspaceResourceGroups = useProjectStore((state) => state.workspaceResourceGroups);
   const status = useProjectStore((state) => state.status);
   const loading = useProjectStore((state) => state.loading);
   const loadProjectList = useProjectStore((state) => state.loadProjectList);
@@ -108,8 +119,8 @@ export function ManagementPage() {
   const updateWorkspaceMcpServers = useProjectStore((state) => state.updateWorkspaceMcpServers);
   const updateWorkspaceModelConfigs = useProjectStore((state) => state.updateWorkspaceModelConfigs);
   const updateWorkspaceRagKnowledgeBases = useProjectStore((state) => state.updateWorkspaceRagKnowledgeBases);
+  const updateWorkspaceResourceGroups = useProjectStore((state) => state.updateWorkspaceResourceGroups);
   const [name, setName] = useState(defaultName("agent"));
-  const [resourceTab, setResourceTab] = useState<ResourceTab>("tools");
   const [selectedToolId, setSelectedToolId] = useState<string | null>(null);
   const [toolDraft, setToolDraft] = useState<ToolConfig>(() => newTool());
   const [toolEditorMode, setToolEditorMode] = useState<ResourceEditorMode>("empty");
@@ -126,6 +137,8 @@ export function ManagementPage() {
   const [modelDraft, setModelDraft] = useState<ModelConfig>(() => newModelConfig(true, MODEL_PROVIDER_PRESETS[0]));
   const [modelEditorMode, setModelEditorMode] = useState<ResourceEditorMode>("empty");
   const [showApiKey, setShowApiKey] = useState(false);
+  const [toolsMenuOpen, setToolsMenuOpen] = useState(true);
+  const [skillsMenuOpen, setSkillsMenuOpen] = useState(true);
   const [dialog, setDialog] = useState<DialogState | null>(null);
 
   useEffect(() => {
@@ -224,6 +237,19 @@ export function ManagementPage() {
     () => (modelEditorMode === "empty" ? "" : getModelConfigError(modelDraft, workspaceModelConfigs)),
     [modelDraft, modelEditorMode, workspaceModelConfigs],
   );
+  const toolResourceGroups = useMemo(
+    () => workspaceResourceGroups.filter((group) => group.resourceType === "tool"),
+    [workspaceResourceGroups],
+  );
+  const skillResourceGroups = useMemo(
+    () => workspaceResourceGroups.filter((group) => group.resourceType === "skill"),
+    [workspaceResourceGroups],
+  );
+
+  function updateResourceGroupsForType(resourceType: "tool" | "skill", groups: ResourceGroupConfig[]) {
+    const others = workspaceResourceGroups.filter((group) => group.resourceType !== resourceType);
+    void updateWorkspaceResourceGroups([...others, ...groups.map((group) => ({ ...group, resourceType }))]);
+  }
 
   function updateModelDraft(patch: Partial<ModelConfig>) {
     setModelDraft((current) => ({ ...current, ...patch }));
@@ -617,19 +643,43 @@ export function ManagementPage() {
               text="管理多 Agent 通信画布"
               onClick={() => setManagerView("agents")}
             />
-            <NavButton
-              active={managerView === "tools"}
+            <NavDropdown
+              active={managerView === "tools" || managerView === "toolGroups"}
+              open={toolsMenuOpen}
               icon={<Wrench size={17} />}
               title="Tools"
               text="管理可作为节点调用的工具"
-              onClick={() => openToolManager()}
+              onToggle={() => {
+                if (managerView === "tools" || managerView === "toolGroups") {
+                  setToolsMenuOpen((current) => !current);
+                  return;
+                }
+                setToolsMenuOpen(true);
+                openToolManager();
+              }}
+              items={[
+                { label: "Tools 配置", active: managerView === "tools", onClick: openToolManager },
+                { label: "预设工具组", active: managerView === "toolGroups", onClick: () => setManagerView("toolGroups") },
+              ]}
             />
-            <NavButton
-              active={managerView === "skills"}
+            <NavDropdown
+              active={managerView === "skills" || managerView === "skillGroups"}
+              open={skillsMenuOpen}
               icon={<Plug size={17} />}
               title="Skills"
               text="管理供 Agent 注入的技能说明"
-              onClick={() => openSkillManager()}
+              onToggle={() => {
+                if (managerView === "skills" || managerView === "skillGroups") {
+                  setSkillsMenuOpen((current) => !current);
+                  return;
+                }
+                setSkillsMenuOpen(true);
+                openSkillManager();
+              }}
+              items={[
+                { label: "Skills 配置", active: managerView === "skills", onClick: openSkillManager },
+                { label: "预设技能组", active: managerView === "skillGroups", onClick: () => setManagerView("skillGroups") },
+              ]}
             />
             <NavButton
               active={managerView === "mcp"}
@@ -653,61 +703,68 @@ export function ManagementPage() {
               onClick={() => openModelManager()}
             />
           </div>
-
-          <div className="manager-sidebar__section">
-            <div className="panel-title">
-              <span>节点资源</span>
-              <small>全局</small>
-            </div>
-            <div className="resource-tabs manager-resource-tabs">
-              <TabButton active={resourceTab === "tools"} icon={<Wrench size={15} />} label="Tools" onClick={() => setResourceTab("tools")} />
-              <TabButton active={resourceTab === "skills"} icon={<Plug size={15} />} label="Skills" onClick={() => setResourceTab("skills")} />
-              <TabButton active={resourceTab === "mcp"} icon={<Server size={15} />} label="MCP" onClick={() => setResourceTab("mcp")} />
-              <TabButton active={resourceTab === "rag"} icon={<Database size={15} />} label="RAG" onClick={() => setResourceTab("rag")} />
-              <TabButton active={resourceTab === "models"} icon={<BrainCircuit size={15} />} label="模型" onClick={() => setResourceTab("models")} />
-            </div>
-            {resourceTab === "tools" ? (
-              <ReadonlyToolResourceList
-                items={workspaceTools}
-                onCreate={createToolDraft}
-                onOpen={openToolManager}
-              />
-            ) : resourceTab === "skills" ? (
-              <ReadonlySkillResourceList
-                items={workspaceSkills}
-                onCreate={createSkillDraft}
-                onOpen={openSkillManager}
-              />
-            ) : resourceTab === "mcp" ? (
-              <ReadonlyMcpResourceList
-                items={workspaceMcpServers}
-                onCreate={createMcpDraft}
-                onOpen={openMcpManager}
-              />
-            ) : resourceTab === "rag" ? (
-              <ReadonlyRagResourceList
-                items={workspaceRagKnowledgeBases}
-                onCreate={createRagDraft}
-                onOpen={openRagManager}
-              />
-            ) : (
-              <ReadonlyModelResourceList
-                items={workspaceModelConfigs}
-                onCreate={() => createModelDraft()}
-                onOpen={openModelManager}
-              />
-            )}
-          </div>
         </aside>
 
         <main className="manager-main glass-panel">
-          {managerView === "tools" ? (
+          {managerView === "toolGroups" ? (
+            <ResourceGroupManagerContent
+              title="预设工具组"
+              text="把常用 Tool 组合成可复用预设组，Agent 工作区的 Tool 检查器左侧可以直接选择这些组。"
+              addText="新建工具组"
+              emptyText="还没有预设工具组。新建后可从已配置 Tools 中勾选加入。"
+              itemLabel="Tool"
+              resourceType="tool"
+              groups={toolResourceGroups}
+              items={workspaceTools}
+              onChange={(groups) => updateResourceGroupsForType("tool", groups)}
+              onRequestDelete={(group, onConfirm) =>
+                setDialog({
+                  kind: "confirm",
+                  title: "删除预设工具组",
+                  message: `确定删除「${group.name || "未命名工具组"}」？删除后已配置节点不会自动移除，但之后不能再选择这个预设组。`,
+                  confirmText: "删除",
+                  danger: true,
+                  onConfirm,
+                })
+              }
+              renderItemMeta={(item) => `${item.source || "tool"} · ${item.description || "未填写描述"}`}
+            />
+          ) : managerView === "skillGroups" ? (
+            <ResourceGroupManagerContent
+              title="预设技能组"
+              text="把常用 Skill 组合成可复用预设组，Agent 工作区的 Skill 检查器左侧可以直接选择这些组。"
+              addText="新建技能组"
+              emptyText="还没有预设技能组。新建后可从已配置 Skills 中勾选加入。"
+              itemLabel="Skill"
+              resourceType="skill"
+              groups={skillResourceGroups}
+              items={workspaceSkills}
+              onChange={(groups) => updateResourceGroupsForType("skill", groups)}
+              onRequestDelete={(group, onConfirm) =>
+                setDialog({
+                  kind: "confirm",
+                  title: "删除预设技能组",
+                  message: `确定删除「${group.name || "未命名技能组"}」？删除后已配置节点不会自动移除，但之后不能再选择这个预设组。`,
+                  confirmText: "删除",
+                  danger: true,
+                  onConfirm,
+                })
+              }
+              renderItemMeta={(item) => `${skillSourceLabel(item.sourceType)} · ${item.description || item.filePath || "未填写描述"}`}
+            />
+          ) : managerView === "tools" ? (
             <ToolManagerContent
               items={workspaceTools}
               draft={toolDraft}
               editorMode={toolEditorMode}
               selectedId={selectedToolId}
               onSelect={(tool) => {
+                if (toolEditorMode === "edit" && selectedToolId === tool.id) {
+                  setSelectedToolId(null);
+                  setToolEditorMode("empty");
+                  setToolDraft(newTool());
+                  return;
+                }
                 setSelectedToolId(tool.id);
                 setToolDraft(tool);
                 setToolEditorMode("edit");
@@ -732,6 +789,12 @@ export function ManagementPage() {
               editorMode={skillEditorMode}
               selectedId={selectedSkillId}
               onSelect={(skill) => {
+                if (skillEditorMode === "edit" && selectedSkillId === skill.id) {
+                  setSelectedSkillId(null);
+                  setSkillEditorMode("empty");
+                  setSkillDraft(newSkill());
+                  return;
+                }
                 setSelectedSkillId(skill.id);
                 setSkillDraft(skill);
                 setSkillEditorMode("edit");
@@ -755,6 +818,12 @@ export function ManagementPage() {
               editorMode={mcpEditorMode}
               selectedId={selectedMcpId}
               onSelect={(server) => {
+                if (mcpEditorMode === "edit" && selectedMcpId === server.id) {
+                  setSelectedMcpId(null);
+                  setMcpEditorMode("empty");
+                  setMcpDraft(newMcpServer());
+                  return;
+                }
                 setSelectedMcpId(server.id);
                 setMcpDraft(server);
                 setMcpEditorMode("edit");
@@ -944,6 +1013,352 @@ function ProjectManagerContent({
   );
 }
 
+function ResourceGroupManagerContent<T extends { id: string; name: string; description?: string }>({
+  title,
+  text,
+  addText,
+  emptyText,
+  itemLabel,
+  resourceType,
+  groups,
+  items,
+  onChange,
+  onRequestDelete,
+  renderItemMeta,
+}: {
+  title: string;
+  text: string;
+  addText: string;
+  emptyText: string;
+  itemLabel: string;
+  resourceType: "tool" | "skill";
+  groups: ResourceGroupConfig[];
+  items: T[];
+  onChange: (groups: ResourceGroupConfig[]) => void;
+  onRequestDelete: (group: ResourceGroupConfig, onConfirm: () => void) => void;
+  renderItemMeta: (item: T) => string;
+}) {
+  return (
+    <div className="model-manager">
+      <div className="manager-main__head">
+        <div>
+          <h2>{title}</h2>
+          <p>{text}</p>
+        </div>
+      </div>
+      <section className="resource-group-page">
+        <ResourceGroupManager
+          title={title}
+          addText={addText}
+          emptyText={emptyText}
+          itemLabel={itemLabel}
+          resourceType={resourceType}
+          groups={groups}
+          items={items}
+          onChange={onChange}
+          onRequestDelete={onRequestDelete}
+          renderItemMeta={renderItemMeta}
+        />
+      </section>
+    </div>
+  );
+}
+
+function ResourceGroupManager<T extends { id: string; name: string; description?: string }>({
+  title,
+  addText,
+  emptyText,
+  itemLabel,
+  resourceType,
+  groups,
+  items,
+  onChange,
+  onRequestDelete,
+  renderItemMeta,
+}: {
+  title: string;
+  addText: string;
+  emptyText: string;
+  itemLabel: string;
+  resourceType: "tool" | "skill";
+  groups: ResourceGroupConfig[];
+  items: T[];
+  onChange: (groups: ResourceGroupConfig[]) => void;
+  onRequestDelete: (group: ResourceGroupConfig, onConfirm: () => void) => void;
+  renderItemMeta: (item: T) => string;
+}) {
+  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(groups[0]?.id ?? null);
+  const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
+  const [groupDraft, setGroupDraft] = useState<ResourceGroupConfig | null>(null);
+  const [groupQuery, setGroupQuery] = useState("");
+  const [itemQuery, setItemQuery] = useState("");
+  const normalizedGroupQuery = groupQuery.trim().toLowerCase();
+  const normalizedItemQuery = itemQuery.trim().toLowerCase();
+  const itemById = new Map(items.map((item) => [item.id, item]));
+  const selectedGroup = groups.find((group) => group.id === selectedGroupId) ?? null;
+  const isEditingSelectedGroup = Boolean(selectedGroup && editingGroupId === selectedGroup.id);
+  const activeGroup = isEditingSelectedGroup && groupDraft ? groupDraft : selectedGroup;
+  const activeItems = activeGroup ? (activeGroup.itemIds.map((id) => itemById.get(id)).filter(Boolean) as T[]) : [];
+  const filteredGroups = normalizedGroupQuery
+    ? groups.filter((group) => {
+        const includedText = group.itemIds
+          .map((id) => itemById.get(id))
+          .filter(Boolean)
+          .map((item) => `${item?.name ?? ""} ${item ? renderItemMeta(item) : ""}`)
+          .join(" ");
+        return `${group.name} ${group.description} ${includedText}`.toLowerCase().includes(normalizedGroupQuery);
+      })
+    : groups;
+  const filteredItems = normalizedItemQuery
+    ? items.filter((item) => `${item.name} ${item.description ?? ""} ${renderItemMeta(item)}`.toLowerCase().includes(normalizedItemQuery))
+    : items;
+
+  useEffect(() => {
+    if (selectedGroupId && groups.some((group) => group.id === selectedGroupId)) {
+      return;
+    }
+    setSelectedGroupId(groups[0]?.id ?? null);
+  }, [groups, selectedGroupId]);
+
+  useEffect(() => {
+    if (editingGroupId && groups.some((group) => group.id === editingGroupId)) {
+      return;
+    }
+    setEditingGroupId(null);
+    setGroupDraft(null);
+  }, [editingGroupId, groups]);
+
+  function addGroup() {
+    const group: ResourceGroupConfig = {
+      id: createId("group"),
+      name: resourceType === "tool" ? "预设工具组" : "预设技能组",
+      description: "",
+      resourceType,
+      itemIds: [],
+    };
+    onChange([...groups, group]);
+    setSelectedGroupId(group.id);
+    setEditingGroupId(group.id);
+    setGroupDraft({ ...group, itemIds: [...group.itemIds] });
+  }
+
+  function startEditing(group: ResourceGroupConfig) {
+    setEditingGroupId(group.id);
+    setGroupDraft({ ...group, itemIds: [...group.itemIds] });
+  }
+
+  function updateGroupDraft(patch: Partial<ResourceGroupConfig>) {
+    setGroupDraft((current) => {
+      const base = current ?? selectedGroup;
+      if (!base) return current;
+      return {
+        ...base,
+        ...patch,
+        resourceType,
+        itemIds: patch.itemIds ? [...patch.itemIds] : [...base.itemIds],
+      };
+    });
+  }
+
+  function toggleDraftGroupItem(itemId: string, checked: boolean) {
+    const current = new Set((groupDraft ?? selectedGroup)?.itemIds ?? []);
+    if (checked) {
+      current.add(itemId);
+    } else {
+      current.delete(itemId);
+    }
+    updateGroupDraft({ itemIds: Array.from(current) });
+  }
+
+  function finishEditingGroup() {
+    if (!groupDraft) {
+      setEditingGroupId(null);
+      return;
+    }
+    onChange(groups.map((group) => (group.id === groupDraft.id ? { ...groupDraft, resourceType } : group)));
+    setEditingGroupId(null);
+    setGroupDraft(null);
+  }
+
+  function selectGroup(groupId: string) {
+    setSelectedGroupId(groupId);
+    if (editingGroupId !== groupId) {
+      setEditingGroupId(null);
+      setGroupDraft(null);
+    }
+  }
+
+  function requestDeleteGroup(group: ResourceGroupConfig) {
+    onRequestDelete(group, () => {
+      const nextGroups = groups.filter((item) => item.id !== group.id);
+      onChange(nextGroups);
+      setSelectedGroupId(nextGroups[0]?.id ?? null);
+      setEditingGroupId(null);
+      setGroupDraft(null);
+    });
+  }
+
+  return (
+    <div className="resource-group-workspace">
+      <section className="model-editor-card resource-group-list-panel">
+        <div className="resource-group-page-head">
+          <span>
+            <strong>{title}</strong>
+            <small>{groups.length} 组 · {items.length} 个{itemLabel}</small>
+          </span>
+          <button type="button" onClick={addGroup}>
+            <Plus size={15} />
+            <span>{addText}</span>
+          </button>
+        </div>
+        <input value={groupQuery} onChange={(event) => setGroupQuery(event.target.value)} placeholder="搜索预设组、说明或成员" />
+        {groups.length === 0 ? <div className="resource-group-empty">{emptyText}</div> : null}
+        {groups.length > 0 && filteredGroups.length === 0 ? <div className="resource-group-empty">没有匹配的预设组。</div> : null}
+        <div className="resource-group-card-grid">
+          {filteredGroups.map((group) => {
+            const includedItems = group.itemIds.map((id) => itemById.get(id)).filter(Boolean) as T[];
+            return (
+              <button
+                key={group.id}
+                className={`resource-group-card ${selectedGroup?.id === group.id ? "is-active" : ""}`}
+                type="button"
+                onClick={() => selectGroup(group.id)}
+              >
+                <span className="resource-group-card__top">
+                  <strong>{group.name}</strong>
+                  <em>{includedItems.length} 个{itemLabel}</em>
+                </span>
+                <small>{group.description || "未填写说明"}</small>
+                <span className="resource-group-card__summary">
+                  {includedItems.length === 0 ? (
+                    <span>未选择{itemLabel}</span>
+                  ) : (
+                    includedItems.slice(0, 5).map((item) => <span key={item.id}>{item.name}</span>)
+                  )}
+                  {includedItems.length > 5 ? <span>+{includedItems.length - 5}</span> : null}
+                </span>
+                <span className="resource-group-card__footer">点击查看详情</span>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
+      <section className="model-editor-card resource-group-detail-panel">
+        {selectedGroup ? (
+          <>
+            <div className="resource-group-detail-head">
+              <span>
+                <strong>预设详情</strong>
+                <small>{activeGroup?.itemIds.length ?? selectedGroup.itemIds.length} 个{itemLabel}</small>
+              </span>
+              <div className="resource-group-detail-actions">
+                {isEditingSelectedGroup ? (
+                  <>
+                    <button type="button" onClick={finishEditingGroup}>
+                      <Check size={15} />
+                      <span>完成</span>
+                    </button>
+                    <button className="danger" type="button" onClick={() => requestDeleteGroup(selectedGroup)}>
+                      <Trash2 size={15} />
+                      <span>删除</span>
+                    </button>
+                  </>
+                ) : (
+                  <button type="button" onClick={() => startEditing(selectedGroup)}>
+                    <Edit3 size={15} />
+                    <span>编辑</span>
+                  </button>
+                )}
+              </div>
+            </div>
+            {isEditingSelectedGroup ? (
+              <>
+                <Field label="组名称">
+                  <input value={groupDraft?.name ?? ""} onChange={(event) => updateGroupDraft({ name: event.target.value })} />
+                </Field>
+                <Field label="说明">
+                  <textarea
+                    rows={3}
+                    value={groupDraft?.description ?? ""}
+                    onChange={(event) => updateGroupDraft({ description: event.target.value })}
+                    placeholder="说明这个预设组适合什么场景"
+                  />
+                </Field>
+                <div className="resource-group-detail-tools">
+                  <span>
+                    <strong>包含的{itemLabel}</strong>
+                    <small>勾选后会保存到该预设组</small>
+                  </span>
+                  <input value={itemQuery} onChange={(event) => setItemQuery(event.target.value)} placeholder={`搜索 ${itemLabel} 名称或说明`} />
+                </div>
+                <div className="resource-group-item-list resource-group-item-list--detail">
+                  {items.length === 0 ? (
+                    <div className="resource-group-empty">还没有可加入的{itemLabel}。</div>
+                  ) : filteredItems.length === 0 ? (
+                    <div className="resource-group-empty">没有匹配的{itemLabel}。</div>
+                  ) : (
+                    filteredItems.map((item) => (
+                      <label key={item.id} className="resource-group-item">
+                        <input
+                          type="checkbox"
+                          checked={(groupDraft?.itemIds ?? []).includes(item.id)}
+                          onChange={(event) => toggleDraftGroupItem(item.id, event.target.checked)}
+                        />
+                        <span>
+                          <strong>{item.name}</strong>
+                          <small>{renderItemMeta(item)}</small>
+                        </span>
+                      </label>
+                    ))
+                  )}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="resource-group-readonly">
+                  <div>
+                    <strong>组名称</strong>
+                    <span>{selectedGroup.name || "未命名预设组"}</span>
+                  </div>
+                  <div>
+                    <strong>说明</strong>
+                    <span>{selectedGroup.description || "未填写说明"}</span>
+                  </div>
+                </div>
+                <div className="resource-group-detail-tools">
+                  <span>
+                    <strong>包含的{itemLabel}</strong>
+                    <small>点击编辑后可调整成员</small>
+                  </span>
+                </div>
+                <div className="resource-group-selected-list">
+                  {activeItems.length === 0 ? (
+                    <div className="resource-group-empty">这个预设组还没有包含任何{itemLabel}。</div>
+                  ) : (
+                    activeItems.map((item) => (
+                      <div key={item.id} className="resource-group-selected-item">
+                        <strong>{item.name}</strong>
+                        <small>{renderItemMeta(item)}</small>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </>
+            )}
+          </>
+        ) : (
+          <ResourceEditorEmpty
+            icon={resourceType === "tool" ? <Wrench size={24} /> : <Plug size={24} />}
+            title="未选择预设组"
+            text="从左侧卡片选择一个预设组查看详情，或新建一个预设组。"
+          />
+        )}
+      </section>
+    </div>
+  );
+}
+
 function ToolManagerContent({
   items,
   draft,
@@ -983,6 +1398,7 @@ function ToolManagerContent({
   const [importing, setImporting] = useState(false);
   const [importMessage, setImportMessage] = useState("");
   const [importError, setImportError] = useState(false);
+  const showToolEditor = editorMode !== "empty";
 
   useEffect(() => {
     let cancelled = false;
@@ -1015,23 +1431,31 @@ function ToolManagerContent({
   }
 
   async function handleInstallCodeReadingSuite() {
+    await handleInstallToolSuite("code-reading-suite", CODE_READING_TOOL_SUITE_IDS, "代码读取套装");
+  }
+
+  async function handleInstallCodeEditingSuite() {
+    await handleInstallToolSuite("code-editing-suite", CODE_EDITING_TOOL_SUITE_IDS, "代码编辑套装");
+  }
+
+  async function handleInstallToolSuite(suiteId: string, suiteIds: string[], suiteName: string) {
     const availableIds = new Set(presets.map((preset) => preset.id));
     const installedIds = new Set(items.map((item) => item.id));
-    const ids = CODE_READING_TOOL_SUITE_IDS.filter((id) => availableIds.has(id) && !installedIds.has(id));
+    const ids = suiteIds.filter((id) => availableIds.has(id) && !installedIds.has(id));
     if (!ids.length) {
-      setPresetMessage("代码读取套装已经全部安装。");
+      setPresetMessage(`${suiteName}已经全部安装。`);
       setPresetError(false);
       return;
     }
-    setInstallingPreset("code-reading-suite");
-    setPresetMessage("正在安装代码读取套装...");
+    setInstallingPreset(suiteId);
+    setPresetMessage(`正在安装${suiteName}...`);
     setPresetError(false);
     try {
       const result = await onInstallPresets(ids);
       setPresetMessage(formatToolImportMessage(result));
       setPresetError(false);
     } catch (error) {
-      setPresetMessage(error instanceof Error ? readableApiError(error.message) : "代码读取套装安装失败。");
+      setPresetMessage(error instanceof Error ? readableApiError(error.message) : `${suiteName}安装失败。`);
       setPresetError(true);
     } finally {
       setInstallingPreset(null);
@@ -1094,106 +1518,120 @@ function ToolManagerContent({
           renderMark={() => <Wrench size={16} />}
         />
         <section className="model-editor-panel">
-          <div className="model-editor-card preset-tools-card">
-            <div className="mcp-import-head">
-              <strong>预设 Tools</strong>
-              <span>安装后会出现在已配置 Tools 中，可在 Tools 节点里选择。</span>
-            </div>
-            <div className="preset-suite-card">
-              <span>
-                <strong>代码读取套装</strong>
-                <small>一次安装文件读取、代码搜索、语义分片、HTML/CSS 抽取和页面分析工具。</small>
-              </span>
-              <button
-                disabled={Boolean(installingPreset) || CODE_READING_TOOL_SUITE_IDS.every((id) => items.some((item) => item.id === id))}
-                onClick={() => void handleInstallCodeReadingSuite()}
-                type="button"
-              >
-                {installingPreset === "code-reading-suite" ? "安装中" : "安装套装"}
-              </button>
-            </div>
-            <div className="preset-tools-grid">
-              {presets.map((preset) => {
-                const installed = items.some((item) => item.id === preset.id);
-                return (
+          {!showToolEditor ? (
+            <>
+              <div className="model-editor-card preset-tools-card">
+                <div className="mcp-import-head">
+                  <strong>预设 Tools</strong>
+                  <span>安装后会出现在已配置 Tools 中，可在 Tools 节点里选择。</span>
+                </div>
+                <div className="preset-suite-card">
+                  <span>
+                    <strong>代码读取套装</strong>
+                    <small>一次安装文件读取、代码搜索、语义分片、HTML/CSS 抽取和页面分析工具。</small>
+                  </span>
                   <button
-                    key={preset.id}
-                    className={installed ? "is-installed" : ""}
-                    disabled={Boolean(installingPreset) || installed}
-                    onClick={() => void handleInstallPreset(preset.id)}
+                    disabled={Boolean(installingPreset) || CODE_READING_TOOL_SUITE_IDS.every((id) => items.some((item) => item.id === id))}
+                    onClick={() => void handleInstallCodeReadingSuite()}
                     type="button"
                   >
-                    <Wrench size={15} />
-                    <span>
-                      <strong>{preset.name}</strong>
-                      <small>{preset.description}</small>
-                    </span>
-                    <em>{installed ? "已安装" : installingPreset === preset.id ? "安装中" : "安装"}</em>
+                    {installingPreset === "code-reading-suite" ? "安装中" : "安装套装"}
                   </button>
-                );
-              })}
-            </div>
-            {presetMessage ? <small className={`rag-inspect-status ${presetError ? "is-error" : ""}`}>{presetMessage}</small> : null}
-          </div>
-          <div className="model-editor-card mcp-import-card">
-            <div className="mcp-import-head">
-              <strong>一键导入 Tools</strong>
-              <span>支持上传本地文件夹、本机路径复制导入，也支持 GitHub 仓库镜像 clone。</span>
-            </div>
-            <div className="api-key-source">
-              <button className={importType === "local" ? "is-active" : ""} onClick={() => setImportType("local")} type="button">
-                <FolderInput size={14} />
-                <span>本机路径</span>
-              </button>
-              <button className={importType === "github" ? "is-active" : ""} onClick={() => setImportType("github")} type="button">
-                <Github size={14} />
-                <span>GitHub 地址</span>
-              </button>
-            </div>
-            <div className="rag-path-import">
-              <input
-                value={importSource}
-                placeholder={importType === "github" ? "https://github.com/org/repo 或 org/repo" : "粘贴本机工具文件夹或单个 tools.py / openapi.json 路径"}
-                onChange={(event) => setImportSource(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    void handleImport();
-                  }
-                }}
-              />
-              <button disabled={importing} onClick={() => void handleImport()} type="button">
-                <Search size={15} />
-                <span>{importing ? "导入中" : "导入"}</span>
-              </button>
-            </div>
-            <div className="tool-import-actions">
-              <label className={`tool-upload-button ${importing ? "is-disabled" : ""}`}>
-                <Upload size={15} />
-                <span>上传本地文件夹</span>
-                <input
-                  type="file"
-                  multiple
-                  disabled={importing}
-                  onChange={(event) => {
-                    void handleFolderUpload(event.target.files);
-                    event.currentTarget.value = "";
-                  }}
-                  {...{ webkitdirectory: "", directory: "" }}
-                />
-              </label>
-              {importType === "github" ? (
-                <label className="mcp-import-toggle">
-                  <input checked={useMirror} onChange={(event) => setUseMirror(event.target.checked)} type="checkbox" />
-                  <span>优先使用国内 GitHub 镜像源 clone，失败后回退原地址。</span>
-                </label>
-              ) : null}
-            </div>
-            <small className="model-config-note">会识别 Python @tool / tool 文件中的函数、OpenAPI operations、tools.json；导入文件统一复制/clone 到后端 config/tools/ 目录。</small>
-            {importMessage ? <small className={`rag-inspect-status ${importError ? "is-error" : ""}`}>{importMessage}</small> : null}
-          </div>
-          {editorMode === "empty" ? (
-            <ResourceEditorEmpty icon={<Wrench size={24} />} title="未选择 Tool" text="从左侧选择一个已配置 Tool 进行编辑，或点击右上角新增 Tool。" />
+                </div>
+                <div className="preset-suite-card">
+                  <span>
+                    <strong>代码编辑套装</strong>
+                    <small>包含代码读取、补丁预览、审批应用、回滚和白名单验证命令工具。</small>
+                  </span>
+                  <button
+                    disabled={Boolean(installingPreset) || CODE_EDITING_TOOL_SUITE_IDS.every((id) => items.some((item) => item.id === id))}
+                    onClick={() => void handleInstallCodeEditingSuite()}
+                    type="button"
+                  >
+                    {installingPreset === "code-editing-suite" ? "安装中" : "安装套装"}
+                  </button>
+                </div>
+                <div className="preset-tools-grid">
+                  {presets.map((preset) => {
+                    const installed = items.some((item) => item.id === preset.id);
+                    return (
+                      <button
+                        key={preset.id}
+                        className={installed ? "is-installed" : ""}
+                        disabled={Boolean(installingPreset) || installed}
+                        onClick={() => void handleInstallPreset(preset.id)}
+                        type="button"
+                      >
+                        <Wrench size={15} />
+                        <span>
+                          <strong>{preset.name}</strong>
+                          <small>{preset.description}</small>
+                        </span>
+                        <em>{installed ? "已安装" : installingPreset === preset.id ? "安装中" : "安装"}</em>
+                      </button>
+                    );
+                  })}
+                </div>
+                {presetMessage ? <small className={`rag-inspect-status ${presetError ? "is-error" : ""}`}>{presetMessage}</small> : null}
+              </div>
+              <div className="model-editor-card mcp-import-card">
+                <div className="mcp-import-head">
+                  <strong>一键导入 Tools</strong>
+                  <span>支持上传本地文件夹、本机路径复制导入，也支持 GitHub 仓库镜像 clone。</span>
+                </div>
+                <div className="api-key-source">
+                  <button className={importType === "local" ? "is-active" : ""} onClick={() => setImportType("local")} type="button">
+                    <FolderInput size={14} />
+                    <span>本机路径</span>
+                  </button>
+                  <button className={importType === "github" ? "is-active" : ""} onClick={() => setImportType("github")} type="button">
+                    <Github size={14} />
+                    <span>GitHub 地址</span>
+                  </button>
+                </div>
+                <div className="rag-path-import">
+                  <input
+                    value={importSource}
+                    placeholder={importType === "github" ? "https://github.com/org/repo 或 org/repo" : "粘贴本机工具文件夹或单个 tools.py / openapi.json 路径"}
+                    onChange={(event) => setImportSource(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void handleImport();
+                      }
+                    }}
+                  />
+                  <button disabled={importing} onClick={() => void handleImport()} type="button">
+                    <Search size={15} />
+                    <span>{importing ? "导入中" : "导入"}</span>
+                  </button>
+                </div>
+                <div className="tool-import-actions">
+                  <label className={`tool-upload-button ${importing ? "is-disabled" : ""}`}>
+                    <Upload size={15} />
+                    <span>上传本地文件夹</span>
+                    <input
+                      type="file"
+                      multiple
+                      disabled={importing}
+                      onChange={(event) => {
+                        void handleFolderUpload(event.target.files);
+                        event.currentTarget.value = "";
+                      }}
+                      {...{ webkitdirectory: "", directory: "" }}
+                    />
+                  </label>
+                  {importType === "github" ? (
+                    <label className="mcp-import-toggle">
+                      <input checked={useMirror} onChange={(event) => setUseMirror(event.target.checked)} type="checkbox" />
+                      <span>优先使用国内 GitHub 镜像源 clone，失败后回退原地址。</span>
+                    </label>
+                  ) : null}
+                </div>
+                <small className="model-config-note">会识别 Python @tool / tool 文件中的函数、OpenAPI operations、tools.json；导入文件统一复制/clone 到后端 config/tools/ 目录。</small>
+                {importMessage ? <small className={`rag-inspect-status ${importError ? "is-error" : ""}`}>{importMessage}</small> : null}
+              </div>
+            </>
           ) : (
             <div className="model-editor-card">
               <ResourceEditorHead title={editorMode === "create" ? "新增 Tool" : "编辑 Tool"} text="配置工具名称、来源、说明和参数 Schema。" mode={editorMode} onCancel={onCancel} onDelete={onDelete} onSave={onSave} />
@@ -1255,6 +1693,7 @@ function SkillManagerContent({
   const [importing, setImporting] = useState(false);
   const [importMessage, setImportMessage] = useState("");
   const [importError, setImportError] = useState(false);
+  const showSkillEditor = editorMode !== "empty";
 
   async function handleImport() {
     const source = importSource.trim();
@@ -1312,79 +1751,80 @@ function SkillManagerContent({
           renderMark={() => <Plug size={16} />}
         />
         <section className="model-editor-panel">
-          <div className="model-editor-card mcp-import-card">
-            <div className="mcp-import-head">
-              <strong>一键导入 Skills</strong>
-              <span>识别目录内 SKILL.md 为 Codex-style Skill；普通 Markdown 会作为独立 Skill。</span>
-            </div>
-            <div className="api-key-source">
-              <button className={importType === "local" ? "is-active" : ""} onClick={() => setImportType("local")} type="button">
-                <FolderInput size={14} />
-                <span>本机路径</span>
-              </button>
-              <button className={importType === "github" ? "is-active" : ""} onClick={() => setImportType("github")} type="button">
-                <Github size={14} />
-                <span>GitHub 地址</span>
-              </button>
-            </div>
-            <div className="rag-path-import">
-              <input
-                value={importSource}
-                placeholder={importType === "github" ? "https://github.com/org/repo 或 org/repo" : "粘贴本机 SKILL.md、Markdown 文件或 skills 目录路径"}
-                onChange={(event) => setImportSource(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    void handleImport();
-                  }
-                }}
-              />
-              <button disabled={importing} onClick={() => void handleImport()} type="button">
-                <Search size={15} />
-                <span>{importing ? "导入中" : "导入"}</span>
-              </button>
-            </div>
-            <div className="tool-import-actions">
-              <label className={`tool-upload-button ${importing ? "is-disabled" : ""}`}>
-                <Upload size={15} />
-                <span>上传 Markdown 文件</span>
-                <input
-                  type="file"
-                  multiple
-                  accept=".md,.markdown,text/markdown,text/plain"
-                  disabled={importing}
-                  onChange={(event) => {
-                    void handleUpload(event.target.files, "uploaded-skills");
-                    event.currentTarget.value = "";
-                  }}
-                />
-              </label>
-              <label className={`tool-upload-button ${importing ? "is-disabled" : ""}`}>
-                <Upload size={15} />
-                <span>上传文件夹</span>
-                <input
-                  type="file"
-                  multiple
-                  disabled={importing}
-                  onChange={(event) => {
-                    void handleUpload(event.target.files, "uploaded-skills");
-                    event.currentTarget.value = "";
-                  }}
-                  {...{ webkitdirectory: "", directory: "" }}
-                />
-              </label>
-              {importType === "github" ? (
-                <label className="mcp-import-toggle">
-                  <input checked={useMirror} onChange={(event) => setUseMirror(event.target.checked)} type="checkbox" />
-                  <span>优先使用国内 GitHub 镜像源 clone，失败后回退原地址。</span>
-                </label>
-              ) : null}
-            </div>
-            <small className="model-config-note">导入文件统一复制/clone 到后端 config/skills/ 目录；v1 只读取 Markdown 内容，不执行脚本、不安装依赖。</small>
-            {importMessage ? <small className={`rag-inspect-status ${importError ? "is-error" : ""}`}>{importMessage}</small> : null}
-          </div>
-          {editorMode === "empty" ? (
-            <ResourceEditorEmpty icon={<Plug size={24} />} title="未选择 Skill" text="从左侧选择一个已配置 Skill 进行编辑，或点击右上角新增 Skill。" />
+          {!showSkillEditor ? (
+            <>
+              <div className="model-editor-card mcp-import-card">
+                <div className="mcp-import-head">
+                  <strong>一键导入 Skills</strong>
+                  <span>识别目录内 SKILL.md 为 Codex-style Skill；普通 Markdown 会作为独立 Skill。</span>
+                </div>
+                <div className="api-key-source">
+                  <button className={importType === "local" ? "is-active" : ""} onClick={() => setImportType("local")} type="button">
+                    <FolderInput size={14} />
+                    <span>本机路径</span>
+                  </button>
+                  <button className={importType === "github" ? "is-active" : ""} onClick={() => setImportType("github")} type="button">
+                    <Github size={14} />
+                    <span>GitHub 地址</span>
+                  </button>
+                </div>
+                <div className="rag-path-import">
+                  <input
+                    value={importSource}
+                    placeholder={importType === "github" ? "https://github.com/org/repo 或 org/repo" : "粘贴本机 SKILL.md、Markdown 文件或 skills 目录路径"}
+                    onChange={(event) => setImportSource(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void handleImport();
+                      }
+                    }}
+                  />
+                  <button disabled={importing} onClick={() => void handleImport()} type="button">
+                    <Search size={15} />
+                    <span>{importing ? "导入中" : "导入"}</span>
+                  </button>
+                </div>
+                <div className="tool-import-actions">
+                  <label className={`tool-upload-button ${importing ? "is-disabled" : ""}`}>
+                    <Upload size={15} />
+                    <span>上传 Markdown 文件</span>
+                    <input
+                      type="file"
+                      multiple
+                      accept=".md,.markdown,text/markdown,text/plain"
+                      disabled={importing}
+                      onChange={(event) => {
+                        void handleUpload(event.target.files, "uploaded-skills");
+                        event.currentTarget.value = "";
+                      }}
+                    />
+                  </label>
+                  <label className={`tool-upload-button ${importing ? "is-disabled" : ""}`}>
+                    <Upload size={15} />
+                    <span>上传文件夹</span>
+                    <input
+                      type="file"
+                      multiple
+                      disabled={importing}
+                      onChange={(event) => {
+                        void handleUpload(event.target.files, "uploaded-skills");
+                        event.currentTarget.value = "";
+                      }}
+                      {...{ webkitdirectory: "", directory: "" }}
+                    />
+                  </label>
+                  {importType === "github" ? (
+                    <label className="mcp-import-toggle">
+                      <input checked={useMirror} onChange={(event) => setUseMirror(event.target.checked)} type="checkbox" />
+                      <span>优先使用国内 GitHub 镜像源 clone，失败后回退原地址。</span>
+                    </label>
+                  ) : null}
+                </div>
+                <small className="model-config-note">导入文件统一复制/clone 到后端 config/skills/ 目录；会识别 SKILL.md、references、metadata、scripts 和 assets，运行时注入可控上下文，但不会自动执行脚本或安装依赖。</small>
+                {importMessage ? <small className={`rag-inspect-status ${importError ? "is-error" : ""}`}>{importMessage}</small> : null}
+              </div>
+            </>
           ) : (
             <div className="model-editor-card">
               <ResourceEditorHead title={editorMode === "create" ? "新增 Skill" : "编辑 Skill"} text="配置 Skill 名称、说明和注入到 Agent 的 Markdown 内容。" mode={editorMode} onCancel={onCancel} onDelete={onDelete} onSave={onSave} />
@@ -1459,6 +1899,7 @@ function McpManagerContent({
   const [importing, setImporting] = useState(false);
   const [importMessage, setImportMessage] = useState("");
   const [importError, setImportError] = useState(false);
+  const showMcpEditor = editorMode !== "empty";
 
   async function handleImport() {
     const source = importSource.trim();
@@ -1497,43 +1938,42 @@ function McpManagerContent({
           renderMark={() => <Server size={16} />}
         />
         <section className="model-editor-panel">
-          <div className="model-editor-card mcp-import-card">
-            <div className="mcp-import-head">
-              <strong>一键导入 MCP</strong>
-              <span>支持本地配置/项目目录，也支持 GitHub 仓库镜像 clone。</span>
+          {!showMcpEditor ? (
+            <div className="model-editor-card mcp-import-card">
+              <div className="mcp-import-head">
+                <strong>一键导入 MCP</strong>
+                <span>支持本地配置/项目目录，也支持 GitHub 仓库镜像 clone。</span>
+              </div>
+              <div className="api-key-source">
+                <button className={importType === "local" ? "is-active" : ""} onClick={() => setImportType("local")} type="button">本地路径</button>
+                <button className={importType === "github" ? "is-active" : ""} onClick={() => setImportType("github")} type="button">GitHub 地址</button>
+              </div>
+              <div className="rag-path-import">
+                <input
+                  value={importSource}
+                  placeholder={importType === "github" ? "https://github.com/org/repo 或 org/repo" : "粘贴 config.toml、mcp.json 或 MCP 项目目录"}
+                  onChange={(event) => setImportSource(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void handleImport();
+                    }
+                  }}
+                />
+                <button disabled={importing} onClick={() => void handleImport()} type="button">
+                  <Search size={15} />
+                  <span>{importing ? "导入中" : "导入"}</span>
+                </button>
+              </div>
+              {importType === "github" ? (
+                <label className="mcp-import-toggle">
+                  <input checked={useMirror} onChange={(event) => setUseMirror(event.target.checked)} type="checkbox" />
+                  <span>优先使用国内 GitHub 镜像源 clone，失败后回退原地址。</span>
+                </label>
+              ) : null}
+              <small className="model-config-note">会识别 Codex config.toml 中的 [mcp_servers.*]、常见 mcp.json；导入文件统一复制/clone 到后端 config/mcp/ 目录。</small>
+              {importMessage ? <small className={`rag-inspect-status ${importError ? "is-error" : ""}`}>{importMessage}</small> : null}
             </div>
-            <div className="api-key-source">
-              <button className={importType === "local" ? "is-active" : ""} onClick={() => setImportType("local")} type="button">本地路径</button>
-              <button className={importType === "github" ? "is-active" : ""} onClick={() => setImportType("github")} type="button">GitHub 地址</button>
-            </div>
-            <div className="rag-path-import">
-              <input
-                value={importSource}
-                placeholder={importType === "github" ? "https://github.com/org/repo 或 org/repo" : "粘贴 config.toml、mcp.json 或 MCP 项目目录"}
-                onChange={(event) => setImportSource(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    void handleImport();
-                  }
-                }}
-              />
-              <button disabled={importing} onClick={() => void handleImport()} type="button">
-                <Search size={15} />
-                <span>{importing ? "导入中" : "导入"}</span>
-              </button>
-            </div>
-            {importType === "github" ? (
-              <label className="mcp-import-toggle">
-                <input checked={useMirror} onChange={(event) => setUseMirror(event.target.checked)} type="checkbox" />
-                <span>优先使用国内 GitHub 镜像源 clone，失败后回退原地址。</span>
-              </label>
-            ) : null}
-            <small className="model-config-note">会识别 Codex config.toml 中的 [mcp_servers.*]、常见 mcp.json；导入文件统一复制/clone 到后端 config/mcp/ 目录。</small>
-            {importMessage ? <small className={`rag-inspect-status ${importError ? "is-error" : ""}`}>{importMessage}</small> : null}
-          </div>
-          {editorMode === "empty" ? (
-            <ResourceEditorEmpty icon={<Server size={24} />} title="未选择 MCP" text="从左侧选择一个已配置 MCP 进行编辑，或点击右上角新增 MCP。" />
           ) : (
             <div className="model-editor-card">
               <ResourceEditorHead title={editorMode === "create" ? "新增 MCP" : "编辑 MCP"} text="配置 MCP Server 的传输方式、启动命令或远程地址。" mode={editorMode} onCancel={onCancel} onDelete={onDelete} onSave={onSave} />
@@ -1976,7 +2416,7 @@ function ModelManagerContent({
       <div className="manager-main__head">
         <div>
           <h2>模型配置</h2>
-          <p>维护运行测试 Agent 使用的模型服务商。节点资源中只能加载这些配置，不能直接管理。</p>
+          <p>维护运行测试 Agent 使用的模型服务商。节点中只能加载这些配置，不能直接管理。</p>
         </div>
         <button className="primary" onClick={onNew} type="button">
           <Plus size={16} />
@@ -2290,6 +2730,43 @@ function NavButton({
   );
 }
 
+function NavDropdown({
+  active,
+  open,
+  icon,
+  title,
+  text,
+  items,
+  onToggle,
+}: {
+  active: boolean;
+  open: boolean;
+  icon: ReactNode;
+  title: string;
+  text: string;
+  items: Array<{ label: string; active: boolean; onClick: () => void }>;
+  onToggle: () => void;
+}) {
+  return (
+    <div className={`manager-nav-group ${active ? "is-active" : ""} ${open ? "is-open" : ""}`}>
+      <button className={`manager-nav__item ${active ? "is-active" : ""}`} onClick={onToggle} type="button">
+        <span>{icon}</span>
+        <strong>{title}</strong>
+        <small>{text}</small>
+      </button>
+      {open ? (
+        <div className="manager-nav-subitems">
+          {items.map((item) => (
+            <button key={item.label} className={item.active ? "is-active" : ""} onClick={item.onClick} type="button">
+              <span>{item.label}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function AgentCard({
   project,
   onOpen,
@@ -2363,203 +2840,6 @@ function AgentCard({
         </button>
       </div>
     </article>
-  );
-}
-
-function TabButton({ active, icon, label, onClick }: { active: boolean; icon: ReactNode; label: string; onClick: () => void }) {
-  return (
-    <button className={active ? "is-active" : ""} onClick={onClick} type="button">
-      {icon}
-      <span>{label}</span>
-    </button>
-  );
-}
-
-function WorkspaceResourceList<T extends { id: string }>({
-  items,
-  emptyText,
-  onAdd,
-  onRemove,
-  render,
-}: {
-  items: T[];
-  emptyText: string;
-  onAdd: () => void;
-  onRemove: (id: string) => void;
-  render: (item: T) => ReactNode;
-}) {
-  return (
-    <div className="resource-list">
-      <button className="resource-add" onClick={onAdd} type="button">
-        <Plus size={15} />
-        <span>添加配置</span>
-      </button>
-      {items.length === 0 ? <div className="resource-empty">{emptyText}</div> : null}
-      {items.map((item) => (
-        <section key={item.id} className="resource-card">
-          {render(item)}
-          <button className="danger resource-remove" onClick={() => onRemove(item.id)} type="button">删除</button>
-        </section>
-      ))}
-    </div>
-  );
-}
-
-function ReadonlyToolResourceList({
-  items,
-  onCreate,
-  onOpen,
-}: {
-  items: ToolConfig[];
-  onCreate: () => void;
-  onOpen: (id?: string) => void;
-}) {
-  return (
-    <div className="resource-list">
-      <button className="resource-add" onClick={onCreate} type="button">
-        <Plus size={15} />
-        <span>去 Tools 管理添加</span>
-      </button>
-      {items.length === 0 ? <div className="resource-empty">还没有 Tool。这里仅展示已配置资源，管理请进入右侧「Tools」区域。</div> : null}
-      {items.map((item) => (
-        <button key={item.id} className="resource-card resource-model-card" onClick={() => onOpen(item.id)} type="button">
-          <span className="resource-model-card__icon">
-            <Wrench size={15} />
-          </span>
-          <span>
-            <strong>{item.name}</strong>
-            <small>{item.source} · {item.description || "未填写描述"}</small>
-          </span>
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function ReadonlySkillResourceList({
-  items,
-  onCreate,
-  onOpen,
-}: {
-  items: SkillConfig[];
-  onCreate: () => void;
-  onOpen: (id?: string) => void;
-}) {
-  return (
-    <div className="resource-list">
-      <button className="resource-add" onClick={onCreate} type="button">
-        <Plus size={15} />
-        <span>去 Skills 管理添加</span>
-      </button>
-      {items.length === 0 ? <div className="resource-empty">还没有 Skill。这里仅展示已配置资源，管理请进入右侧「Skills」区域。</div> : null}
-      {items.map((item) => (
-        <button key={item.id} className="resource-card resource-model-card" onClick={() => onOpen(item.id)} type="button">
-          <span className="resource-model-card__icon">
-            <Plug size={15} />
-          </span>
-          <span>
-            <strong>{item.name}</strong>
-            <small>{skillSourceLabel(item.sourceType)} · {item.description || item.filePath || "未填写描述"}</small>
-          </span>
-          {item.enabled ? null : <em>停用</em>}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function ReadonlyMcpResourceList({
-  items,
-  onCreate,
-  onOpen,
-}: {
-  items: MCPServerConfig[];
-  onCreate: () => void;
-  onOpen: (id?: string) => void;
-}) {
-  return (
-    <div className="resource-list">
-      <button className="resource-add" onClick={onCreate} type="button">
-        <Plus size={15} />
-        <span>去 MCP 管理添加</span>
-      </button>
-      {items.length === 0 ? <div className="resource-empty">还没有 MCP Server。这里仅展示已配置资源，管理请进入右侧「MCP」区域。</div> : null}
-      {items.map((item) => (
-        <button key={item.id} className="resource-card resource-model-card" onClick={() => onOpen(item.id)} type="button">
-          <span className="resource-model-card__icon">
-            <Server size={15} />
-          </span>
-          <span>
-            <strong>{item.name}</strong>
-            <small>{item.transport} · {item.command || item.url || "未配置入口"}</small>
-          </span>
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function ReadonlyRagResourceList({
-  items,
-  onCreate,
-  onOpen,
-}: {
-  items: RagKnowledgeBaseConfig[];
-  onCreate: () => void;
-  onOpen: (id?: string) => void;
-}) {
-  return (
-    <div className="resource-list">
-      <button className="resource-add" onClick={onCreate} type="button">
-        <Plus size={15} />
-        <span>去 RAG 管理添加</span>
-      </button>
-      {items.length === 0 ? <div className="resource-empty">还没有 RAG 知识库。这里仅展示已配置资源，管理请进入右侧「RAG」区域。</div> : null}
-      {items.map((item) => (
-        <button key={item.id} className="resource-card resource-model-card" onClick={() => onOpen(item.id)} type="button">
-          <span className="resource-model-card__icon">
-            <Database size={15} />
-          </span>
-          <span>
-            <strong>{item.name}</strong>
-            <small>{ragSourceLabel(item.sourceType)} · {item.path || item.url || item.collection || "未配置入口"}</small>
-          </span>
-          {item.enabled ? null : <em>停用</em>}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function ReadonlyModelResourceList({
-  items,
-  onCreate,
-  onOpen,
-}: {
-  items: ModelConfig[];
-  onCreate: () => void;
-  onOpen: (id?: string) => void;
-}) {
-  return (
-    <div className="resource-list">
-      <button className="resource-add" onClick={onCreate} type="button">
-        <Plus size={15} />
-        <span>去模型管理添加</span>
-      </button>
-      {items.length === 0 ? <div className="resource-empty">还没有模型配置。这里仅展示已配置模型，管理请进入右侧「模型」区域。</div> : null}
-      {items.map((item) => (
-        <button key={item.id} className="resource-card resource-model-card" onClick={() => onOpen(item.id)} type="button">
-          <span className="resource-model-card__icon">
-            <BrainCircuit size={15} />
-          </span>
-          <span>
-            <strong>{item.name}</strong>
-            <small>{item.provider} · {item.model || "未设置模型"}</small>
-          </span>
-          {item.isDefault ? <em>默认</em> : null}
-        </button>
-      ))}
-    </div>
   );
 }
 

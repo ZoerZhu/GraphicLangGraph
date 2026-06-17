@@ -255,6 +255,65 @@ def test_live_preview_injects_selected_skills_into_agent_system_prompt(monkeypat
     assert "请保持礼貌" in seen["messages"][0][1]
 
 
+def test_live_preview_injects_skill_package_references(monkeypatch):
+    seen = {}
+
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        seen["messages"] = messages
+        return FakeResponse("已按 Skill 包输出")
+
+    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+
+    metadata = {
+        "packageMetadata": {"version": "1.0.0", "category": "Frontend"},
+        "relatedMarkdown": [
+            {
+                "path": "writer/notes.md",
+                "title": "Notes",
+                "content": "关联说明：输出必须包含验收标准。",
+            }
+        ],
+        "supportFiles": [
+            {"path": "writer/scripts/format.sh", "kind": "script", "size": 22, "preview": "echo format"},
+            {"path": "writer/assets/template.txt", "kind": "asset", "size": 12},
+        ],
+    }
+    project = create_default_project("Skill 包注入测试")
+    project.skills.append(
+        SkillConfig(
+            id="skill_package",
+            name="写作 Skill 包",
+            description="带 references 的 Skill",
+            content="核心规则：先给结论。",
+            metadata_json=json.dumps(metadata, ensure_ascii=False),
+        )
+    )
+    project.nodes.append(
+        NodeIR(
+            id="package_agent",
+            type=NodeType.AGENT,
+            label="包 Agent",
+            config={
+                "systemPrompt": "你是写作助手。",
+                "skillIdsJson": '["skill_package"]',
+                "outputField": "agent_result",
+            },
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="package_agent"))
+
+    _trace, state = preview.run_project_preview(project, {"messages": "写总结"}, "live")
+
+    assert state["agent_result"] == "已按 Skill 包输出"
+    system_prompt = seen["messages"][0][1]
+    assert "核心规则：先给结论" in system_prompt
+    assert "Related References" in system_prompt
+    assert "关联说明：输出必须包含验收标准" in system_prompt
+    assert "Support Files" in system_prompt
+    assert "writer/scripts/format.sh" in system_prompt
+    assert "writer/assets/template.txt" in system_prompt
+
+
 def test_live_preview_skill_node_writes_skill_content():
     project = create_default_project("Skill Node 测试")
     project.skills.append(

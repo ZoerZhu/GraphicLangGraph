@@ -113,6 +113,14 @@ export interface SkillImportResult {
   warnings: string[];
 }
 
+export interface ResourceGroupConfig {
+  id: string;
+  name: string;
+  description: string;
+  resourceType: "tool" | "skill" | string;
+  itemIds: string[];
+}
+
 export interface MCPServerConfig {
   id: string;
   name: string;
@@ -176,6 +184,47 @@ export interface RuntimeEnvironmentConfig {
   allowedHostsJson: string;
   maxFileBytes: number;
   maxHttpBytes: number;
+  allowDirectEdits: boolean;
+  allowedCommandProfilesJson: string;
+  maxPatchBytes: number;
+  maxCommandOutputBytes: number;
+}
+
+export interface EditSessionFile {
+  path: string;
+  absolutePath: string;
+  exists: boolean;
+  baseHash: string;
+  changeKind: string;
+  hunkCount: number;
+  summary: string;
+}
+
+export interface EditSession {
+  patchId: string;
+  projectId: string;
+  runId: string;
+  status: string;
+  files: EditSessionFile[];
+  diff: string;
+  conflicts: string[];
+  rollbackId: string;
+  createdAt: string;
+  appliedAt: string;
+  discardedAt: string;
+  rolledBackAt?: string;
+  commandResults: CommandRunResult[];
+}
+
+export interface CommandRunResult {
+  command: string[];
+  cwd: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+  timedOut: boolean;
+  truncated: boolean;
 }
 
 export interface EnvVarCheckResult {

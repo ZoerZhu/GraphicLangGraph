@@ -277,6 +277,99 @@ BUILTIN_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "x-graphic": {"kind": "builtin_tool", "builtinId": "fetch_url", "version": "0.1.0"},
         },
     },
+    {
+        "id": "builtin_propose_patch",
+        "name": "propose_patch",
+        "description": "生成并保存待审批代码补丁，不直接写入文件；支持 unified diff 或 path/original/replacement 结构化修改。",
+        "source": "builtin",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "diff": {"type": "string", "description": "unified diff，可选。"},
+                "path": {"type": "string", "description": "结构化修改目标文件路径。"},
+                "original": {"type": "string", "description": "待替换原文，结构化修改时使用。"},
+                "replacement": {"type": "string", "description": "替换后的文本，结构化修改时使用。"},
+                "expectedOccurrences": {"type": "number", "description": "期望命中次数，默认唯一命中。"},
+                "changes": {"type": "array", "description": "多个结构化修改。"},
+                "projectId": {"type": "string", "description": "可选项目 ID。"},
+                "runId": {"type": "string", "description": "可选运行 ID。"},
+            },
+            "x-graphic": {"kind": "builtin_tool", "builtinId": "propose_patch", "version": "0.1.0", "usageTags": ["编辑"]},
+        },
+    },
+    {
+        "id": "builtin_apply_patch_set",
+        "name": "apply_patch_set",
+        "description": "应用已审批 patch；仅供前端应用面板调用，Agent 普通运行中会被拒绝。",
+        "source": "builtin",
+        "schema": {
+            "type": "object",
+            "properties": {"patchId": {"type": "string", "description": "patch ID。"}},
+            "required": ["patchId"],
+            "x-graphic": {"kind": "builtin_tool", "builtinId": "apply_patch_set", "version": "0.1.0", "usageTags": ["编辑", "高风险"], "uiOnly": True},
+        },
+    },
+    {
+        "id": "builtin_rollback_patch_set",
+        "name": "rollback_patch_set",
+        "description": "回滚已应用 patch；仅恢复本工具生成的备份。",
+        "source": "builtin",
+        "schema": {
+            "type": "object",
+            "properties": {"rollbackId": {"type": "string", "description": "rollback ID。"}},
+            "required": ["rollbackId"],
+            "x-graphic": {"kind": "builtin_tool", "builtinId": "rollback_patch_set", "version": "0.1.0", "usageTags": ["编辑", "高风险"], "uiOnly": True},
+        },
+    },
+    {
+        "id": "builtin_replace_in_file",
+        "name": "replace_in_file",
+        "description": "高级直接写入工具：在允许目录内替换文件文本；运行环境必须开启 allowDirectEdits。",
+        "source": "builtin",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "目标文件路径。"},
+                "search": {"type": "string", "description": "要替换的原文。"},
+                "replace": {"type": "string", "description": "替换后的文本。"},
+                "expectedOccurrences": {"type": "number", "description": "期望命中次数，默认 1。"},
+            },
+            "required": ["path", "search", "replace"],
+            "x-graphic": {"kind": "builtin_tool", "builtinId": "replace_in_file", "version": "0.1.0", "usageTags": ["编辑", "高风险"]},
+        },
+    },
+    {
+        "id": "builtin_write_file",
+        "name": "write_file",
+        "description": "高级直接写入工具：创建或覆盖文本文件；运行环境必须开启 allowDirectEdits。",
+        "source": "builtin",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "目标文件路径。"},
+                "content": {"type": "string", "description": "写入内容。"},
+                "overwrite": {"type": "boolean", "description": "是否允许覆盖已有文件，默认 false。"},
+            },
+            "required": ["path", "content"],
+            "x-graphic": {"kind": "builtin_tool", "builtinId": "write_file", "version": "0.1.0", "usageTags": ["编辑", "高风险"]},
+        },
+    },
+    {
+        "id": "builtin_run_whitelisted_command",
+        "name": "run_whitelisted_command",
+        "description": "在运行环境允许目录内运行白名单验证命令，返回 stdout、stderr、exitCode 和耗时。",
+        "source": "builtin",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "命令，例如 git diff --check 或 python -m pytest。"},
+                "cwd": {"type": "string", "description": "工作目录，默认当前允许目录。"},
+                "timeoutSeconds": {"type": "number", "description": "超时秒数，默认 60，上限 300。"},
+            },
+            "required": ["command"],
+            "x-graphic": {"kind": "builtin_tool", "builtinId": "run_whitelisted_command", "version": "0.1.0", "usageTags": ["命令"]},
+        },
+    },
 ]
 
 

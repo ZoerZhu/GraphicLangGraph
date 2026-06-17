@@ -1,6 +1,8 @@
-import { AlertTriangle, ChevronDown, Eye, Layers, Maximize2, Minimize2, Trash2, X } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { AlertTriangle, ChevronDown, Eye, Layers, Maximize2, Minimize2, RotateCcw, ShieldCheck, Trash2, X } from "lucide-react";
+import { applyEditSession, discardEditSession, getEditSession, rollbackEditSession, runEditCommand } from "../lib/api";
 import { useProjectStore } from "../store/projectStore";
-import type { RunHistoryGraphMismatch, RunHistoryRecord, RunHistoryReplayMode, RunPreviewResult, RunTraceItem, ValidationIssue } from "../types";
+import type { CommandRunResult, EditSession, RunHistoryGraphMismatch, RunHistoryRecord, RunHistoryReplayMode, RunPreviewResult, RunTraceItem, RuntimeEnvironmentConfig, ValidationIssue } from "../types";
 import { FloatingPanel } from "./FloatingPanel";
 import { RunInputEditor, RunModelPicker, RunStartButton } from "./RunControls";
 import { RuntimeValueView } from "./RuntimeValueView";
@@ -121,7 +123,10 @@ export function RunPreviewPanel() {
         ) : null}
 
         {runResult ? (
-          <RunResultView result={runResult} selectableNodeIds={selectableNodeIds} onSelectNode={selectNode} />
+          <>
+            <PatchApplicationPanel result={runResult} />
+            <RunResultView result={runResult} selectableNodeIds={selectableNodeIds} onSelectNode={selectNode} />
+          </>
         ) : (
           <div className="run-empty">
             进入运行模式后，可在本面板或 Start 节点下方选择模型、填写输入并开始真实运行。
@@ -129,6 +134,167 @@ export function RunPreviewPanel() {
         )}
       </div>
     </FloatingPanel>
+  );
+}
+
+function PatchApplicationPanel({ result }: { result: RunPreviewResult }) {
+  const project = useProjectStore((state) => state.project);
+  const runtimeEnvironments = useProjectStore((state) => state.workspaceRuntimeEnvironments);
+  const runtimeEnvironment = pickRuntimeEnvironment(runtimeEnvironments, project?.project.runtimeEnvironmentId ?? "");
+  const patchIds = useMemo(() => collectPatchIds(result), [result]);
+  const [sessions, setSessions] = useState<Record<string, EditSession>>({});
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [message, setMessage] = useState("");
+  const [command, setCommand] = useState("git diff --check");
+  const [commandResult, setCommandResult] = useState<CommandRunResult | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadSessions() {
+      const next: Record<string, EditSession> = {};
+      for (const patchId of patchIds) {
+        try {
+          next[patchId] = await getEditSession(patchId);
+        } catch {
+          // Runtime output may still contain a partial object; ignore missing sessions.
+        }
+      }
+      if (!cancelled) setSessions(next);
+    }
+    void loadSessions();
+    return () => {
+      cancelled = true;
+    };
+  }, [patchIds]);
+
+  const sessionList = patchIds.map((id) => sessions[id]).filter(Boolean);
+  if (!patchIds.length) return null;
+
+  async function applyPatch(session: EditSession) {
+    setBusyId(session.patchId);
+    setMessage("正在应用补丁...");
+    try {
+      const updated = await applyEditSession(session.patchId, runtimeEnvironment ?? undefined);
+      setSessions((current) => ({ ...current, [updated.patchId]: updated }));
+      setMessage("补丁已应用");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "补丁应用失败");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function discardPatch(session: EditSession) {
+    setBusyId(session.patchId);
+    setMessage("正在丢弃补丁...");
+    try {
+      const updated = await discardEditSession(session.patchId);
+      setSessions((current) => ({ ...current, [updated.patchId]: updated }));
+      setMessage("补丁已丢弃");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "补丁丢弃失败");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function rollbackPatch(session: EditSession) {
+    if (!session.rollbackId) return;
+    setBusyId(session.patchId);
+    setMessage("正在回滚补丁...");
+    try {
+      const updated = await rollbackEditSession(session.rollbackId);
+      setSessions((current) => ({ ...current, [updated.patchId]: updated }));
+      setMessage("补丁已回滚");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "补丁回滚失败");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function runCommand() {
+    setBusyId("__command__");
+    setCommandResult(null);
+    setMessage("正在运行验证命令...");
+    try {
+      const result = await runEditCommand(command, ".", runtimeEnvironment ?? undefined);
+      setCommandResult(result);
+      setMessage(result.exitCode === 0 ? "验证命令通过" : `验证命令失败：exit ${result.exitCode}`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "验证命令执行失败");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <section className="patch-panel">
+      <div className="run-section-title">
+        <strong>变更集应用</strong>
+        <span>{patchIds.length} 个 patch</span>
+      </div>
+      {sessionList.length ? (
+        <div className="patch-panel__list">
+          {sessionList.map((session) => (
+            <article key={session.patchId} className={`patch-card is-${session.status}`}>
+              <div className="patch-card__head">
+                <span>
+                  <strong>{session.patchId}</strong>
+                  <small>{session.status} · {session.files.length} 文件</small>
+                </span>
+                <span className="patch-card__actions">
+                  <button disabled={busyId === session.patchId || !["proposed", "blocked"].includes(session.status)} onClick={() => void applyPatch(session)} type="button">
+                    <ShieldCheck size={14} />
+                    应用
+                  </button>
+                  <button disabled={busyId === session.patchId || session.status === "applied"} onClick={() => void discardPatch(session)} type="button">
+                    <Trash2 size={14} />
+                    丢弃
+                  </button>
+                  <button disabled={busyId === session.patchId || !session.rollbackId || session.status !== "applied"} onClick={() => void rollbackPatch(session)} type="button">
+                    <RotateCcw size={14} />
+                    回滚
+                  </button>
+                </span>
+              </div>
+              {session.conflicts.length ? (
+                <div className="patch-card__conflicts">
+                  {session.conflicts.map((conflict) => <span key={conflict}>{conflict}</span>)}
+                </div>
+              ) : null}
+              <div className="patch-card__files">
+                {session.files.map((file) => (
+                  <span key={file.path}>{file.path} · {file.summary}</span>
+                ))}
+              </div>
+              <details className="runtime-value__fold">
+                <summary>
+                  <span>Diff · {session.diff.length} 字符</span>
+                </summary>
+                <pre className="runtime-value__code">{session.diff}</pre>
+              </details>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <div className="run-empty">正在读取 patch 详情...</div>
+      )}
+      <div className="patch-command">
+        <input value={command} onChange={(event) => setCommand(event.target.value)} placeholder="git diff --check" />
+        <button disabled={busyId === "__command__"} onClick={() => void runCommand()} type="button">
+          运行验证命令
+        </button>
+      </div>
+      {message ? <small className="patch-panel__message">{message}</small> : null}
+      {commandResult ? (
+        <div className={`patch-command-result ${commandResult.exitCode === 0 ? "is-ok" : "is-error"}`}>
+          <strong>exit {commandResult.exitCode} · {commandResult.durationMs}ms</strong>
+          {commandResult.stdout ? <pre>{commandResult.stdout}</pre> : null}
+          {commandResult.stderr ? <pre>{commandResult.stderr}</pre> : null}
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -338,6 +504,29 @@ function statusLabel(status: RunTraceItem["status"]) {
     default:
       return status;
   }
+}
+
+function collectPatchIds(result: RunPreviewResult): string[] {
+  const ids = new Set<string>();
+  const visit = (value: unknown) => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    if (typeof record.patchId === "string" && record.patchId.startsWith("patch_")) {
+      ids.add(record.patchId);
+    }
+    Object.values(record).forEach(visit);
+  };
+  visit(result.outputState);
+  result.trace.forEach((item) => visit(item.outputDelta));
+  return [...ids];
+}
+
+function pickRuntimeEnvironment(environments: RuntimeEnvironmentConfig[], selectedId: string) {
+  return environments.find((environment) => environment.id === selectedId) ?? environments[0] ?? null;
 }
 
 function formatTime(value: string) {

@@ -491,6 +491,13 @@ description: 写作风格控制
         encoding="utf-8",
     )
     (writer_dir / "notes.md").write_text("# Notes\n\n关联说明。", encoding="utf-8")
+    (writer_dir / "metadata.json").write_text('{"version": "1.0.0", "category": "Writing"}', encoding="utf-8")
+    scripts_dir = writer_dir / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "format.sh").write_text("#!/usr/bin/env bash\necho format\n", encoding="utf-8")
+    assets_dir = writer_dir / "assets"
+    assets_dir.mkdir()
+    (assets_dir / "template.txt").write_text("模板内容", encoding="utf-8")
     (source / "standalone.md").write_text("# Standalone Skill\n\n普通 Markdown skill。", encoding="utf-8")
     ignored_dir = source / "node_modules"
     ignored_dir.mkdir()
@@ -512,6 +519,13 @@ description: 写作风格控制
     writer = next(item for item in body["imported"] if item["name"] == "Writer Skill")
     assert "请使用清晰" in writer["content"]
     assert "notes.md" in writer["metadataJson"]
+    metadata = json.loads(writer["metadataJson"])
+    assert metadata["packageMetadata"]["version"] == "1.0.0"
+    assert metadata["frontmatter"]["description"] == "写作风格控制"
+    assert metadata["relatedMarkdown"][0]["path"].endswith("notes.md")
+    assert "关联说明" in metadata["relatedMarkdown"][0]["content"]
+    assert any(item["path"].endswith("scripts/format.sh") and item["kind"] == "script" for item in metadata["supportFiles"])
+    assert any(item["path"].endswith("assets/template.txt") for item in metadata["supportFiles"])
     assert "ignored.md" not in "\n".join(body["detectedFiles"])
     assert client.get("/api/workspace/skills").json() == body["allConfigs"]
 

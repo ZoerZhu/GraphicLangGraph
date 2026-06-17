@@ -1,4 +1,6 @@
 import type {
+  CommandRunResult,
+  EditSession,
   EnvVarCheckResult,
   ExportResponse,
   MCPServerConfig,
@@ -8,6 +10,7 @@ import type {
   ProjectListItem,
   RagKnowledgeBaseInspection,
   RagKnowledgeBaseConfig,
+  ResourceGroupConfig,
   RuntimeEnvironmentConfig,
   RunMode,
   RunPreviewResult,
@@ -19,6 +22,8 @@ import type {
   ValidationResult,
 } from "../types";
 import {
+  CommandRunResultSchema,
+  EditSessionSchema,
   ExportResponseSchema,
   EnvVarCheckSchema,
   McpImportResultSchema,
@@ -28,6 +33,7 @@ import {
   ProjectSchema,
   RagKnowledgeBaseInspectionSchema,
   RagKnowledgeBaseListSchema,
+  ResourceGroupConfigListSchema,
   RuntimeEnvironmentConfigListSchema,
   RunPreviewResultSchema,
   SkillConfigListSchema,
@@ -212,6 +218,19 @@ export async function uploadWorkspaceSkillFolder(files: File[], rootName: string
   return SkillImportResultSchema.parse(data) as SkillImportResult;
 }
 
+export async function listWorkspaceResourceGroups(): Promise<ResourceGroupConfig[]> {
+  const data = await request("/api/workspace/resource-groups");
+  return ResourceGroupConfigListSchema.parse(data) as ResourceGroupConfig[];
+}
+
+export async function saveWorkspaceResourceGroups(groups: ResourceGroupConfig[]): Promise<ResourceGroupConfig[]> {
+  const data = await request("/api/workspace/resource-groups", {
+    method: "PUT",
+    body: JSON.stringify(groups),
+  });
+  return ResourceGroupConfigListSchema.parse(data) as ResourceGroupConfig[];
+}
+
 export async function listWorkspaceMcpServers(): Promise<MCPServerConfig[]> {
   const data = await request("/api/workspace/mcp");
   return McpServerConfigListSchema.parse(data) as MCPServerConfig[];
@@ -257,6 +276,37 @@ export async function saveWorkspaceRuntimeEnvironments(configs: RuntimeEnvironme
     body: JSON.stringify(configs),
   });
   return RuntimeEnvironmentConfigListSchema.parse(data) as RuntimeEnvironmentConfig[];
+}
+
+export async function getEditSession(patchId: string): Promise<EditSession> {
+  const data = await request(`/api/edit-sessions/${patchId}`);
+  return EditSessionSchema.parse(data) as EditSession;
+}
+
+export async function applyEditSession(patchId: string, runtimeEnvironment?: RuntimeEnvironmentConfig): Promise<EditSession> {
+  const data = await request(`/api/edit-sessions/${patchId}/apply`, {
+    method: "POST",
+    body: JSON.stringify({ runtimeEnvironment }),
+  });
+  return EditSessionSchema.parse(data) as EditSession;
+}
+
+export async function discardEditSession(patchId: string): Promise<EditSession> {
+  const data = await request(`/api/edit-sessions/${patchId}/discard`, { method: "POST" });
+  return EditSessionSchema.parse(data) as EditSession;
+}
+
+export async function rollbackEditSession(rollbackId: string): Promise<EditSession> {
+  const data = await request(`/api/edit-sessions/rollback/${rollbackId}`, { method: "POST" });
+  return EditSessionSchema.parse(data) as EditSession;
+}
+
+export async function runEditCommand(command: string, cwd: string, runtimeEnvironment?: RuntimeEnvironmentConfig, timeoutSeconds = 60): Promise<CommandRunResult> {
+  const data = await request("/api/edit-sessions/commands/run", {
+    method: "POST",
+    body: JSON.stringify({ command, cwd, timeoutSeconds, runtimeEnvironment }),
+  });
+  return CommandRunResultSchema.parse(data) as CommandRunResult;
 }
 
 export async function checkWorkspaceEnvVar(name: string): Promise<EnvVarCheckResult> {

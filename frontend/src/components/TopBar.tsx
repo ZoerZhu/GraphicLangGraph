@@ -267,6 +267,29 @@ function RuntimeEnvironmentModal({
                 <input type="number" min={1} value={active.maxHttpBytes} onChange={(event) => updateActive({ maxHttpBytes: Number(event.target.value || 1) })} />
               </label>
             </div>
+            <label className="checkbox-row runtime-modal__toggle">
+              <input checked={active.allowDirectEdits} onChange={(event) => updateActive({ allowDirectEdits: event.target.checked })} type="checkbox" />
+              <span>允许高级直接编辑</span>
+            </label>
+            <label className="field">
+              <span>命令白名单</span>
+              <textarea
+                rows={5}
+                value={jsonListToLines(active.allowedCommandProfilesJson)}
+                onChange={(event) => updateActive({ allowedCommandProfilesJson: linesToJsonList(event.target.value, defaultCommandProfiles()) })}
+                placeholder="python -m pytest"
+              />
+            </label>
+            <div className="runtime-modal__grid">
+              <label className="field">
+                <span>Patch 最大字节</span>
+                <input type="number" min={1} value={active.maxPatchBytes} onChange={(event) => updateActive({ maxPatchBytes: Number(event.target.value || 1) })} />
+              </label>
+              <label className="field">
+                <span>命令输出最大字节</span>
+                <input type="number" min={1} value={active.maxCommandOutputBytes} onChange={(event) => updateActive({ maxCommandOutputBytes: Number(event.target.value || 1) })} />
+              </label>
+            </div>
             <label className="field">
               <span>说明</span>
               <textarea rows={2} value={active.description} onChange={(event) => updateActive({ description: event.target.value })} />
@@ -397,6 +420,10 @@ function normalizeRuntimeEnvironments(environments: RuntimeEnvironmentConfig[]) 
     maxFileBytes: Math.max(1, Number(environment.maxFileBytes || 1048576)),
     maxHttpBytes: Math.max(1, Number(environment.maxHttpBytes || 262144)),
     networkEnabled: environment.networkEnabled !== false,
+    allowDirectEdits: environment.allowDirectEdits === true,
+    allowedCommandProfilesJson: linesToJsonList(jsonListToLines(environment.allowedCommandProfilesJson), defaultCommandProfiles()),
+    maxPatchBytes: Math.max(1, Number(environment.maxPatchBytes || 524288)),
+    maxCommandOutputBytes: Math.max(1, Number(environment.maxCommandOutputBytes || 262144)),
   }));
 }
 
@@ -411,7 +438,25 @@ function newRuntimeEnvironment(id = createRuntimeId(), name = "本地后端"): R
     allowedHostsJson: JSON.stringify(["api.duckduckgo.com"], null, 2),
     maxFileBytes: 1048576,
     maxHttpBytes: 262144,
+    allowDirectEdits: false,
+    allowedCommandProfilesJson: JSON.stringify(defaultCommandProfiles(), null, 2),
+    maxPatchBytes: 524288,
+    maxCommandOutputBytes: 262144,
   };
+}
+
+function defaultCommandProfiles(): string[] {
+  return [
+    "git status",
+    "git diff",
+    "git diff --check",
+    "npm run build",
+    "npm test",
+    "npm run lint",
+    "python -m pytest",
+    "pytest",
+    "python -m compileall",
+  ];
 }
 
 function createRuntimeId() {

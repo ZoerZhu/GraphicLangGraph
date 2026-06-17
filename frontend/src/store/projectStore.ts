@@ -18,6 +18,7 @@ import {
   getProject,
   listWorkspaceMcpServers,
   listWorkspaceRagKnowledgeBases,
+  listWorkspaceResourceGroups,
   listWorkspaceModelConfigs,
   listWorkspaceRuntimeEnvironments,
   listWorkspaceSkills,
@@ -25,6 +26,7 @@ import {
   listProjects,
   saveWorkspaceMcpServers,
   saveWorkspaceRagKnowledgeBases,
+  saveWorkspaceResourceGroups,
   saveWorkspaceModelConfigs,
   saveWorkspaceRuntimeEnvironments,
   saveWorkspaceSkills,
@@ -50,6 +52,7 @@ import type {
   ProjectIR,
   ProjectListItem,
   RagKnowledgeBaseConfig,
+  ResourceGroupConfig,
   RuntimeEnvironmentConfig,
   RunHistoryGraphMismatch,
   RunHistoryGraphSnapshot,
@@ -70,7 +73,7 @@ interface PendingConnection {
   sourceHandle: string | null;
 }
 
-type ManagerView = "agent" | "agents" | "tools" | "skills" | "mcp" | "rag" | "models";
+type ManagerView = "agent" | "agents" | "tools" | "toolGroups" | "skills" | "skillGroups" | "mcp" | "rag" | "models";
 
 interface ProjectStore {
   mode: "manager" | "editor";
@@ -82,6 +85,7 @@ interface ProjectStore {
   workspaceMcpServers: MCPServerConfig[];
   workspaceModelConfigs: ModelConfig[];
   workspaceRagKnowledgeBases: RagKnowledgeBaseConfig[];
+  workspaceResourceGroups: ResourceGroupConfig[];
   workspaceRuntimeEnvironments: RuntimeEnvironmentConfig[];
   selectedNodeId: string | null;
   pendingConnection: PendingConnection | null;
@@ -126,6 +130,7 @@ interface ProjectStore {
   updateWorkspaceMcpServers: (servers: MCPServerConfig[]) => Promise<void>;
   updateWorkspaceModelConfigs: (configs: ModelConfig[]) => Promise<void>;
   updateWorkspaceRagKnowledgeBases: (configs: RagKnowledgeBaseConfig[]) => Promise<void>;
+  updateWorkspaceResourceGroups: (groups: ResourceGroupConfig[]) => Promise<void>;
   updateWorkspaceRuntimeEnvironments: (configs: RuntimeEnvironmentConfig[]) => Promise<void>;
   setProjectRuntimeEnvironmentId: (id: string) => void;
   updateTools: (tools: ToolConfig[]) => void;
@@ -205,6 +210,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   workspaceMcpServers: [],
   workspaceModelConfigs: [],
   workspaceRagKnowledgeBases: [],
+  workspaceResourceGroups: [],
   workspaceRuntimeEnvironments: [],
   selectedNodeId: null,
   pendingConnection: null,
@@ -238,13 +244,14 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   async initialize() {
     set({ loading: true, status: "正在加载历史 Agent" });
     try {
-      const [projects, storedTools, storedSkills, storedMcpServers, storedModelConfigs, storedRagKnowledgeBases, storedRuntimeEnvironments] = await Promise.all([
+      const [projects, storedTools, storedSkills, storedMcpServers, storedModelConfigs, storedRagKnowledgeBases, storedResourceGroups, storedRuntimeEnvironments] = await Promise.all([
         listProjects(),
         listWorkspaceTools(),
         listWorkspaceSkills(),
         listWorkspaceMcpServers(),
         listWorkspaceModelConfigs(),
         listWorkspaceRagKnowledgeBases(),
+        listWorkspaceResourceGroups(),
         listWorkspaceRuntimeEnvironments(),
       ]);
       let workspaceTools = normalizeTools(storedTools);
@@ -252,6 +259,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       let workspaceMcpServers = normalizeMcpServers(storedMcpServers);
       let workspaceModelConfigs = normalizeModelConfigs(storedModelConfigs);
       const workspaceRagKnowledgeBases = normalizeRagKnowledgeBases(storedRagKnowledgeBases);
+      const workspaceResourceGroups = normalizeResourceGroups(storedResourceGroups);
       const workspaceRuntimeEnvironments = normalizeRuntimeEnvironments(storedRuntimeEnvironments);
       let migratedResources = false;
       if (workspaceTools.length === 0) {
@@ -313,6 +321,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
         workspaceMcpServers,
         workspaceModelConfigs,
         workspaceRagKnowledgeBases,
+        workspaceResourceGroups,
         workspaceRuntimeEnvironments,
         selectedRunModelConfigId: pickModelConfigId(workspaceModelConfigs, null),
         status: migratedModels || migratedResources ? "历史 Agent 已加载，资源配置已迁移到后端" : "历史 Agent 已加载",
@@ -543,6 +552,17 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       });
     } catch (error) {
       set({ status: error instanceof Error ? error.message : "RAG 知识库配置保存失败" });
+    }
+  },
+
+  async updateWorkspaceResourceGroups(groups) {
+    const workspaceResourceGroups = normalizeResourceGroups(groups);
+    set({ workspaceResourceGroups, status: "正在保存资源预设组" });
+    try {
+      const savedGroups = normalizeResourceGroups(await saveWorkspaceResourceGroups(workspaceResourceGroups));
+      set({ workspaceResourceGroups: savedGroups, status: "资源预设组已保存到后端" });
+    } catch (error) {
+      set({ status: error instanceof Error ? error.message : "资源预设组保存失败" });
     }
   },
 
@@ -1466,6 +1486,28 @@ function normalizeRagKnowledgeBases(configs: RagKnowledgeBaseConfig[]): RagKnowl
     }));
 }
 
+function normalizeResourceGroups(groups: ResourceGroupConfig[]): ResourceGroupConfig[] {
+  const seenIds = new Set<string>();
+  return groups
+    .filter((group) => group && typeof group === "object")
+    .map((group) => {
+      let id = typeof group.id === "string" && group.id.trim() ? group.id.trim() : `group_${nanoid(8)}`;
+      if (seenIds.has(id)) id = `group_${nanoid(8)}`;
+      seenIds.add(id);
+      const resourceType = group.resourceType === "skill" ? "skill" : "tool";
+      const itemIds = Array.from(
+        new Set((group.itemIds ?? []).map((item) => String(item).trim()).filter(Boolean)),
+      );
+      return {
+        id,
+        name: String(group.name || "").trim() || (resourceType === "skill" ? "预设技能组" : "预设工具组"),
+        description: String(group.description || "").trim(),
+        resourceType,
+        itemIds,
+      };
+    });
+}
+
 function normalizeRuntimeEnvironments(configs: RuntimeEnvironmentConfig[]): RuntimeEnvironmentConfig[] {
   const normalized = configs
     .filter((config) => config && typeof config.id === "string")
@@ -1479,6 +1521,10 @@ function normalizeRuntimeEnvironments(configs: RuntimeEnvironmentConfig[]): Runt
       allowedHostsJson: safeJsonList(config.allowedHostsJson, ["api.duckduckgo.com"]),
       maxFileBytes: Math.max(1, Number(config.maxFileBytes || 1048576)),
       maxHttpBytes: Math.max(1, Number(config.maxHttpBytes || 262144)),
+      allowDirectEdits: config.allowDirectEdits === true,
+      allowedCommandProfilesJson: safeJsonList(config.allowedCommandProfilesJson, defaultCommandProfiles()),
+      maxPatchBytes: Math.max(1, Number(config.maxPatchBytes || 524288)),
+      maxCommandOutputBytes: Math.max(1, Number(config.maxCommandOutputBytes || 262144)),
     }));
   return normalized.length ? normalized : [newDefaultRuntimeEnvironment()];
 }
@@ -1514,7 +1560,25 @@ function newDefaultRuntimeEnvironment(): RuntimeEnvironmentConfig {
     allowedHostsJson: JSON.stringify(["api.duckduckgo.com"], null, 2),
     maxFileBytes: 1048576,
     maxHttpBytes: 262144,
+    allowDirectEdits: false,
+    allowedCommandProfilesJson: JSON.stringify(defaultCommandProfiles(), null, 2),
+    maxPatchBytes: 524288,
+    maxCommandOutputBytes: 262144,
   };
+}
+
+function defaultCommandProfiles(): string[] {
+  return [
+    "git status",
+    "git diff",
+    "git diff --check",
+    "npm run build",
+    "npm test",
+    "npm run lint",
+    "python -m pytest",
+    "pytest",
+    "python -m compileall",
+  ];
 }
 
 function pickRuntimeEnvironment(configs: RuntimeEnvironmentConfig[], currentId: string | null): RuntimeEnvironmentConfig | null {

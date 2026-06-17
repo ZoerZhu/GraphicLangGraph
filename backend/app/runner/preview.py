@@ -31,6 +31,7 @@ from app.code_intelligence import (
     glg_summarize_page_structure,
 )
 from app.config import ROOT_DIR, WORKSPACE_TOOLS_FILE
+from app.edit_sessions import EditSessionError, propose_patch, replace_in_file, run_whitelisted_command, write_file
 from app.ir.schemas import EdgeKind, NodeIR, NodeType, ProjectIR
 from app.runtime_environment import default_runtime_environment, resolve_runtime_environment
 
@@ -45,6 +46,9 @@ TEMPLATE_RE = re.compile(r"{{\s*state\.([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
 TEXT_SUFFIXES = {".md", ".markdown", ".txt"}
 MAX_STEPS = 80
 TOOL_OBSERVATION_STRING_LIMIT = 12_000
+SKILL_CORE_RUNTIME_LIMIT = 60_000
+SKILL_REFERENCES_RUNTIME_LIMIT = 30_000
+SKILL_SUPPORT_FILES_RUNTIME_LIMIT = 12_000
 CODE_TOOL_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "dist", "build", ".venv", "venv", "__pycache__", ".next", ".turbo", "coverage"}
 CODE_TOOL_BINARY_CHECK_BYTES = 4096
 OPENAI_COMPATIBLE_PROVIDERS = {
@@ -501,6 +505,7 @@ def _enabled_skills_by_id(project: ProjectIR) -> SkillRuntimeConfig:
             "sourcePath": str(getattr(skill, "source_path", "") or ""),
             "filePath": str(getattr(skill, "file_path", "") or ""),
             "content": str(getattr(skill, "content", "") or ""),
+            "metadataJson": str(getattr(skill, "metadata_json", "") or "{}"),
         }
     return result
 
@@ -519,13 +524,125 @@ def _append_selected_skills(system_prompt: str, selected_skills: list[dict[str, 
     sections = ["可用 Skills:"]
     for skill in selected_skills:
         name = str(skill.get("name") or skill.get("id") or "Skill").strip()
-        content = str(skill.get("content") or "").strip()
+        content = _skill_runtime_content(skill).strip()
         if content:
             sections.append(f"### {name}\n{content}")
         else:
             sections.append(f"### {name}\n（该 Skill 暂无内容）")
     skill_prompt = "\n\n".join(sections)
     return f"{system_prompt}\n\n{skill_prompt}".strip() if system_prompt else skill_prompt
+
+
+def _skill_runtime_content(skill: dict[str, Any]) -> str:
+    content = str(skill.get("content") or "").strip()
+    metadata = _skill_metadata(skill)
+    sections: list[str] = []
+    if content:
+        sections.append(_limit_text(content, SKILL_CORE_RUNTIME_LIMIT, "SKILL.md 内容已截断"))
+
+    package_metadata = metadata.get("packageMetadata") if isinstance(metadata.get("packageMetadata"), dict) else {}
+    if package_metadata:
+        summary = _skill_package_metadata_summary(package_metadata)
+        if summary:
+            sections.append(f"#### Package Metadata\n{summary}")
+
+    references = metadata.get("relatedMarkdown")
+    if isinstance(references, list) and references:
+        reference_text = _skill_references_runtime_text(references)
+        if reference_text:
+            sections.append(f"#### Related References\n{reference_text}")
+
+    support_files = metadata.get("supportFiles")
+    if isinstance(support_files, list) and support_files:
+        support_text = _skill_support_files_runtime_text(support_files)
+        if support_text:
+            sections.append(f"#### Support Files\n{support_text}")
+
+    if metadata.get("relatedMarkdownTruncated"):
+        sections.append("注意：部分 reference 文件因数量或长度限制已截断。需要更精确内容时，请使用文件读取工具读取对应路径。")
+    return "\n\n".join(sections)
+
+
+def _skill_metadata(skill: dict[str, Any]) -> dict[str, Any]:
+    raw = skill.get("metadataJson")
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(str(raw or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _skill_package_metadata_summary(metadata: dict[str, Any]) -> str:
+    lines: list[str] = []
+    for key in ("version", "organization", "technology", "category", "abstract"):
+        value = metadata.get(key)
+        if value:
+            lines.append(f"- {key}: {value}")
+    references = metadata.get("references")
+    if isinstance(references, list) and references:
+        compact = ", ".join(str(item) for item in references[:8] if str(item).strip())
+        if compact:
+            lines.append(f"- references: {compact}")
+    return _limit_text("\n".join(lines), 4000, "package metadata 已截断")
+
+
+def _skill_references_runtime_text(references: list[Any]) -> str:
+    lines: list[str] = []
+    used = 0
+    for raw_item in references:
+        if not isinstance(raw_item, dict):
+            continue
+        path = str(raw_item.get("path") or "reference.md")
+        title = str(raw_item.get("title") or path)
+        content = str(raw_item.get("content") or "").strip()
+        if not content:
+            continue
+        header = f"##### {title} ({path})"
+        block = f"{header}\n{content}"
+        remaining = SKILL_REFERENCES_RUNTIME_LIMIT - used
+        if remaining <= 0:
+            break
+        block = _limit_text(block, remaining, "reference 内容已截断")
+        used += len(block)
+        lines.append(block)
+    return "\n\n".join(lines)
+
+
+def _skill_support_files_runtime_text(files: list[Any]) -> str:
+    lines: list[str] = []
+    used = 0
+    for raw_item in files:
+        if not isinstance(raw_item, dict):
+            continue
+        path = str(raw_item.get("path") or "").strip()
+        if not path:
+            continue
+        kind = str(raw_item.get("kind") or "file")
+        size = raw_item.get("size", 0)
+        preview = str(raw_item.get("preview") or "").strip()
+        line = f"- {kind}: {path} ({size} bytes)"
+        if preview:
+            line = f"{line}\n  preview:\n{_indent_text(_limit_text(preview, 1800, 'preview 已截断'), '  ')}"
+        remaining = SKILL_SUPPORT_FILES_RUNTIME_LIMIT - used
+        if remaining <= 0:
+            break
+        line = _limit_text(line, remaining, "support files 清单已截断")
+        used += len(line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _limit_text(value: str, max_chars: int, note: str) -> str:
+    text = value.strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}\n\n[{note}]"
+
+
+def _indent_text(value: str, prefix: str) -> str:
+    return "\n".join(f"{prefix}{line}" for line in value.splitlines())
 
 
 def _json_string_list(value: Any) -> list[str]:
@@ -1149,6 +1266,18 @@ def _tools_agent_system_prompt(system_prompt: str, selected_tools: list[dict[str
             "【网络搜索策略】web_search 默认返回 DuckDuckGo SERP 结果；搜索无结果时调整关键词或中英文表达。"
             "引用网络信息时优先使用结果中的 title、url 和 snippet；fetch_url 只在需要读取已知 URL 页面内容时使用。"
         )
+    if tool_names & {"propose_patch", "replace_in_file", "write_file", "run_whitelisted_command"}:
+        instructions += (
+            "【代码编辑策略】修改代码前必须先用读取工具定位相关文件、函数、类或页面片段。"
+            "默认只能调用 propose_patch 生成待审批补丁，不要直接写文件。"
+            "生成补丁后说明修改原因、影响文件和建议验证命令。"
+            "如果需要验证，只能使用 run_whitelisted_command 运行白名单命令。"
+        )
+    if tool_names & {"replace_in_file", "write_file"}:
+        instructions += (
+            "【直接写入限制】replace_in_file 和 write_file 是高级高风险工具，只有运行环境显式开启 allowDirectEdits 时才可用；"
+            "调用前必须说明目标文件和预期修改。"
+        )
     registry = "可用工具：\n" + json.dumps(tool_lines, ensure_ascii=False, indent=2)
     return "\n\n".join(part for part in (system_prompt, instructions, registry) if part).strip()
 
@@ -1386,6 +1515,18 @@ def _invoke_builtin_tool(metadata: dict[str, Any], args: dict[str, Any], runtime
         return _builtin_chunk_code_semantic(args, runtime)
     if builtin_id == "fetch_url":
         return _builtin_fetch_url(args, runtime)
+    if builtin_id == "propose_patch":
+        return _builtin_propose_patch(args, runtime)
+    if builtin_id == "apply_patch_set":
+        raise RuntimeError("apply_patch_set 只能通过前端变更集应用面板调用，Agent 运行中不能直接应用补丁。")
+    if builtin_id == "rollback_patch_set":
+        raise RuntimeError("rollback_patch_set 只能通过前端变更集应用面板调用。")
+    if builtin_id == "replace_in_file":
+        return _builtin_replace_in_file(args, runtime)
+    if builtin_id == "write_file":
+        return _builtin_write_file(args, runtime)
+    if builtin_id == "run_whitelisted_command":
+        return _builtin_run_whitelisted_command(args, runtime)
     raise RuntimeError(f"未知内置 Tool：{builtin_id or '未配置 builtinId'}")
 
 
@@ -2161,6 +2302,34 @@ def _builtin_fetch_url(args: dict[str, Any], runtime: dict[str, Any]) -> dict[st
         "truncated": truncated,
         "text": text,
     }
+
+
+def _builtin_propose_patch(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return propose_patch(args, runtime)
+    except EditSessionError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def _builtin_replace_in_file(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return replace_in_file(args, runtime)
+    except EditSessionError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def _builtin_write_file(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return write_file(args, runtime)
+    except EditSessionError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def _builtin_run_whitelisted_command(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return run_whitelisted_command(args, runtime)
+    except EditSessionError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def _normalize_runtime_environment(runtime_environment: RuntimeEnvironment) -> dict[str, Any]:
