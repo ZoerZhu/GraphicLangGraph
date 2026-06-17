@@ -1,7 +1,8 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { inspectWorkspaceMcpServer } from "../lib/api";
 import { useProjectStore } from "../store/projectStore";
-import type { MCPServerConfig, ModelConfig, NodeIR, RagKnowledgeBaseConfig, ResourceGroupConfig, SkillConfig, StateField, ToolConfig } from "../types";
+import type { ImportedAgentConfig, MCPServerConfig, McpInspectResult, McpToolInspection, ModelConfig, NodeIR, ProjectListItem, RagKnowledgeBaseConfig, ResourceGroupConfig, SkillConfig, StateField, ToolConfig } from "../types";
 import { FloatingPanel } from "./FloatingPanel";
 
 export function Inspector() {
@@ -19,7 +20,10 @@ export function Inspector() {
   const updateNode = useProjectStore((state) => state.updateNode);
   const updateNodeConfig = useProjectStore((state) => state.updateNodeConfig);
   const updateSkills = useProjectStore((state) => state.updateSkills);
+  const updateImportedAgents = useProjectStore((state) => state.updateImportedAgents);
   const setStateFields = useProjectStore((state) => state.setStateFields);
+  const [mcpInspecting, setMcpInspecting] = useState(false);
+  const [mcpInspectResult, setMcpInspectResult] = useState<McpInspectResult | null>(null);
 
   const node = useMemo(
     () => project?.nodes.find((item) => item.id === selectedNodeId) ?? null,
@@ -46,10 +50,15 @@ export function Inspector() {
     () => projects.filter((item) => item.kind === "agent" && item.id !== project?.project.id),
     [project?.project.id, projects],
   );
+  const availableImportedAgents = useMemo(() => project?.importedAgents ?? [], [project?.importedAgents]);
+  const availableAgentResources = useMemo(
+    () => mergeAgentResources(availableImportedAgents, availableAgents),
+    [availableAgents, availableImportedAgents],
+  );
   const availableModelConfigs = useMemo(() => buildModelConfigOptions(workspaceModelConfigs), [workspaceModelConfigs]);
   const availableRagKnowledgeBases = useMemo(() => workspaceRagKnowledgeBases.filter((item) => item.enabled), [workspaceRagKnowledgeBases]);
   const detectedStateFields = useMemo(() => detectStateFieldsFromNodes(project?.nodes ?? []), [project?.nodes]);
-  const resourceInspector = Boolean(node && ["agent", "tool", "parallel_tools"].includes(node.type));
+  const resourceInspector = Boolean(node && ["agent", "tool", "parallel_tools", "mcp_node"].includes(node.type));
 
   function updateToolSelection(targetNode: NodeIR, directIds: string[], groupIds: string[]) {
     const availableIds = new Set(availableTools.map((tool) => tool.id));
@@ -84,6 +93,72 @@ export function Inspector() {
       skillGroupIdsJson: JSON.stringify(groupIds),
       skillIdsJson: JSON.stringify(ids),
     });
+  }
+
+  function updateMcpSelection(targetNode: NodeIR, directIds: string[]) {
+    const availableIds = new Set(availableMcpServers.map((server) => server.id));
+    const ids = uniqueStrings(directIds).filter((id) => availableIds.has(id));
+    const selectedServers = availableMcpServers.filter((server) => ids.includes(server.id));
+    updateNodeConfig(targetNode.id, {
+      mcpServerIdsJson: JSON.stringify(ids),
+      mcpServerRegistryJson: JSON.stringify(selectedServers),
+    });
+  }
+
+  function updateAgentSelection(targetNode: NodeIR, directIds: string[]) {
+    const availableIds = new Set(availableAgentResources.map((agent) => agent.id));
+    const ids = uniqueStrings(directIds).filter((id) => availableIds.has(id));
+    const selectedAgents = availableAgentResources.filter((agent) => ids.includes(agent.id));
+    if (project) {
+      updateImportedAgents(mergeAgentResources(project.importedAgents ?? [], selectedAgents));
+    }
+    updateNodeConfig(targetNode.id, {
+      agentIdsJson: JSON.stringify(ids),
+      agentRegistryJson: JSON.stringify(selectedAgents),
+    });
+  }
+
+  async function refreshMcpToolsForNode(targetNode: NodeIR) {
+    const server = mcpServerForNode(targetNode, availableMcpServers);
+    if (!server) {
+      setMcpInspectResult({
+        ok: false,
+        serverId: "",
+        serverName: "",
+        transport: "",
+        tools: [],
+        warnings: [],
+        durationMs: 0,
+        error: "请先绑定 MCP Server。",
+      });
+      return;
+    }
+    setMcpInspecting(true);
+    setMcpInspectResult(null);
+    try {
+      const result = await inspectWorkspaceMcpServer(server);
+      setMcpInspectResult(result);
+      if (result.ok) {
+        const selectedTool = result.tools.find((tool) => tool.name === targetNode.config.toolName);
+        updateNodeConfig(targetNode.id, {
+          mcpToolsJson: JSON.stringify(result.tools),
+          toolInputSchemaJson: JSON.stringify(selectedTool?.inputSchema ?? {}),
+        });
+      }
+    } catch (error) {
+      setMcpInspectResult({
+        ok: false,
+        serverId: server.id,
+        serverName: server.name,
+        transport: server.transport,
+        tools: [],
+        warnings: [],
+        durationMs: 0,
+        error: error instanceof Error ? error.message : "MCP 工具刷新失败。",
+      });
+    } finally {
+      setMcpInspecting(false);
+    }
   }
 
   if (!project || !node || runActive) {
@@ -163,17 +238,41 @@ export function Inspector() {
       {node.type === "agent" && (
         <InspectorSplit
           left={
-            <ResourceSelectionRail
-              title="Skill 配置"
-              itemLabel="Skill"
-              groups={availableSkillGroups}
-              items={availableSkills}
-              selectedGroupIds={parseStringList(node.config.skillGroupIdsJson)}
-              selectedDirectIds={directResourceIdsFromConfig(node.config, "skillIdsJson", "skillDirectIdsJson", "skillGroupIdsJson", availableSkillGroups)}
-              emptyText="还没有可用 Skill。请先在管理页 Skills 中新增或导入。"
-              onChange={(directIds, groupIds) => updateSkillSelection(node, directIds, groupIds)}
-              renderItemMeta={(skill) => skill.description || skill.filePath || "未填写描述"}
-            />
+            <>
+              <ResourceSelectionRail
+                title="Skill 配置"
+                itemLabel="Skill"
+                groups={availableSkillGroups}
+                items={availableSkills}
+                selectedGroupIds={parseStringList(node.config.skillGroupIdsJson)}
+                selectedDirectIds={directResourceIdsFromConfig(node.config, "skillIdsJson", "skillDirectIdsJson", "skillGroupIdsJson", availableSkillGroups)}
+                emptyText="还没有可用 Skill。请先在管理页 Skills 中新增或导入。"
+                onChange={(directIds, groupIds) => updateSkillSelection(node, directIds, groupIds)}
+                renderItemMeta={(skill) => skill.description || skill.filePath || "未填写描述"}
+              />
+              <ResourceSelectionRail
+                title="MCP Server"
+                itemLabel="MCP"
+                groups={[]}
+                items={availableMcpServers.filter((server) => server.enabled)}
+                selectedGroupIds={[]}
+                selectedDirectIds={parseStringList(node.config.mcpServerIdsJson)}
+                emptyText="还没有可用 MCP。请先在管理页 MCP 中新增或导入。"
+                onChange={(directIds) => updateMcpSelection(node, directIds)}
+                renderItemMeta={(server) => `${server.transport || "stdio"} · ${server.command || server.url || "未配置入口"}`}
+              />
+              <ResourceSelectionRail
+                title="Agent 接入"
+                itemLabel="Agent"
+                groups={[]}
+                items={availableAgentResources}
+                selectedGroupIds={[]}
+                selectedDirectIds={parseStringList(node.config.agentIdsJson)}
+                emptyText="还没有可接入 Agent。请先在 Agent 管理中创建 Agent。"
+                onChange={(directIds) => updateAgentSelection(node, directIds)}
+                renderItemMeta={(agent) => `${agent.role || "sub_agent"} · ${agent.projectId || "未绑定项目"}`}
+              />
+            </>
           }
         >
           <ModelSelectionFields
@@ -196,6 +295,14 @@ export function Inspector() {
               value={String(node.config.tools ?? "")}
               onChange={(event) => updateNodeConfig(node.id, { tools: event.target.value })}
               placeholder="get_order,refund_policy"
+            />
+          </Field>
+          <Field label="用户输入">
+            <textarea
+              rows={4}
+              value={String(node.config.userPrompt ?? "")}
+              onChange={(event) => updateNodeConfig(node.id, { userPrompt: event.target.value })}
+              placeholder="{{ state.messages }}"
             />
           </Field>
           <div className="inline-grid">
@@ -759,7 +866,10 @@ export function Inspector() {
           </Field>
         </>
       )}
-      {node.type === "mcp_node" && (
+      {node.type === "mcp_node" && (() => {
+        const mcpTools = parseMcpToolList(node.config.mcpToolsJson);
+        const toolSelectionMode = String(node.config.toolSelectionMode ?? "heuristic");
+        return (
         <>
           <Field label="绑定 MCP Server">
             <select
@@ -772,6 +882,10 @@ export function Inspector() {
                   transport: server?.transport ?? "stdio",
                   command: server?.command ?? "",
                   url: server?.url ?? "",
+                  mcpServerSnapshotJson: server ? JSON.stringify([server]) : "[]",
+                  mcpToolsJson: "[]",
+                  toolName: "",
+                  toolInputSchemaJson: "{}",
                 });
                 if (server) updateNode(node.id, { label: server.name });
               }}
@@ -796,6 +910,107 @@ export function Inspector() {
           <Field label="URL">
             <input value={String(node.config.url ?? "")} onChange={(event) => updateNodeConfig(node.id, { url: event.target.value })} />
           </Field>
+          <Field label="工具选择方式">
+            <select
+              value={toolSelectionMode}
+              onChange={(event) => updateNodeConfig(node.id, { toolSelectionMode: event.target.value })}
+            >
+              <option value="model">模型选择</option>
+              <option value="heuristic">启发式自动</option>
+              <option value="manual">手动选择</option>
+            </select>
+            <small className="model-config-note">已选择 MCP Tool 时会直接调用；未选择时按这里的模式选择工具。</small>
+          </Field>
+          {toolSelectionMode === "model" ? (
+            <>
+              <ModelSelectionFields
+                config={node.config}
+                defaultModel="gpt-4.1-mini"
+                defaultProvider="openai"
+                fieldNames={{
+                  provider: "toolSelectionModelProvider",
+                  model: "toolSelectionModel",
+                  modelConfigId: "toolSelectionModelConfigId",
+                  modelConfigName: "toolSelectionModelConfigName",
+                  modelDisplayName: "toolSelectionModelDisplayName",
+                  baseUrl: "toolSelectionBaseUrl",
+                  apiKeyEnv: "toolSelectionApiKeyEnv",
+                  apiVersion: "toolSelectionApiVersion",
+                  organization: "toolSelectionOrganization",
+                  apiFormat: "toolSelectionApiFormat",
+                }}
+                modelConfigs={availableModelConfigs}
+                nodeId={node.id}
+                providerLabel="选择模型配置"
+                providerManualLabel="选择模型供应商"
+                providerNote="该模型只负责从 MCP Server 暴露的工具中选择一个工具并生成参数。"
+                updateNodeConfig={updateNodeConfig}
+              />
+              <Field label="选择指令">
+                <textarea
+                  rows={3}
+                  value={String(node.config.toolSelectionInstruction ?? "")}
+                  onChange={(event) => updateNodeConfig(node.id, { toolSelectionInstruction: event.target.value })}
+                  placeholder="搜索网页时优先 web_search_exa，抓取 URL 时使用 web_fetch_exa"
+                />
+              </Field>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={Boolean(node.config.fallbackToHeuristic)}
+                  onChange={(event) => updateNodeConfig(node.id, { fallbackToHeuristic: event.target.checked })}
+                />
+                <span>模型选择失败时回退到启发式自动选择</span>
+              </label>
+            </>
+          ) : null}
+          <div className="mcp-inspector-actions">
+            <button disabled={mcpInspecting} onClick={() => void refreshMcpToolsForNode(node)} type="button">
+              <RefreshCw size={15} />
+              <span>{mcpInspecting ? "刷新中" : "刷新工具"}</span>
+            </button>
+          </div>
+          {mcpInspectResult ? (
+            <small className={`rag-inspect-status ${mcpInspectResult.ok ? "" : "is-error"}`}>
+              {mcpInspectResult.ok ? `发现 ${mcpInspectResult.tools.length} 个 MCP Tool` : mcpInspectResult.error || "MCP 工具刷新失败"}
+            </small>
+          ) : null}
+          <Field label="MCP Tool">
+            <select
+              value={String(node.config.toolName ?? "")}
+              onChange={(event) => {
+                const tool = mcpTools.find((item) => item.name === event.target.value);
+                updateNodeConfig(node.id, {
+                  toolName: tool?.name ?? "",
+                  toolInputSchemaJson: JSON.stringify(tool?.inputSchema ?? {}),
+                });
+              }}
+            >
+              <option value="">未选择</option>
+              {mcpTools.map((tool) => (
+                <option key={tool.name} value={tool.name}>
+                  {tool.name}
+                </option>
+              ))}
+            </select>
+            <small className="model-config-note">
+              {mcpTools.length
+                ? "可选择要调用的 MCP Tool；不选择时运行时按工具选择方式处理。"
+                : "先点击刷新工具读取 MCP Server 暴露的工具；不选择时运行时会自动读取并按工具选择方式处理。"}
+            </small>
+          </Field>
+          <Field label="参数 JSON">
+            <textarea
+              className="code-area"
+              rows={6}
+              value={String(node.config.toolArgsJson ?? "{}")}
+              onChange={(event) => updateNodeConfig(node.id, { toolArgsJson: event.target.value })}
+              placeholder={'{ "query": "{{ state.messages }}" }'}
+            />
+          </Field>
+          <Field label="输入 Schema">
+            <textarea className="code-area" rows={5} readOnly value={String(node.config.toolInputSchemaJson ?? "{}")} />
+          </Field>
           <Field label="输出字段">
             <input
               value={String(node.config.outputField ?? "mcp_result")}
@@ -803,7 +1018,8 @@ export function Inspector() {
             />
           </Field>
         </>
-      )}
+        );
+      })()}
       {node.type === "agent_ref" && (
         <>
           <Field label="绑定 Agent">
@@ -839,6 +1055,12 @@ export function Inspector() {
               rows={4}
               value={String(node.config.instruction ?? "")}
               onChange={(event) => updateNodeConfig(node.id, { instruction: event.target.value })}
+            />
+          </Field>
+          <Field label="输出字段">
+            <input
+              value={String(node.config.outputField ?? "agent_ref_result")}
+              onChange={(event) => updateNodeConfig(node.id, { outputField: event.target.value })}
             />
           </Field>
         </>
@@ -1228,6 +1450,80 @@ function parseStringList(value: unknown): string[] {
   }
 }
 
+function parseMcpToolList(value: unknown): McpToolInspection[] {
+  if (Array.isArray(value)) {
+    return value.filter(isMcpToolInspection);
+  }
+  const text = String(value ?? "").trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed.filter(isMcpToolInspection) : [];
+  } catch {
+    return [];
+  }
+}
+
+function isMcpToolInspection(value: unknown): value is McpToolInspection {
+  return Boolean(value && typeof value === "object" && "name" in value && String((value as { name?: unknown }).name ?? "").trim());
+}
+
+function mcpServerForNode(node: NodeIR, availableMcpServers: MCPServerConfig[]): MCPServerConfig | null {
+  const serverId = String(node.config.serverId ?? "").trim();
+  const configured = availableMcpServers.find((server) => server.id === serverId);
+  if (configured) return configured;
+  const snapshots = parseMcpServerSnapshots(node.config.mcpServerSnapshotJson);
+  if (snapshots.length) return snapshots[0];
+  const transport = String(node.config.transport ?? "").trim();
+  const command = String(node.config.command ?? "").trim();
+  const url = String(node.config.url ?? "").trim();
+  if (!transport && !command && !url) return null;
+  return {
+    id: serverId,
+    name: String(node.config.serverName ?? "未命名 MCP"),
+    transport: transport || "stdio",
+    command,
+    argsJson: "[]",
+    envJson: "{}",
+    envVarsJson: "[]",
+    cwd: "",
+    url,
+    apiKey: "",
+    apiKeyEnv: "",
+    apiKeyMode: "env",
+    apiKeyHeader: "Authorization",
+    apiKeyPrefix: "Bearer",
+    bearerTokenEnvVar: "",
+    httpHeadersJson: "{}",
+    envHttpHeadersJson: "{}",
+    enabled: true,
+    startupTimeoutSec: 10,
+    toolTimeoutSec: 60,
+    enabledToolsJson: "[]",
+    disabledToolsJson: "[]",
+    defaultToolsApprovalMode: "",
+    sourceType: "manual",
+    sourcePath: "",
+    description: "",
+  };
+}
+
+function parseMcpServerSnapshots(value: unknown): MCPServerConfig[] {
+  if (Array.isArray(value)) return value.filter(isMcpServerConfig);
+  const text = String(value ?? "").trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed.filter(isMcpServerConfig) : [];
+  } catch {
+    return [];
+  }
+}
+
+function isMcpServerConfig(value: unknown): value is MCPServerConfig {
+  return Boolean(value && typeof value === "object" && "id" in value && "name" in value);
+}
+
 function directResourceIdsFromConfig(
   config: Record<string, unknown>,
   finalKey: string,
@@ -1285,7 +1581,13 @@ function detectStateFieldsFromNodes(nodes: NodeIR[]): DetectedStateField[] {
         fields.push(detectedFieldFromConfig(node, "outputField", "final_answer", "str", "模型输出"));
         break;
       case "agent":
-        fields.push(detectedFieldFromConfig(node, "outputField", "agent_result", "str", "Agent 输出"));
+        {
+          const output = detectedFieldFromConfig(node, "outputField", "agent_result", "str", "Agent 输出");
+          fields.push(output);
+          if (parseStringList(node.config.mcpServerIdsJson).length) {
+            fields.push(detectedField(node, `${output.name}_mcp_tool_calls`, "list", "MCP 调用记录"));
+          }
+        }
         break;
       case "tool": {
         const output = detectedFieldFromConfig(node, "outputField", "tools_result", "str", "Tools 输出");
@@ -1420,6 +1722,7 @@ function ModelSelectionFields({
   config,
   defaultProvider,
   defaultModel,
+  fieldNames,
   modelConfigs,
   nodeId,
   providerLabel = "供应商",
@@ -1430,6 +1733,18 @@ function ModelSelectionFields({
   config: Record<string, unknown>;
   defaultProvider: string;
   defaultModel: string;
+  fieldNames?: {
+    provider: string;
+    model: string;
+    modelConfigId: string;
+    modelConfigName: string;
+    modelDisplayName: string;
+    baseUrl: string;
+    apiKeyEnv: string;
+    apiVersion: string;
+    organization: string;
+    apiFormat: string;
+  };
   modelConfigs: ModelConfigOption[];
   nodeId: string;
   providerLabel?: string;
@@ -1437,9 +1752,21 @@ function ModelSelectionFields({
   providerNote?: string;
   updateNodeConfig: (nodeId: string, patch: Record<string, unknown>) => void;
 }) {
-  const provider = String(config.provider ?? defaultProvider);
-  const model = String(config.model ?? defaultModel);
-  const modelConfigId = String(config.modelConfigId ?? "");
+  const keys = fieldNames ?? {
+    provider: "provider",
+    model: "model",
+    modelConfigId: "modelConfigId",
+    modelConfigName: "modelConfigName",
+    modelDisplayName: "modelDisplayName",
+    baseUrl: "baseUrl",
+    apiKeyEnv: "apiKeyEnv",
+    apiVersion: "apiVersion",
+    organization: "organization",
+    apiFormat: "apiFormat",
+  };
+  const provider = String(config[keys.provider] ?? defaultProvider);
+  const model = String(config[keys.model] ?? defaultModel);
+  const modelConfigId = String(config[keys.modelConfigId] ?? "");
   const selectedConfig =
     modelConfigs.find((item) => item.id === modelConfigId) ??
     modelConfigs.find((item) => item.provider === provider && item.models.some((option) => option.id === model)) ??
@@ -1451,11 +1778,14 @@ function ModelSelectionFields({
     return (
       <>
         <Field label={providerManualLabel}>
-          <input value={provider} onChange={(event) => updateNodeConfig(nodeId, { provider: event.target.value, modelConfigId: "", modelConfigName: "" })} />
+          <input
+            value={provider}
+            onChange={(event) => updateNodeConfig(nodeId, { [keys.provider]: event.target.value, [keys.modelConfigId]: "", [keys.modelConfigName]: "" })}
+          />
           <small className="model-config-note">还没有本地模型配置，暂时使用手动输入。可在管理页「模型」中添加。{providerNote}</small>
         </Field>
         <Field label="模型">
-          <input value={model} onChange={(event) => updateNodeConfig(nodeId, { model: event.target.value })} />
+          <input value={model} onChange={(event) => updateNodeConfig(nodeId, { [keys.model]: event.target.value })} />
         </Field>
       </>
     );
@@ -1469,20 +1799,20 @@ function ModelSelectionFields({
           onChange={(event) => {
             const nextConfig = modelConfigs.find((item) => item.id === event.target.value);
             if (!nextConfig) {
-              updateNodeConfig(nodeId, { modelConfigId: "", modelConfigName: "" });
+              updateNodeConfig(nodeId, { [keys.modelConfigId]: "", [keys.modelConfigName]: "" });
               return;
             }
             const nextModel = nextConfig.models.find((option) => option.id === model)?.id ?? nextConfig.model ?? nextConfig.models[0]?.id ?? model;
             updateNodeConfig(nodeId, {
-              provider: nextConfig.provider,
-              model: nextModel,
-              modelConfigId: nextConfig.id,
-              modelConfigName: nextConfig.name,
-              baseUrl: nextConfig.baseUrl,
-              apiKeyEnv: nextConfig.apiKeyEnv,
-              apiVersion: nextConfig.apiVersion,
-              organization: nextConfig.organization,
-              apiFormat: nextConfig.apiFormat,
+              [keys.provider]: nextConfig.provider,
+              [keys.model]: nextModel,
+              [keys.modelConfigId]: nextConfig.id,
+              [keys.modelConfigName]: nextConfig.name,
+              [keys.baseUrl]: nextConfig.baseUrl,
+              [keys.apiKeyEnv]: nextConfig.apiKeyEnv,
+              [keys.apiVersion]: nextConfig.apiVersion,
+              [keys.organization]: nextConfig.organization,
+              [keys.apiFormat]: nextConfig.apiFormat,
             });
           }}
         >
@@ -1502,16 +1832,16 @@ function ModelSelectionFields({
             onChange={(event) => {
               const option = modelOptions.find((item) => item.id === event.target.value);
               updateNodeConfig(nodeId, {
-                model: event.target.value,
-                modelDisplayName: option?.name ?? "",
-                modelConfigId: selectedConfig.id,
-                modelConfigName: selectedConfig.name,
-                provider: selectedConfig.provider,
-                baseUrl: selectedConfig.baseUrl,
-                apiKeyEnv: selectedConfig.apiKeyEnv,
-                apiVersion: selectedConfig.apiVersion,
-                organization: selectedConfig.organization,
-                apiFormat: selectedConfig.apiFormat,
+                [keys.model]: event.target.value,
+                [keys.modelDisplayName]: option?.name ?? "",
+                [keys.modelConfigId]: selectedConfig.id,
+                [keys.modelConfigName]: selectedConfig.name,
+                [keys.provider]: selectedConfig.provider,
+                [keys.baseUrl]: selectedConfig.baseUrl,
+                [keys.apiKeyEnv]: selectedConfig.apiKeyEnv,
+                [keys.apiVersion]: selectedConfig.apiVersion,
+                [keys.organization]: selectedConfig.organization,
+                [keys.apiFormat]: selectedConfig.apiFormat,
               });
             }}
           >
@@ -1525,10 +1855,10 @@ function ModelSelectionFields({
       ) : (
         <div className="inline-grid">
           <Field label="供应商标识">
-            <input value={provider} onChange={(event) => updateNodeConfig(nodeId, { provider: event.target.value })} />
+            <input value={provider} onChange={(event) => updateNodeConfig(nodeId, { [keys.provider]: event.target.value })} />
           </Field>
           <Field label="模型">
-            <input value={model} onChange={(event) => updateNodeConfig(nodeId, { model: event.target.value })} />
+            <input value={model} onChange={(event) => updateNodeConfig(nodeId, { [keys.model]: event.target.value })} />
           </Field>
         </div>
       )}
@@ -1542,6 +1872,45 @@ function mergeById<T extends { id: string }>(items: T[]): T[] {
     map.set(item.id, item);
   }
   return Array.from(map.values());
+}
+
+function mergeAgentResources(importedAgents: ImportedAgentConfig[], globalAgents: ProjectListItem[] | ImportedAgentConfig[]): ImportedAgentConfig[] {
+  const byProjectId = new Map<string, ImportedAgentConfig>();
+  const byId = new Map<string, ImportedAgentConfig>();
+
+  function add(agent: ImportedAgentConfig) {
+    const projectId = String(agent.projectId ?? "").trim();
+    const id = String(agent.id ?? "").trim();
+    if (projectId && byProjectId.has(projectId)) return;
+    if (!projectId && id && byId.has(id)) return;
+    const normalized: ImportedAgentConfig = {
+      id: id || projectId,
+      name: agent.name || "导入的 Agent",
+      projectId,
+      role: agent.role || "sub_agent",
+      description: agent.description || "",
+    };
+    if (projectId) byProjectId.set(projectId, normalized);
+    if (normalized.id) byId.set(normalized.id, normalized);
+  }
+
+  for (const agent of importedAgents) {
+    add(agent);
+  }
+  for (const item of globalAgents) {
+    if ("projectId" in item) {
+      add(item);
+    } else {
+      add({
+        id: item.id,
+        name: item.name,
+        projectId: item.id,
+        role: "sub_agent",
+        description: item.description || `${item.nodeCount} 节点 · ${item.edgeCount} 连线`,
+      });
+    }
+  }
+  return Array.from(byProjectId.values()).concat(Array.from(byId.values()).filter((agent) => !agent.projectId));
 }
 
 function buildModelConfigOptions(configs: ModelConfig[]): ModelConfigOption[] {

@@ -9,6 +9,7 @@ export function ResourceConfigPanel() {
   const project = useProjectStore((state) => state.project);
   const projects = useProjectStore((state) => state.projects);
   const workspaceSkills = useProjectStore((state) => state.workspaceSkills);
+  const workspaceMcpServers = useProjectStore((state) => state.workspaceMcpServers);
   const updateTools = useProjectStore((state) => state.updateTools);
   const updateSkills = useProjectStore((state) => state.updateSkills);
   const updateMcpServers = useProjectStore((state) => state.updateMcpServers);
@@ -16,9 +17,11 @@ export function ResourceConfigPanel() {
   const updateAgentLinks = useProjectStore((state) => state.updateAgentLinks);
   const [tab, setTab] = useState<TabKey>("tools");
   const [selectedSkillId, setSelectedSkillId] = useState("");
+  const [selectedMcpId, setSelectedMcpId] = useState("");
 
   if (!project) return null;
   const projectSkills = project.skills ?? [];
+  const projectMcpServers = project.mcpServers ?? [];
 
   return (
     <aside className="resource-panel glass-panel">
@@ -80,30 +83,19 @@ export function ResourceConfigPanel() {
       )}
 
       {tab === "mcp" && (
-        <ResourceList
-          emptyText="还没有 MCP Server。"
-          items={project.mcpServers}
-          onAdd={() => updateMcpServers([...project.mcpServers, newMcpServer()])}
-          onRemove={(id) => updateMcpServers(project.mcpServers.filter((item) => item.id !== id))}
-          render={(server) => (
-            <>
-              <Field label="名称">
-                <input value={server.name} onChange={(event) => updateMcpServers(updateItem(project.mcpServers, server.id, { name: event.target.value }))} />
-              </Field>
-              <Field label="Transport">
-                <select value={server.transport} onChange={(event) => updateMcpServers(updateItem(project.mcpServers, server.id, { transport: event.target.value }))}>
-                  <option value="stdio">stdio</option>
-                  <option value="http">http</option>
-                </select>
-              </Field>
-              <Field label="Command">
-                <input value={server.command} onChange={(event) => updateMcpServers(updateItem(project.mcpServers, server.id, { command: event.target.value }))} />
-              </Field>
-              <Field label="URL">
-                <input value={server.url} onChange={(event) => updateMcpServers(updateItem(project.mcpServers, server.id, { url: event.target.value }))} />
-              </Field>
-            </>
-          )}
+        <McpProjectList
+          items={projectMcpServers}
+          workspaceMcpServers={workspaceMcpServers}
+          selectedMcpId={selectedMcpId}
+          onSelectMcp={setSelectedMcpId}
+          onAdd={(server) => {
+            if (!server || projectMcpServers.some((item) => item.id === server.id)) return;
+            updateMcpServers([...projectMcpServers, { ...server }]);
+            setSelectedMcpId("");
+          }}
+          onAddManual={() => updateMcpServers([...projectMcpServers, newMcpServer()])}
+          onChange={(id, patch) => updateMcpServers(updateItem(projectMcpServers, id, patch))}
+          onRemove={(id) => updateMcpServers(projectMcpServers.filter((item) => item.id !== id))}
         />
       )}
 
@@ -238,6 +230,91 @@ function SkillProjectList({
   );
 }
 
+function McpProjectList({
+  items,
+  workspaceMcpServers,
+  selectedMcpId,
+  onSelectMcp,
+  onAdd,
+  onAddManual,
+  onChange,
+  onRemove,
+}: {
+  items: MCPServerConfig[];
+  workspaceMcpServers: MCPServerConfig[];
+  selectedMcpId: string;
+  onSelectMcp: (id: string) => void;
+  onAdd: (server: MCPServerConfig | undefined) => void;
+  onAddManual: () => void;
+  onChange: (id: string, patch: Partial<MCPServerConfig>) => void;
+  onRemove: (id: string) => void;
+}) {
+  const available = workspaceMcpServers.filter((server) => !items.some((item) => item.id === server.id));
+  const selected = available.find((server) => server.id === selectedMcpId);
+  return (
+    <div className="resource-list">
+      <div className="resource-add resource-add--picker">
+        <select value={selectedMcpId} onChange={(event) => onSelectMcp(event.target.value)}>
+          <option value="">从全局 MCP 选择</option>
+          {available.map((server) => (
+            <option key={server.id} value={server.id}>
+              {server.name}
+            </option>
+          ))}
+        </select>
+        <button onClick={() => onAdd(selected)} disabled={!selected} type="button">
+          <Link2 size={15} />
+          <span>添加 MCP</span>
+        </button>
+      </div>
+      <button className="resource-add" onClick={onAddManual} type="button">
+        <Link2 size={15} />
+        <span>手动新增 MCP</span>
+      </button>
+      {items.length === 0 ? <div className="resource-empty">还没有添加项目 MCP。先在管理页配置全局 MCP，再从上方选择。</div> : null}
+      {items.map((server) => (
+        <section key={server.id} className="resource-card">
+          <Field label="名称">
+            <input value={server.name} onChange={(event) => onChange(server.id, { name: event.target.value })} />
+          </Field>
+          <div className="resource-summary">
+            <strong>{server.transport}</strong>
+            <span>{mcpEndpointSummary(server)}</span>
+          </div>
+          <Field label="Transport">
+            <select value={server.transport} onChange={(event) => onChange(server.id, { transport: event.target.value })}>
+              <option value="stdio">stdio</option>
+              <option value="http">http</option>
+            </select>
+          </Field>
+          <Field label="Command">
+            <input value={server.command} onChange={(event) => onChange(server.id, { command: event.target.value })} />
+          </Field>
+          <Field label="URL">
+            <input value={server.url} onChange={(event) => onChange(server.id, { url: event.target.value })} />
+          </Field>
+          <Field label="允许工具 JSON">
+            <textarea rows={2} value={server.enabledToolsJson} onChange={(event) => onChange(server.id, { enabledToolsJson: event.target.value })} />
+          </Field>
+          <Field label="禁用工具 JSON">
+            <textarea rows={2} value={server.disabledToolsJson} onChange={(event) => onChange(server.id, { disabledToolsJson: event.target.value })} />
+          </Field>
+          <label className="checkbox-row">
+            <input checked={server.enabled} onChange={(event) => onChange(server.id, { enabled: event.target.checked })} type="checkbox" />
+            <span>启用该项目 MCP Server</span>
+          </label>
+          {server.description ? (
+            <Field label="描述">
+              <textarea rows={2} value={server.description} onChange={(event) => onChange(server.id, { description: event.target.value })} />
+            </Field>
+          ) : null}
+          <button className="danger resource-remove" onClick={() => onRemove(server.id)} type="button">移除</button>
+        </section>
+      ))}
+    </div>
+  );
+}
+
 function ResourceList<T extends { id: string }>({
   items,
   emptyText,
@@ -296,6 +373,11 @@ function newMcpServer(): MCPServerConfig {
     envVarsJson: "[]",
     cwd: "",
     url: "",
+    apiKey: "",
+    apiKeyEnv: "",
+    apiKeyMode: "env",
+    apiKeyHeader: "Authorization",
+    apiKeyPrefix: "Bearer",
     bearerTokenEnvVar: "",
     httpHeadersJson: "{}",
     envHttpHeadersJson: "{}",
@@ -330,6 +412,21 @@ function newAgentLink(agents: ImportedAgentConfig[]): AgentLinkConfig {
     protocol: "handoff",
     instruction: "",
   };
+}
+
+function mcpEndpointSummary(server: MCPServerConfig) {
+  if (server.transport === "http") return server.url || "未配置 URL";
+  const args = parseJsonList(server.argsJson);
+  return [server.command, ...args].filter(Boolean).join(" ") || "未配置 Command";
+}
+
+function parseJsonList(value: string) {
+  try {
+    const parsed = JSON.parse(value || "[]");
+    return Array.isArray(parsed) ? parsed.map((item) => String(item)) : [];
+  } catch {
+    return [];
+  }
 }
 
 function createId(prefix: string) {

@@ -240,7 +240,7 @@ function RuntimeEnvironmentModal({
               <textarea
                 rows={4}
                 value={jsonListToLines(active.allowedRootsJson)}
-                onChange={(event) => updateActive({ allowedRootsJson: linesToJsonList(event.target.value, ["./"]) })}
+                onChange={(event) => updateActive({ allowedRootsJson: event.target.value })}
                 placeholder={"./\nE:\\data"}
               />
             </label>
@@ -248,14 +248,28 @@ function RuntimeEnvironmentModal({
               <input checked={active.networkEnabled} onChange={(event) => updateActive({ networkEnabled: event.target.checked })} type="checkbox" />
               <span>允许网络访问</span>
             </label>
+            <label className="checkbox-row runtime-modal__toggle">
+              <input
+                checked={active.allowAllHosts === true}
+                disabled={!active.networkEnabled}
+                onChange={(event) => updateActive({
+                  allowAllHosts: event.target.checked,
+                  allowedHostsJson: event.target.checked ? "[]" : JSON.stringify(["api.duckduckgo.com"], null, 2),
+                })}
+                type="checkbox"
+              />
+              <span>允许全部域名</span>
+            </label>
             <label className="field">
               <span>允许访问域名</span>
               <textarea
+                disabled={!active.networkEnabled || active.allowAllHosts === true}
                 rows={3}
                 value={jsonListToLines(active.allowedHostsJson)}
-                onChange={(event) => updateActive({ allowedHostsJson: linesToJsonList(event.target.value, ["api.duckduckgo.com"]) })}
-                placeholder="api.duckduckgo.com"
+                onChange={(event) => updateActive({ allowedHostsJson: event.target.value })}
+                placeholder={"mcp.exa.ai\napi.duckduckgo.com"}
               />
+              <small>多个域名可用换行、逗号或分号分隔；支持 *.example.com。</small>
             </label>
             <div className="runtime-modal__grid">
               <label className="field">
@@ -276,7 +290,7 @@ function RuntimeEnvironmentModal({
               <textarea
                 rows={5}
                 value={jsonListToLines(active.allowedCommandProfilesJson)}
-                onChange={(event) => updateActive({ allowedCommandProfilesJson: linesToJsonList(event.target.value, defaultCommandProfiles()) })}
+                onChange={(event) => updateActive({ allowedCommandProfilesJson: event.target.value })}
                 placeholder="python -m pytest"
               />
             </label>
@@ -416,7 +430,8 @@ function normalizeRuntimeEnvironments(environments: RuntimeEnvironmentConfig[]) 
     kind: "local_backend",
     description: environment.description || "由当前 FastAPI 后端所在机器执行工具。",
     allowedRootsJson: linesToJsonList(jsonListToLines(environment.allowedRootsJson), ["./"]),
-    allowedHostsJson: linesToJsonList(jsonListToLines(environment.allowedHostsJson), ["api.duckduckgo.com"]),
+    allowAllHosts: environment.allowAllHosts === true,
+    allowedHostsJson: environment.allowAllHosts === true ? "[]" : linesToJsonList(jsonListToLines(environment.allowedHostsJson), ["api.duckduckgo.com"]),
     maxFileBytes: Math.max(1, Number(environment.maxFileBytes || 1048576)),
     maxHttpBytes: Math.max(1, Number(environment.maxHttpBytes || 262144)),
     networkEnabled: environment.networkEnabled !== false,
@@ -435,6 +450,7 @@ function newRuntimeEnvironment(id = createRuntimeId(), name = "本地后端"): R
     description: "由当前 FastAPI 后端所在机器执行工具。",
     allowedRootsJson: JSON.stringify(["./"], null, 2),
     networkEnabled: true,
+    allowAllHosts: false,
     allowedHostsJson: JSON.stringify(["api.duckduckgo.com"], null, 2),
     maxFileBytes: 1048576,
     maxHttpBytes: 262144,

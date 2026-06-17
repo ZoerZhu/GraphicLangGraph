@@ -7,6 +7,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import time
 import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -29,6 +30,7 @@ from app.config import (
     load_runtime_env,
 )
 from app.builtin_tools import builtin_tool_config_dicts
+from app.mcp_runtime import inspect_mcp_server
 from app.runtime_environment import (
     RuntimeEnvironmentConfig,
     normalize_runtime_environments,
@@ -82,6 +84,11 @@ class WorkspaceMcpServerConfig(BaseModel):
     env_vars_json: str = Field("[]", alias="envVarsJson")
     cwd: str = ""
     url: str = ""
+    api_key: str = Field("", alias="apiKey")
+    api_key_env: str = Field("", alias="apiKeyEnv")
+    api_key_mode: str = Field("env", alias="apiKeyMode")
+    api_key_header: str = Field("Authorization", alias="apiKeyHeader")
+    api_key_prefix: str = Field("Bearer", alias="apiKeyPrefix")
     bearer_token_env_var: str = Field("", alias="bearerTokenEnvVar")
     http_headers_json: str = Field("{}", alias="httpHeadersJson")
     env_http_headers_json: str = Field("{}", alias="envHttpHeadersJson")
@@ -211,6 +218,28 @@ class McpImportResponse(BaseModel):
     import_path: str = Field("", alias="importPath")
     detected_files: list[str] = Field(default_factory=list, alias="detectedFiles")
     warnings: list[str] = Field(default_factory=list)
+
+
+class McpToolInspectResult(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str
+    title: str = ""
+    description: str = ""
+    input_schema: dict[str, Any] = Field(default_factory=dict, alias="inputSchema")
+
+
+class McpInspectResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    ok: bool
+    server_id: str = Field("", alias="serverId")
+    server_name: str = Field("", alias="serverName")
+    transport: str = ""
+    tools: list[McpToolInspectResult] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    duration_ms: float = Field(0, alias="durationMs")
+    error: str = ""
 
 
 class RagPathInspectResult(BaseModel):
@@ -505,6 +534,27 @@ def import_mcp_server_configs(payload: McpImportRequest) -> McpImportResponse:
         detectedFiles=detected_files,
         warnings=warnings,
     )
+
+
+@router.post("/mcp/inspect", response_model=McpInspectResponse)
+def inspect_mcp_server_config(config: WorkspaceMcpServerConfig) -> McpInspectResponse:
+    started = time.perf_counter()
+    normalized = _normalize_mcp_server_configs([config])[0]
+    payload = normalized.model_dump(by_alias=True)
+    try:
+        result = inspect_mcp_server(payload, runtime_environment=None)
+        return McpInspectResponse.model_validate(result)
+    except Exception as exc:
+        return McpInspectResponse(
+            ok=False,
+            serverId=normalized.id,
+            serverName=normalized.name,
+            transport=normalized.transport,
+            tools=[],
+            warnings=[],
+            durationMs=round((time.perf_counter() - started) * 1000, 2),
+            error=f"{exc.__class__.__name__}: {exc}",
+        )
 
 
 @router.get("/models", response_model=list[WorkspaceModelConfig])
@@ -1840,6 +1890,13 @@ def _normalize_mcp_server_configs(configs: list[WorkspaceMcpServerConfig]) -> li
         default_approval = config.default_tools_approval_mode.strip()
         if default_approval not in {"", "auto", "prompt", "approve"}:
             default_approval = ""
+        legacy_bearer_env = _safe_env_name(config.bearer_token_env_var)
+        api_key_mode = "direct" if config.api_key_mode.strip() == "direct" or (config.api_key.strip() and not config.api_key_env.strip()) else "env"
+        api_key_env = _safe_env_name(config.api_key_env) if api_key_mode == "env" else ""
+        if api_key_mode == "env" and not api_key_env and legacy_bearer_env:
+            api_key_env = legacy_bearer_env
+        api_key_header = config.api_key_header.strip() or ("Authorization" if api_key_env else "")
+        api_key_prefix = config.api_key_prefix.strip() or ("Bearer" if api_key_header.lower() == "authorization" and api_key_env else "")
         normalized.append(
             config.model_copy(
                 update={
@@ -1852,7 +1909,12 @@ def _normalize_mcp_server_configs(configs: list[WorkspaceMcpServerConfig]) -> li
                     "env_vars_json": _ensure_json_text(config.env_vars_json, []),
                     "cwd": config.cwd.strip(),
                     "url": config.url.strip(),
-                    "bearer_token_env_var": _safe_env_name(config.bearer_token_env_var),
+                    "api_key": config.api_key.strip() if api_key_mode == "direct" else "",
+                    "api_key_env": api_key_env,
+                    "api_key_mode": api_key_mode,
+                    "api_key_header": api_key_header,
+                    "api_key_prefix": api_key_prefix,
+                    "bearer_token_env_var": legacy_bearer_env,
                     "http_headers_json": _ensure_json_text(config.http_headers_json, {}),
                     "env_http_headers_json": _ensure_json_text(config.env_http_headers_json, {}),
                     "enabled": config.enabled is not False,

@@ -34,4 +34,6 @@ def _is_plain_secret_key(key: str) -> bool:
     normalized = "".join(ch for ch in key.lower() if ch.isalnum())
     if normalized.endswith("env") or normalized in {"authsecret", "secretref"}:
         return False
-    return normalized in SECRET_KEY_NAMES
+    if normalized in SECRET_KEY_NAMES:
+        return True
+    return normalized.endswith(("apikey", "secret", "password", "token"))

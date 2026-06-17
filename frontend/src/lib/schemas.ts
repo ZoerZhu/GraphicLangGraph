@@ -95,6 +95,11 @@ export const ProjectSchema = z.object({
       envVarsJson: z.string().default("[]"),
       cwd: z.string().default(""),
       url: z.string(),
+      apiKey: z.string().default(""),
+      apiKeyEnv: z.string().default(""),
+      apiKeyMode: z.string().default("env"),
+      apiKeyHeader: z.string().default("Authorization"),
+      apiKeyPrefix: z.string().default("Bearer"),
       bearerTokenEnvVar: z.string().default(""),
       httpHeadersJson: z.string().default("{}"),
       envHttpHeadersJson: z.string().default("{}"),
@@ -203,6 +208,7 @@ export const RuntimeEnvironmentConfigSchema = z.object({
   description: z.string(),
   allowedRootsJson: z.string(),
   networkEnabled: z.boolean(),
+  allowAllHosts: z.boolean().default(false),
   allowedHostsJson: z.string(),
   maxFileBytes: z.number(),
   maxHttpBytes: z.number(),
@@ -319,6 +325,11 @@ export const McpServerConfigSchema = z.object({
   envVarsJson: z.string().default("[]"),
   cwd: z.string().default(""),
   url: z.string(),
+  apiKey: z.string().default(""),
+  apiKeyEnv: z.string().default(""),
+  apiKeyMode: z.string().default("env"),
+  apiKeyHeader: z.string().default("Authorization"),
+  apiKeyPrefix: z.string().default("Bearer"),
   bearerTokenEnvVar: z.string().default(""),
   httpHeadersJson: z.string().default("{}"),
   envHttpHeadersJson: z.string().default("{}"),
@@ -341,6 +352,24 @@ export const McpImportResultSchema = z.object({
   importPath: z.string(),
   detectedFiles: z.array(z.string()),
   warnings: z.array(z.string()),
+});
+
+export const McpToolInspectionSchema = z.object({
+  name: z.string(),
+  title: z.string().default(""),
+  description: z.string().default(""),
+  inputSchema: z.record(z.unknown()).default({}),
+});
+
+export const McpInspectResultSchema = z.object({
+  ok: z.boolean(),
+  serverId: z.string().default(""),
+  serverName: z.string().default(""),
+  transport: z.string().default(""),
+  tools: z.array(McpToolInspectionSchema).default([]),
+  warnings: z.array(z.string()).default([]),
+  durationMs: z.number().default(0),
+  error: z.string().default(""),
 });
 
 export const RagKnowledgeBaseSchema = z.object({

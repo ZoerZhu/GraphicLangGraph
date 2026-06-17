@@ -30,9 +30,11 @@ from app.code_intelligence import (
     glg_semantic_symbols,
     glg_summarize_page_structure,
 )
-from app.config import ROOT_DIR, WORKSPACE_TOOLS_FILE
+from app.config import ROOT_DIR, WORKSPACE_MCP_FILE, WORKSPACE_TOOLS_FILE
 from app.edit_sessions import EditSessionError, propose_patch, replace_in_file, run_whitelisted_command, write_file
 from app.ir.schemas import EdgeKind, NodeIR, NodeType, ProjectIR
+from app.mcp_runtime import invoke_mcp_tool, list_mcp_tools, make_mcp_agent_tool_config, normalize_mcp_server_config
+from app.project_store import read_project
 from app.runtime_environment import default_runtime_environment, resolve_runtime_environment
 
 
@@ -41,10 +43,13 @@ ModelRuntimeConfig = dict[str, Any] | None
 RuntimeEnvironment = dict[str, Any] | None
 SkillRuntimeConfig = dict[str, dict[str, Any]]
 ToolRuntimeConfig = dict[str, dict[str, Any]]
+McpRuntimeConfig = dict[str, dict[str, Any]]
+AgentRuntimeConfig = dict[str, dict[str, Any]]
 
 TEMPLATE_RE = re.compile(r"{{\s*state\.([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
 TEXT_SUFFIXES = {".md", ".markdown", ".txt"}
 MAX_STEPS = 80
+MAX_AGENT_CALL_DEPTH = 3
 TOOL_OBSERVATION_STRING_LIMIT = 12_000
 SKILL_CORE_RUNTIME_LIMIT = 60_000
 SKILL_REFERENCES_RUNTIME_LIMIT = 30_000
@@ -88,6 +93,7 @@ def run_project_preview(
     mode: RunMode = "dry",
     model_config: ModelRuntimeConfig = None,
     runtime_environment: RuntimeEnvironment = None,
+    agent_depth: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     return _walk_project(
         project,
@@ -95,6 +101,7 @@ def run_project_preview(
         mode,
         _normalize_model_config(model_config),
         _normalize_runtime_environment(runtime_environment),
+        agent_depth,
     )
 
 
@@ -104,6 +111,7 @@ def iter_project_preview_events(
     mode: RunMode = "dry",
     model_config: ModelRuntimeConfig = None,
     runtime_environment: RuntimeEnvironment = None,
+    agent_depth: int = 0,
 ):
     yield from _walk_project_events(
         project,
@@ -111,6 +119,7 @@ def iter_project_preview_events(
         mode,
         _normalize_model_config(model_config),
         _normalize_runtime_environment(runtime_environment),
+        agent_depth,
     )
 
 
@@ -120,10 +129,13 @@ def _walk_project(
     mode: RunMode,
     model_config: ModelRuntimeConfig,
     runtime_environment: RuntimeEnvironment,
+    agent_depth: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     nodes = {node.id: node for node in project.nodes}
     skills = _enabled_skills_by_id(project)
     tools = _tool_configs_by_id(project)
+    mcp_servers = _mcp_configs_by_id(project)
+    agents = _agent_configs_by_id(project)
     outgoing: dict[str, list] = {}
     for edge in project.edges:
         outgoing.setdefault(edge.source, []).append(edge)
@@ -142,7 +154,7 @@ def _walk_project(
         before = dict(state)
         started = time.perf_counter()
         try:
-            delta, detail = _execute_node(node, state, mode, model_config, runtime_environment, skills, tools)
+            delta, detail = _execute_node(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             state.update(delta)
             status = "ok"
         except Exception as exc:  # Keep the preview response structured instead of surfacing a 500.
@@ -197,10 +209,13 @@ def _walk_project_events(
     mode: RunMode,
     model_config: ModelRuntimeConfig,
     runtime_environment: RuntimeEnvironment,
+    agent_depth: int,
 ):
     nodes = {node.id: node for node in project.nodes}
     skills = _enabled_skills_by_id(project)
     tools = _tool_configs_by_id(project)
+    mcp_servers = _mcp_configs_by_id(project)
+    agents = _agent_configs_by_id(project)
     outgoing: dict[str, list] = {}
     for edge in project.edges:
         outgoing.setdefault(edge.source, []).append(edge)
@@ -234,7 +249,7 @@ def _walk_project_events(
             if mode == "live" and node.type == NodeType.PARALLEL_TOOLS:
                 delta, detail = yield from _execute_live_parallel_tools_events(node, state, model_config, runtime_environment, tools)
             else:
-                delta, detail = _execute_node(node, state, mode, model_config, runtime_environment, skills, tools)
+                delta, detail = _execute_node(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             state.update(delta)
             status = "ok"
         except Exception as exc:  # Keep streamed events structured instead of surfacing a 500.
@@ -298,16 +313,20 @@ def _walk_project_events(
 
 def _execute_node(
     node: NodeIR,
+    project: ProjectIR,
     state: dict[str, Any],
     mode: RunMode,
     model_config: ModelRuntimeConfig,
     runtime_environment: RuntimeEnvironment,
     skills: SkillRuntimeConfig,
     tools: ToolRuntimeConfig,
+    mcp_servers: McpRuntimeConfig,
+    agents: AgentRuntimeConfig,
+    agent_depth: int,
 ) -> tuple[dict[str, Any], str]:
     if mode == "dry":
         return _execute_dry_node(node, state, skills, tools)
-    return _execute_live_node(node, state, model_config, runtime_environment, skills, tools)
+    return _execute_live_node(node, project, state, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
 
 
 def _execute_dry_node(node: NodeIR, state: dict[str, Any], skills: SkillRuntimeConfig, tools: ToolRuntimeConfig) -> tuple[dict[str, Any], str]:
@@ -396,19 +415,27 @@ def _execute_dry_node(node: NodeIR, state: dict[str, Any], skills: SkillRuntimeC
 
 def _execute_live_node(
     node: NodeIR,
+    project: ProjectIR,
     state: dict[str, Any],
     model_config: ModelRuntimeConfig,
     runtime_environment: RuntimeEnvironment,
     skills: SkillRuntimeConfig,
     tools: ToolRuntimeConfig,
+    mcp_servers: McpRuntimeConfig,
+    agents: AgentRuntimeConfig,
+    agent_depth: int,
 ) -> tuple[dict[str, Any], str]:
     config = node.config
     if node.type == NodeType.LLM:
         return _execute_live_llm(node, state, model_config)
     if node.type == NodeType.AGENT:
-        return _execute_live_agent(node, state, model_config, skills)
+        return _execute_live_agent(node, project, state, model_config, runtime_environment, skills, mcp_servers, agents, agent_depth)
+    if node.type == NodeType.AGENT_REF:
+        return _execute_live_agent_ref(node, project, state, model_config, runtime_environment, agent_depth)
     if node.type == NodeType.SKILL_NODE:
         return _execute_skill_node(node, skills, dry_run=False)
+    if node.type == NodeType.MCP_NODE:
+        return _execute_live_mcp_node(node, state, model_config, runtime_environment, mcp_servers)
     if node.type == NodeType.TOOL:
         return _execute_live_tool(node, state, model_config, runtime_environment, tools)
     if node.type == NodeType.TASK_SPLITTER:
@@ -452,7 +479,17 @@ def _execute_live_llm(node: NodeIR, state: dict[str, Any], model_config: ModelRu
     return {output_field: content}, f"真实调用 {provider}/{model}{suffix}，输出到 state.{output_field}"
 
 
-def _execute_live_agent(node: NodeIR, state: dict[str, Any], model_config: ModelRuntimeConfig, skills: SkillRuntimeConfig) -> tuple[dict[str, Any], str]:
+def _execute_live_agent(
+    node: NodeIR,
+    project: ProjectIR,
+    state: dict[str, Any],
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    skills: SkillRuntimeConfig,
+    mcp_servers: McpRuntimeConfig,
+    agents: AgentRuntimeConfig,
+    agent_depth: int,
+) -> tuple[dict[str, Any], str]:
     config = node.config
     effective_model_config = _effective_model_config(config, model_config)
     provider, model = _resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
@@ -463,6 +500,45 @@ def _execute_live_agent(node: NodeIR, state: dict[str, Any], model_config: Model
         user_text = render_template(user_prompt, state)
     else:
         user_text = _agent_state_prompt(state)
+    selected_mcp_servers = _selected_mcp_server_configs(config, mcp_servers)
+    selected_agents = _selected_agent_configs(config, agents)
+    if selected_mcp_servers or selected_agents:
+        max_iterations = min(_positive_int(config.get("maxIterations", 4), 4), 12)
+        mcp_tools = _mcp_agent_tool_configs(selected_mcp_servers, runtime_environment)
+        agent_tools = _agent_tool_configs(selected_agents, project)
+        registered_tools = [*mcp_tools, *agent_tools]
+        if selected_mcp_servers and not mcp_tools:
+            raise RuntimeError("Agent 已选择 MCP Server，但没有可用 MCP Tool。")
+        if selected_agents and not agent_tools:
+            raise RuntimeError("Agent 已选择子 Agent，但没有可用 Agent Tool。")
+        final_answer, calls = _run_tools_agent_session(
+            provider,
+            model,
+            effective_model_config,
+            registered_tools,
+            system_prompt,
+            user_text,
+            max_iterations,
+            runtime_environment,
+            {
+                "projectId": project.project.id,
+                "projectName": project.project.name,
+                "state": state,
+                "agentDepth": agent_depth,
+                "modelConfig": effective_model_config,
+            },
+        )
+        output_field = str(config.get("outputField", f"{node.id}_result"))
+        skill_count = len(_selected_skill_configs(config, skills))
+        skill_hint = f"，注入 {skill_count} 个 Skill" if skill_count else ""
+        result = {
+            output_field: final_answer,
+        }
+        if mcp_tools:
+            result[f"{output_field}_mcp_tool_calls"] = [call for call in calls if str(call.get("source") or "") == "mcp"]
+        if agent_tools:
+            result[f"{output_field}_agent_tool_calls"] = [call for call in calls if str(call.get("source") or "") == "agent"]
+        return result, f"真实调用 Agent 模型 {provider}/{model}{skill_hint}，注册 {len(registered_tools)} 个工具，执行 {len(calls)} 次调用，输出到 state.{output_field}"
     messages: list[tuple[str, str]] = []
     if system_prompt:
         messages.append(("system", system_prompt))
@@ -488,6 +564,235 @@ def _execute_skill_node(node: NodeIR, skills: SkillRuntimeConfig, dry_run: bool)
         content = f"[dry-run] {skill_name}"
     mode_text = "模拟读取" if dry_run else "读取"
     return {output_field: content}, f"{mode_text} Skill「{skill_name}」内容到 state.{output_field}"
+
+
+def _execute_live_mcp_node(
+    node: NodeIR,
+    state: dict[str, Any],
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    mcp_servers: McpRuntimeConfig,
+) -> tuple[dict[str, Any], str]:
+    config = node.config
+    output_field = str(config.get("outputField", "mcp_result")).strip() or "mcp_result"
+    server = _mcp_server_for_node(config, mcp_servers)
+    if not server:
+        raise RuntimeError("MCP Node 未绑定有效 MCP Server。")
+    tool_name = str(config.get("toolName") or "").strip()
+    args = _render_json_object(str(config.get("toolArgsJson") or "{}"), state, "toolArgsJson")
+    available_tools: list[dict[str, Any]] = []
+    auto_selected = False
+    selected_by_model = False
+    selection_reason = ""
+    selection_mode = _mcp_tool_selection_mode(config, bool(tool_name))
+    selected_tool: dict[str, Any] | None = None
+    if not tool_name:
+        available_tools = list_mcp_tools(server, runtime_environment)
+        if selection_mode == "manual":
+            candidates = ", ".join(str(tool.get("name") or "") for tool in available_tools if str(tool.get("name") or "").strip())
+            raise RuntimeError(f"MCP Node 未选择 MCP Tool。可选工具：{candidates}" if candidates else "MCP Node 未选择 MCP Tool。")
+        if selection_mode == "model":
+            try:
+                selection = _select_mcp_tool_with_model(config, available_tools, args, state, model_config)
+                tool_name = str(selection.get("tool") or "").strip()
+                selected_tool = next((tool for tool in available_tools if str(tool.get("name") or "").strip() == tool_name), None)
+                selected_args = selection.get("args")
+                if not selected_tool:
+                    raise RuntimeError(f"模型选择了不存在或不可用的 MCP Tool：{tool_name}")
+                if not isinstance(selected_args, dict):
+                    raise RuntimeError("模型选择 MCP Tool 时返回的 args 必须是 JSON object。")
+                args = {**args, **selected_args}
+                selected_by_model = True
+                selection_reason = str(selection.get("reason") or "").strip()
+            except Exception:
+                if not _truthy(config.get("fallbackToHeuristic")):
+                    raise
+                selected_tool = _select_default_mcp_tool(available_tools, args, state)
+                tool_name = str(selected_tool.get("name") or "").strip()
+                selection_reason = "model_selection_failed_fallback_to_heuristic"
+        else:
+            selected_tool = _select_default_mcp_tool(available_tools, args, state)
+            tool_name = str(selected_tool.get("name") or "").strip()
+        tool_name = str(selected_tool.get("name") or "").strip()
+        auto_selected = True
+    if not tool_name:
+        raise RuntimeError("MCP Node 未选择 MCP Tool，且无法自动选择。")
+    if selected_tool is None and available_tools:
+        selected_tool = next((tool for tool in available_tools if str(tool.get("name") or "") == tool_name), None)
+    args = _ensure_mcp_default_args(args, selected_tool, state)
+    result = invoke_mcp_tool(server, tool_name, args, runtime_environment)
+    if isinstance(result, dict):
+        result["autoSelectedTool"] = auto_selected
+        result["selectionMode"] = selection_mode
+        result["selectedByModel"] = selected_by_model
+        result["selectionReason"] = selection_reason
+        if available_tools:
+            result["availableTools"] = [_mcp_tool_summary(tool) for tool in available_tools]
+    server_name = str(result.get("serverName") or server.get("name") or "未命名 MCP")
+    return {output_field: result}, f"真实调用 MCP「{server_name}」工具 {tool_name}，输出到 state.{output_field}"
+
+
+def _mcp_tool_selection_mode(config: dict[str, Any], has_explicit_tool: bool) -> str:
+    if has_explicit_tool:
+        return "manual"
+    mode = str(config.get("toolSelectionMode") or "").strip().lower()
+    return mode if mode in {"manual", "heuristic", "model"} else "heuristic"
+
+
+def _select_mcp_tool_with_model(
+    config: dict[str, Any],
+    tools: list[dict[str, Any]],
+    base_args: dict[str, Any],
+    state: dict[str, Any],
+    model_config: ModelRuntimeConfig,
+) -> dict[str, Any]:
+    available = [tool for tool in tools if str(tool.get("name") or "").strip()]
+    if not available:
+        raise RuntimeError("MCP Server 未暴露可调用 Tool。")
+    selection_config = _mcp_tool_selection_model_config(config)
+    effective_model_config = _effective_model_config(selection_config, model_config)
+    provider, model = _resolve_node_model(selection_config, model_config, "openai", "gpt-4.1-mini")
+    messages = [
+        ("system", _mcp_tool_selection_system_prompt(config, available)),
+        ("user", _mcp_tool_selection_user_prompt(state, base_args)),
+    ]
+    response = _call_chat_model(provider, model, messages, effective_model_config)
+    content = getattr(response, "content", str(response))
+    selection = _parse_mcp_tool_selection(content)
+    tool_name = str(selection.get("tool") or selection.get("toolName") or selection.get("name") or "").strip()
+    if not tool_name:
+        raise RuntimeError("模型没有返回要调用的 MCP Tool。")
+    selection["tool"] = tool_name
+    args = selection.get("args")
+    if args is None:
+        selection["args"] = {}
+    elif not isinstance(args, dict):
+        raise RuntimeError("模型选择 MCP Tool 时返回的 args 必须是 JSON object。")
+    return selection
+
+
+def _mcp_tool_selection_model_config(config: dict[str, Any]) -> dict[str, Any]:
+    result = dict(config)
+    mapping = {
+        "toolSelectionModelProvider": "provider",
+        "toolSelectionModel": "model",
+        "toolSelectionModelConfigId": "modelConfigId",
+        "toolSelectionModelConfigName": "modelConfigName",
+        "toolSelectionBaseUrl": "baseUrl",
+        "toolSelectionApiKeyEnv": "apiKeyEnv",
+        "toolSelectionApiKey": "apiKey",
+        "toolSelectionApiVersion": "apiVersion",
+        "toolSelectionOrganization": "organization",
+        "toolSelectionApiFormat": "apiFormat",
+    }
+    for source, target in mapping.items():
+        value = config.get(source)
+        if value is not None and str(value).strip():
+            result[target] = value
+    return result
+
+
+def _mcp_tool_selection_system_prompt(config: dict[str, Any], tools: list[dict[str, Any]]) -> str:
+    instruction = str(config.get("toolSelectionInstruction") or "").strip()
+    tool_specs = [
+        {
+            "name": str(tool.get("name") or ""),
+            "title": str(tool.get("title") or ""),
+            "description": str(tool.get("description") or ""),
+            "inputSchema": _compact_value(tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else {}, string_limit=1800, list_limit=10),
+        }
+        for tool in tools
+    ]
+    base = (
+        "你负责为 MCP Node 选择一个 MCP Tool 并生成调用参数。"
+        "只能从可用工具列表中选择一个工具；不要编造工具名。"
+        "只输出 JSON object，格式固定为："
+        '{"tool":"工具名","args":{},"reason":"选择原因"}。'
+        "args 必须是 JSON object。"
+    )
+    sections = [base]
+    if instruction:
+        sections.append("额外选择要求：\n" + instruction)
+    sections.append("可用 MCP Tools：\n" + json.dumps(tool_specs, ensure_ascii=False, indent=2))
+    return "\n\n".join(sections)
+
+
+def _mcp_tool_selection_user_prompt(state: dict[str, Any], base_args: dict[str, Any]) -> str:
+    payload = {
+        "state": _compact_state(state),
+        "baseArgs": base_args,
+        "queryText": _mcp_state_query_text(state),
+    }
+    return "请根据当前流程 state 和基础参数选择 MCP Tool：\n" + json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+
+
+def _parse_mcp_tool_selection(content: str) -> dict[str, Any]:
+    text = str(content or "").strip()
+    if not text:
+        raise RuntimeError("模型选择 MCP Tool 的响应为空。")
+    candidates = [text]
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidates.insert(0, fenced.group(1).strip())
+    start = text.find("{")
+    end = text.rfind("}")
+    if 0 <= start < end:
+        candidates.append(text[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise RuntimeError("模型选择 MCP Tool 的响应不是合法 JSON object。")
+
+
+def _select_default_mcp_tool(tools: list[dict[str, Any]], args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    available = [tool for tool in tools if str(tool.get("name") or "").strip()]
+    if not available:
+        raise RuntimeError("MCP Server 未暴露可调用 Tool。")
+    if len(available) == 1:
+        return available[0]
+    by_name = {str(tool.get("name") or "").strip(): tool for tool in available}
+    query_text = str(args.get("query") or "").strip() or _mcp_state_query_text(state)
+    if query_text and "web_search_exa" in by_name:
+        return by_name["web_search_exa"]
+    search_tools = [tool for tool in available if "search" in str(tool.get("name") or "").lower()]
+    if len(search_tools) == 1:
+        return search_tools[0]
+    candidates = ", ".join(str(tool.get("name") or "") for tool in available)
+    raise RuntimeError(f"MCP Node 未选择 Tool，且无法自动判断。可选工具：{candidates}")
+
+
+def _ensure_mcp_default_args(args: dict[str, Any], selected_tool: dict[str, Any] | None, state: dict[str, Any]) -> dict[str, Any]:
+    if args or not selected_tool or not _mcp_tool_needs_query(selected_tool):
+        return args
+    query = _mcp_state_query_text(state)
+    return {"query": query} if query else args
+
+
+def _mcp_tool_needs_query(tool: dict[str, Any]) -> bool:
+    schema = tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = schema.get("required") if isinstance(schema.get("required"), list) else []
+    return "query" in properties or "query" in {str(item) for item in required}
+
+
+def _mcp_state_query_text(state: dict[str, Any]) -> str:
+    for key in ("chat", "messages", "message", "input", "query"):
+        text = _state_value_to_text(state.get(key)).strip()
+        if text:
+            return text
+    return ""
+
+
+def _mcp_tool_summary(tool: dict[str, Any]) -> dict[str, str]:
+    return {
+        "name": str(tool.get("name") or ""),
+        "title": str(tool.get("title") or ""),
+        "description": str(tool.get("description") or ""),
+    }
 
 
 def _enabled_skills_by_id(project: ProjectIR) -> SkillRuntimeConfig:
@@ -785,6 +1090,7 @@ def _run_tools_agent_session(
     user_prompt: str,
     max_iterations: int,
     runtime_environment: RuntimeEnvironment,
+    agent_context: dict[str, Any] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     messages: list[tuple[str, str]] = [
         ("system", _tools_agent_system_prompt(system_prompt, selected_tools, max_iterations)),
@@ -803,13 +1109,15 @@ def _run_tools_agent_session(
 
         observations: list[dict[str, Any]] = []
         for call_index, tool_call in enumerate(tool_calls, start=1):
+            started = time.perf_counter()
             tool_name = str(tool_call.get("tool") or tool_call.get("name") or "").strip()
             args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
             tool_config = _find_selected_tool(selected_tools, tool_name)
+            trace_meta = _registered_tool_trace_metadata(tool_config) if tool_config else {"toolName": tool_name}
             if not tool_config:
                 observation = {"ok": False, "error": f"未知 Tool：{tool_name}", "errorType": "tool_args"}
             else:
-                observation = _invoke_registered_tool(tool_config, args, runtime_environment)
+                observation = _invoke_registered_tool(tool_config, args, runtime_environment, effective_model_config, agent_context)
             recommended_next_tools = _recommended_next_tools(tool_name, args, observation)
             if recommended_next_tools:
                 observation["recommendedNextTools"] = recommended_next_tools
@@ -821,6 +1129,11 @@ def _run_tools_agent_session(
                     "args": args,
                     "observation": observation,
                     "recommendedNextTools": recommended_next_tools,
+                    "source": trace_meta.get("source", ""),
+                    "serverName": trace_meta.get("serverName", ""),
+                    "agentName": trace_meta.get("agentName", ""),
+                    "toolName": trace_meta.get("toolName", tool_name),
+                    "durationMs": round((time.perf_counter() - started) * 1000, 2),
                     "errorType": observation.get("errorType") if isinstance(observation, dict) else None,
                 }
             )
@@ -1316,7 +1629,26 @@ def _normalize_tool_calls(value: Any) -> list[dict[str, Any]]:
     return calls
 
 
-def _invoke_registered_tool(tool_config: dict[str, Any], args: dict[str, Any], runtime_environment: RuntimeEnvironment = None) -> dict[str, Any]:
+def _registered_tool_trace_metadata(tool_config: dict[str, Any]) -> dict[str, str]:
+    schema = _parse_json_object(str(tool_config.get("schemaJson", "{}")))
+    metadata = schema.get("x-graphic") if isinstance(schema.get("x-graphic"), dict) else {}
+    server = metadata.get("server") if isinstance(metadata.get("server"), dict) else {}
+    source = str(tool_config.get("source") or metadata.get("source") or "")
+    return {
+        "source": "mcp" if source == "mcp" or metadata.get("kind") == "mcp_tool" else ("agent" if source == "agent" or metadata.get("kind") == "agent_tool" else source),
+        "serverName": str(metadata.get("serverName") or server.get("name") or ""),
+        "agentName": str(metadata.get("agentName") or ""),
+        "toolName": str(metadata.get("toolName") or tool_config.get("name") or ""),
+    }
+
+
+def _invoke_registered_tool(
+    tool_config: dict[str, Any],
+    args: dict[str, Any],
+    runtime_environment: RuntimeEnvironment = None,
+    model_config: ModelRuntimeConfig = None,
+    agent_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     tool_config = _fresh_builtin_tool_config(tool_config) or tool_config
     schema = _parse_json_object(str(tool_config.get("schemaJson", "{}")))
     metadata = schema.get("x-graphic") if isinstance(schema.get("x-graphic"), dict) else {}
@@ -1329,6 +1661,14 @@ def _invoke_registered_tool(tool_config: dict[str, Any], args: dict[str, Any], r
         if source == "python" or kind == "python_function":
             result = _invoke_python_tool(metadata, args)
             return {"ok": True, "result": _compact_tool_result(result)}
+        if source == "mcp" or kind == "mcp_tool":
+            server = metadata.get("server") if isinstance(metadata.get("server"), dict) else {}
+            tool_name = str(metadata.get("toolName") or tool_config.get("name") or "").strip()
+            result = invoke_mcp_tool(server, tool_name, args, runtime_environment)
+            return {"ok": True, "result": _compact_tool_result(result)}
+        if source == "agent" or kind == "agent_tool":
+            result = _invoke_agent_tool(metadata, args, model_config, runtime_environment, agent_context)
+            return {"ok": bool(result.get("ok", True)), "result": _compact_tool_result(result), "errorType": result.get("errorType")}
         if source in {"openapi", "http"} or kind == "openapi_operation":
             return {
                 "ok": True,
@@ -1350,6 +1690,100 @@ def _invoke_registered_tool(tool_config: dict[str, Any], args: dict[str, Any], r
     except Exception as exc:
         error = f"{exc.__class__.__name__}: {exc}"
         return {"ok": False, "error": error, "errorType": _classify_tool_error(error)}
+
+
+def _invoke_agent_tool(
+    metadata: dict[str, Any],
+    args: dict[str, Any],
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    agent_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    context = agent_context or {}
+    depth = int(context.get("agentDepth") or 0)
+    if depth >= MAX_AGENT_CALL_DEPTH:
+        raise RuntimeError(f"子 Agent 调用深度超过限制：{MAX_AGENT_CALL_DEPTH}")
+    current_project_id = str(context.get("projectId") or "").strip()
+    project_id = str(metadata.get("projectId") or "").strip()
+    if not project_id:
+        raise RuntimeError("Agent Tool 缺少 projectId。")
+    if current_project_id and project_id == current_project_id:
+        raise RuntimeError("禁止 Agent 调用当前项目自身，避免递归。")
+
+    input_text = _first_text(args.get("input"), args.get("query"), args.get("task"), args.get("message"))
+    state_patch = args.get("statePatch") if isinstance(args.get("statePatch"), dict) else {}
+    parent_state = context.get("state") if isinstance(context.get("state"), dict) else {}
+    child_input = {
+        **state_patch,
+        "messages": input_text or _state_value_to_text(parent_state.get("messages")),
+        "chat": input_text or _state_value_to_text(parent_state.get("chat") or parent_state.get("messages")),
+        "parent_state": _compact_state(parent_state),
+    }
+    started = time.perf_counter()
+    child_project = read_project(project_id)
+    trace, output_state = _walk_project(
+        child_project,
+        _normalize_input(child_input),
+        "live",
+        _normalize_model_config(model_config),
+        _normalize_runtime_environment(runtime_environment),
+        depth + 1,
+    )
+    error_item = next((item for item in trace if item.get("status") == "error"), None)
+    final_answer = _agent_child_final_answer(output_state)
+    result = {
+        "ok": error_item is None,
+        "agentId": str(metadata.get("agentId") or ""),
+        "agentName": str(metadata.get("agentName") or child_project.project.name or project_id),
+        "projectId": project_id,
+        "finalAnswer": final_answer,
+        "outputState": _compact_state(output_state),
+        "durationMs": round((time.perf_counter() - started) * 1000, 2),
+    }
+    if error_item:
+        result["error"] = str(error_item.get("detail") or "子 Agent 执行失败。")
+        result["errorType"] = "agent_runtime"
+    return result
+
+
+def _execute_live_agent_ref(
+    node: NodeIR,
+    project: ProjectIR,
+    state: dict[str, Any],
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    agent_depth: int,
+) -> tuple[dict[str, Any], str]:
+    config = node.config
+    output_field = str(config.get("outputField") or "agent_ref_result").strip() or "agent_ref_result"
+    project_id = str(config.get("agentProjectId") or "").strip()
+    if not project_id:
+        raise RuntimeError("Agent Ref 未绑定 Agent。")
+    if project_id == project.project.id:
+        raise RuntimeError("禁止 Agent Ref 调用当前项目自身。")
+    instruction = render_template(str(config.get("instruction") or ""), state).strip()
+    input_text = instruction or _state_value_to_text(state.get("messages") or state.get("chat")) or _agent_state_prompt(state)
+    result = _invoke_agent_tool(
+        {
+            "agentId": str(config.get("agentId") or project_id),
+            "agentName": str(config.get("agentName") or node.label or project_id),
+            "projectId": project_id,
+        },
+        {"input": input_text, "statePatch": {}},
+        model_config,
+        runtime_environment,
+        {"projectId": project.project.id, "projectName": project.project.name, "state": state, "agentDepth": agent_depth},
+    )
+    detail = f"真实调用 Agent Ref「{result.get('agentName')}」({config.get('protocol', 'handoff')})，输出到 state.{output_field}"
+    return {output_field: result}, detail
+
+
+def _agent_child_final_answer(output_state: dict[str, Any]) -> str:
+    for key in ("final_answer", "answer", "agent_result", "tools_result", "llm_result"):
+        text = _state_value_to_text(output_state.get(key)).strip()
+        if text:
+            return text
+    return _fallback_reply_content(output_state)
 
 
 def _recommended_next_tools(tool_name: str, args: dict[str, Any], observation: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1411,6 +1845,10 @@ def _recommended_next_tools(tool_name: str, args: dict[str, Any], observation: d
 def _classify_tool_error(message: str) -> str:
     text = str(message or "")
     lower = text.lower()
+    if "mcp" in lower and ("json" in lower or "参数" in text or "arguments" in lower):
+        return "tool_args"
+    if "白名单" in text or "黑名单" in text or "审批" in text or "approval" in lower or "命令不在" in text:
+        return "permission"
     if "允许目录" in text or "路径不在" in text:
         return "path_permission"
     if "网络访问" in text or "不允许访问域名" in text or "只允许访问 http/https" in text or "domain" in lower:
@@ -1463,6 +1901,11 @@ def _first_text(*values: Any) -> str:
         if text:
             return text
     return ""
+
+
+def _slugify(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return re.sub(r"[^a-z0-9_]+", "_", text).strip("_") or "agent"
 
 
 def _path_name(path: str) -> str:
@@ -2680,6 +3123,8 @@ def _assert_network_allowed(url: str, runtime: dict[str, Any], extra_allowed_hos
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise RuntimeError("只允许访问 http/https URL。")
     host = parsed.hostname or ""
+    if runtime.get("allowAllHosts") is True:
+        return
     allowed_hosts = {item.lower() for item in _json_string_list(runtime.get("allowedHostsJson"))}
     allowed_hosts.update(item.lower() for item in (extra_allowed_hosts or set()))
     if allowed_hosts and not _host_allowed(host, allowed_hosts):
@@ -2866,6 +3311,243 @@ def _tool_configs_by_id(project: ProjectIR) -> ToolRuntimeConfig:
         for tool in _json_object_list(node.config.get("toolRegistryJson")):
             _register_tool_config(result, tool)
     return result
+
+
+def _mcp_configs_by_id(project: ProjectIR) -> McpRuntimeConfig:
+    result: McpRuntimeConfig = {}
+    for server in _workspace_mcp_dicts():
+        _register_mcp_config(result, server)
+    for server in getattr(project, "mcpServers", []) or []:
+        _register_mcp_config(result, _model_to_mcp_dict(server))
+    for node in project.nodes:
+        for server in _json_object_list(node.config.get("mcpServerRegistryJson")):
+            _register_mcp_config(result, server)
+        for server in _json_object_list(node.config.get("mcpServerSnapshotJson")):
+            _register_mcp_config(result, server)
+    return result
+
+
+def _agent_configs_by_id(project: ProjectIR) -> AgentRuntimeConfig:
+    result: AgentRuntimeConfig = {}
+    for agent in getattr(project, "importedAgents", []) or []:
+        _register_agent_config(result, _model_to_agent_dict(agent))
+    for node in project.nodes:
+        for agent in _json_object_list(node.config.get("agentRegistryJson")):
+            _register_agent_config(result, agent)
+    return result
+
+
+def _model_to_agent_dict(agent: Any) -> dict[str, Any]:
+    if isinstance(agent, dict):
+        return dict(agent)
+    if hasattr(agent, "model_dump"):
+        return agent.model_dump(by_alias=True)
+    return {
+        "id": str(getattr(agent, "id", "") or ""),
+        "name": str(getattr(agent, "name", "") or "导入的 Agent"),
+        "projectId": str(getattr(agent, "project_id", "") or ""),
+        "role": str(getattr(agent, "role", "") or "sub_agent"),
+        "description": str(getattr(agent, "description", "") or ""),
+    }
+
+
+def _register_agent_config(registry: AgentRuntimeConfig, agent: dict[str, Any]) -> None:
+    if not isinstance(agent, dict):
+        return
+    agent_id = str(agent.get("id") or "").strip()
+    project_id = str(agent.get("projectId") or agent.get("project_id") or "").strip()
+    name = str(agent.get("name") or "").strip()
+    if not agent_id and project_id:
+        agent_id = project_id
+        agent["id"] = agent_id
+    if agent_id:
+        registry[agent_id] = agent
+    if project_id and project_id not in registry:
+        registry[project_id] = agent
+    if name and name not in registry:
+        registry[name] = agent
+
+
+def _workspace_mcp_dicts() -> list[dict[str, Any]]:
+    if not WORKSPACE_MCP_FILE.exists():
+        return []
+    try:
+        data = json.loads(WORKSPACE_MCP_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return _flatten_json_object_list(data) if isinstance(data, list) else []
+
+
+def _model_to_mcp_dict(server: Any) -> dict[str, Any]:
+    if isinstance(server, dict):
+        return server
+    if isinstance(server, list):
+        return {}
+    if hasattr(server, "model_dump"):
+        return server.model_dump(by_alias=True)
+    return {
+        "id": str(getattr(server, "id", "") or ""),
+        "name": str(getattr(server, "name", "") or ""),
+        "transport": str(getattr(server, "transport", "") or "stdio"),
+        "command": str(getattr(server, "command", "") or ""),
+        "argsJson": str(getattr(server, "args_json", "") or "[]"),
+        "envJson": str(getattr(server, "env_json", "") or "{}"),
+        "envVarsJson": str(getattr(server, "env_vars_json", "") or "[]"),
+        "cwd": str(getattr(server, "cwd", "") or ""),
+        "url": str(getattr(server, "url", "") or ""),
+        "apiKey": str(getattr(server, "api_key", "") or ""),
+        "apiKeyEnv": str(getattr(server, "api_key_env", "") or ""),
+        "apiKeyMode": str(getattr(server, "api_key_mode", "") or "env"),
+        "apiKeyHeader": str(getattr(server, "api_key_header", "") or "Authorization"),
+        "apiKeyPrefix": str(getattr(server, "api_key_prefix", "") or "Bearer"),
+        "bearerTokenEnvVar": str(getattr(server, "bearer_token_env_var", "") or ""),
+        "httpHeadersJson": str(getattr(server, "http_headers_json", "") or "{}"),
+        "envHttpHeadersJson": str(getattr(server, "env_http_headers_json", "") or "{}"),
+        "enabled": getattr(server, "enabled", True) is not False,
+        "startupTimeoutSec": int(getattr(server, "startup_timeout_sec", 10) or 10),
+        "toolTimeoutSec": int(getattr(server, "tool_timeout_sec", 60) or 60),
+        "enabledToolsJson": str(getattr(server, "enabled_tools_json", "") or "[]"),
+        "disabledToolsJson": str(getattr(server, "disabled_tools_json", "") or "[]"),
+        "defaultToolsApprovalMode": str(getattr(server, "default_tools_approval_mode", "") or ""),
+        "sourceType": str(getattr(server, "source_type", "") or "manual"),
+        "sourcePath": str(getattr(server, "source_path", "") or ""),
+        "description": str(getattr(server, "description", "") or ""),
+    }
+
+
+def _register_mcp_config(registry: McpRuntimeConfig, server: dict[str, Any]) -> None:
+    if not isinstance(server, dict):
+        return
+    normalized = normalize_mcp_server_config(server)
+    server_id = str(normalized.get("id") or "").strip()
+    if server_id:
+        registry[server_id] = normalized
+    server_name = str(normalized.get("name") or "").strip()
+    if server_name and server_name not in registry:
+        registry[server_name] = normalized
+
+
+def _selected_mcp_server_configs(config: dict[str, Any], mcp_servers: McpRuntimeConfig) -> list[dict[str, Any]]:
+    selected_ids = _json_string_list(config.get("mcpServerIdsJson"))
+    snapshots = _json_object_list(config.get("mcpServerRegistryJson"))
+    snapshot_by_id = {str(server.get("id") or "").strip(): server for server in snapshots if str(server.get("id") or "").strip()}
+    if not selected_ids and snapshots:
+        selected_ids = [str(server.get("id") or "").strip() for server in snapshots if str(server.get("id") or "").strip()]
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for server_id in selected_ids:
+        server = mcp_servers.get(server_id) or snapshot_by_id.get(server_id)
+        if not server:
+            server = next((item for item in mcp_servers.values() if str(item.get("name") or "") == server_id), None)
+        if not server:
+            continue
+        normalized = normalize_mcp_server_config(server)
+        key = str(normalized.get("id") or normalized.get("name") or server_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+    return result
+
+
+def _selected_agent_configs(config: dict[str, Any], agents: AgentRuntimeConfig) -> list[dict[str, Any]]:
+    selected_ids = _json_string_list(config.get("agentIdsJson"))
+    snapshots = _json_object_list(config.get("agentRegistryJson"))
+    snapshot_by_id = {str(agent.get("id") or "").strip(): agent for agent in snapshots if str(agent.get("id") or "").strip()}
+    snapshot_by_project = {str(agent.get("projectId") or "").strip(): agent for agent in snapshots if str(agent.get("projectId") or "").strip()}
+    if not selected_ids and snapshots:
+        selected_ids = [str(agent.get("id") or agent.get("projectId") or "").strip() for agent in snapshots if str(agent.get("id") or agent.get("projectId") or "").strip()]
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for agent_id in selected_ids:
+        agent = agents.get(agent_id) or snapshot_by_id.get(agent_id) or snapshot_by_project.get(agent_id)
+        if not agent:
+            continue
+        key = str(agent.get("projectId") or agent.get("id") or agent_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(agent)
+    return result
+
+
+def _agent_tool_configs(agents: list[dict[str, Any]], project: ProjectIR) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for agent in agents:
+        project_id = str(agent.get("projectId") or agent.get("project_id") or "").strip()
+        if not project_id or project_id == project.project.id:
+            continue
+        agent_id = str(agent.get("id") or project_id).strip()
+        agent_name = str(agent.get("name") or project_id).strip()
+        tool_name = f"agent_{_slugify(agent_id or agent_name)}"
+        schema = {
+            "type": "object",
+            "properties": {
+                "input": {"type": "string", "description": "要交给子 Agent 处理的任务内容。"},
+                "statePatch": {"type": "object", "description": "可选，传给子 Agent 的额外 state。"},
+            },
+            "required": ["input"],
+            "x-graphic": {
+                "kind": "agent_tool",
+                "source": "agent",
+                "agentId": agent_id,
+                "agentName": agent_name,
+                "projectId": project_id,
+                "role": str(agent.get("role") or "sub_agent"),
+            },
+        }
+        result.append(
+            {
+                "id": f"agent::{agent_id}",
+                "name": tool_name,
+                "description": str(agent.get("description") or f"调用子 Agent：{agent_name}"),
+                "source": "agent",
+                "schemaJson": json.dumps(schema, ensure_ascii=False),
+            }
+        )
+    return result
+
+
+def _mcp_server_for_node(config: dict[str, Any], mcp_servers: McpRuntimeConfig) -> dict[str, Any] | None:
+    server_id = str(config.get("serverId") or "").strip()
+    server = mcp_servers.get(server_id) if server_id else None
+    if not server:
+        server_name = str(config.get("serverName") or "").strip()
+        server = mcp_servers.get(server_name) if server_name else None
+    if not server:
+        snapshots = _json_object_list(config.get("mcpServerSnapshotJson"))
+        server = snapshots[0] if snapshots else None
+    if not server:
+        server = {
+            "id": server_id,
+            "name": str(config.get("serverName") or "未命名 MCP"),
+            "transport": str(config.get("transport") or "stdio"),
+            "command": str(config.get("command") or ""),
+            "url": str(config.get("url") or ""),
+        }
+    normalized = normalize_mcp_server_config(server)
+    if not normalized.get("id") and server_id:
+        normalized["id"] = server_id
+    return normalized
+
+
+def _mcp_agent_tool_configs(servers: list[dict[str, Any]], runtime_environment: RuntimeEnvironment) -> list[dict[str, Any]]:
+    tools: list[dict[str, Any]] = []
+    for server in servers:
+        for tool in list_mcp_tools(server, runtime_environment, require_enabled=True):
+            tools.append(make_mcp_agent_tool_config(server, tool))
+    return tools
+
+
+def _render_json_object(template: str, state: dict[str, Any], field: str) -> dict[str, Any]:
+    rendered = render_template(template.strip() or "{}", state)
+    try:
+        parsed = json.loads(rendered)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{field} 不是合法 JSON：{exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"{field} 必须是 JSON object。")
+    return parsed
 
 
 def _workspace_tool_dicts() -> list[dict[str, Any]]:

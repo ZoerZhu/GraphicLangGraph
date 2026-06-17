@@ -1,7 +1,8 @@
+import json
 import zipfile
 
 from app.compiler import export_project_zip, generate_project_files
-from app.ir.schemas import EdgeIR, EdgeKind, NodeIR, NodeType, Position, StateField, ToolConfig, create_default_project
+from app.ir.schemas import EdgeIR, EdgeKind, ImportedAgentConfig, MCPServerConfig, NodeIR, NodeType, Position, StateField, ToolConfig, create_default_project
 
 
 def sample_project():
@@ -57,6 +58,243 @@ def test_export_zip_contains_required_files():
     assert "langgraph.json" in names
     assert "README.md" in names
     assert "flow/project.graph.json" in names
+
+
+def test_codegen_exports_mcp_runtime_and_node_call():
+    project = create_default_project("MCP Export Agent")
+    project.mcpServers.append(
+        MCPServerConfig(
+            id="exa",
+            name="Exa MCP",
+            transport="http",
+            url="https://mcp.exa.ai/mcp",
+            envHttpHeadersJson='{"x-api-key":"EXA_API_KEY"}',
+            enabledToolsJson='["web_search_exa"]',
+        )
+    )
+    project.state.fields.extend([StateField(name="messages", type="str"), StateField(name="mcp_result", type="dict")])
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="mcp_1",
+                type=NodeType.MCP_NODE,
+                label="Exa Search",
+                config={
+                    "serverId": "exa",
+                    "serverName": "Exa MCP",
+                    "toolName": "web_search_exa",
+                    "toolArgsJson": '{"query":"{{ state.messages }}"}',
+                    "outputField": "mcp_result",
+                },
+            ),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复", config={"template": "{{ state.mcp_result }}"}),
+        ]
+    )
+    project.edges.extend([EdgeIR(id="e1", source="start", target="mcp_1"), EdgeIR(id="e2", source="mcp_1", target="reply_1")])
+
+    files = generate_project_files(project)
+    nodes_py = next(value for path, value in files.items() if path.endswith("/nodes.py"))
+    mcp_runtime_py = next(value for path, value in files.items() if path.endswith("/mcp_runtime.py"))
+    mcp_servers_py = next(value for path, value in files.items() if path.endswith("/mcp_servers.py"))
+
+    assert "mcp>=1.12.4" in files["pyproject.toml"]
+    assert "GLG_MCP_ALLOWED_HOSTS=mcp.exa.ai" in files[".env.example"]
+    assert "EXA_API_KEY=replace_me" in files[".env.example"]
+    assert "MCP_SERVER_REGISTRY" in mcp_servers_py
+    assert "https://mcp.exa.ai/mcp" in mcp_servers_py
+    assert "def invoke_mcp_tool" in mcp_runtime_py
+    assert "def render_json_object" in mcp_runtime_py
+    assert "result = invoke_mcp_tool(server, tool_name, args)" in nodes_py
+    assert "render_json_object" in nodes_py
+    compile(mcp_runtime_py, "mcp_runtime.py", "exec")
+    compile(mcp_servers_py, "mcp_servers.py", "exec")
+    compile(nodes_py, "nodes.py", "exec")
+
+
+def test_codegen_exports_agent_mcp_tool_loop():
+    project = create_default_project("MCP Agent Export")
+    server = MCPServerConfig(id="context7", name="Context7", transport="http", url="https://mcp.context7.com/mcp")
+    project.mcpServers.append(server)
+    project.state.fields.append(StateField(name="answer", type="str"))
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="agent_1",
+                type=NodeType.AGENT,
+                label="Agent",
+                config={
+                    "outputField": "answer",
+                    "mcpServerIdsJson": '["context7"]',
+                    "mcpServerRegistryJson": json.dumps([server.model_dump(by_alias=True)]),
+                    "maxIterations": 3,
+                },
+            ),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复", config={"template": "{{ state.answer }}"}),
+        ]
+    )
+    project.edges.extend([EdgeIR(id="e1", source="start", target="agent_1"), EdgeIR(id="e2", source="agent_1", target="reply_1")])
+
+    files = generate_project_files(project)
+    nodes_py = next(value for path, value in files.items() if path.endswith("/nodes.py"))
+    mcp_runtime_py = next(value for path, value in files.items() if path.endswith("/mcp_runtime.py"))
+
+    assert "list_mcp_tools(server)" in nodes_py
+    assert "make_mcp_agent_tool_config(server, mcp_tool)" in nodes_py
+    assert "run_mcp_agent_session" in nodes_py
+    assert '"answer_mcp_tool_calls"' in nodes_py
+    assert "_run_export_tool_agent_session" in nodes_py
+    assert "serverName" in mcp_runtime_py
+    assert "toolName" in mcp_runtime_py
+    assert "durationMs" in mcp_runtime_py
+    compile(nodes_py, "nodes.py", "exec")
+
+
+def test_codegen_exports_mcp_node_model_tool_selection():
+    project = create_default_project("MCP Model Export")
+    project.mcpServers.append(MCPServerConfig(id="exa", name="Exa MCP", transport="http", url="https://mcp.exa.ai/mcp"))
+    project.nodes.append(
+        NodeIR(
+            id="mcp_1",
+            type=NodeType.MCP_NODE,
+            label="Exa",
+            config={
+                "serverId": "exa",
+                "serverName": "Exa MCP",
+                "toolSelectionMode": "model",
+                "toolSelectionInstruction": "搜索问题优先 web_search_exa",
+                "toolSelectionModelProvider": "openai",
+                "toolSelectionModel": "gpt-4.1-mini",
+                "toolSelectionApiKeyEnv": "OPENAI_API_KEY",
+                "fallbackToHeuristic": False,
+                "outputField": "mcp_result",
+            },
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="mcp_1"))
+
+    files = generate_project_files(project)
+    nodes_py = next(value for path, value in files.items() if path.endswith("/nodes.py"))
+
+    assert "_run_mcp_node_auto_call" in nodes_py
+    assert "_select_mcp_tool_with_model" in nodes_py
+    assert "web_search_exa" in nodes_py
+    assert "OPENAI_API_KEY=replace_me" in files[".env.example"]
+    compile(nodes_py, "nodes.py", "exec")
+
+
+def test_codegen_embeds_agent_ref_project(monkeypatch):
+    child = create_default_project("Child Export Agent")
+    child.project.id = "child_export_agent"
+    child.nodes.append(NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "child: {{ state.messages }}", "outputField": "final_answer"}))
+    child.edges.append(EdgeIR(id="child_e1", source="start", target="reply"))
+
+    monkeypatch.setattr("app.compiler.codegen.read_project", lambda project_id: child)
+
+    project = create_default_project("Parent Export Agent")
+    project.nodes.append(
+        NodeIR(
+            id="agent_ref",
+            type=NodeType.AGENT_REF,
+            label="Child",
+            config={"agentProjectId": "child_export_agent", "agentName": "Child Export Agent", "instruction": "处理 {{ state.messages }}"},
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="agent_ref"))
+
+    files = generate_project_files(project)
+    nodes_py = next(value for path, value in files.items() if path.endswith(f"{project.project.id}/nodes.py"))
+    embedded_py = next(value for path, value in files.items() if path.endswith(f"{project.project.id}/embedded_agents.py"))
+    embedded_paths = [path for path in files if "embedded_child_export_agent" in path]
+
+    assert embedded_paths
+    assert "run_embedded_agent(project_id" in nodes_py
+    assert "child_export_agent" in embedded_py
+    assert "导出工程暂不支持" not in nodes_py
+    compile(nodes_py, "nodes.py", "exec")
+    compile(embedded_py, "embedded_agents.py", "exec")
+
+
+def test_codegen_embeds_agent_node_selected_project(monkeypatch):
+    child = create_default_project("Worker Agent")
+    child.project.id = "worker_agent"
+    child.nodes.append(NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "worker", "outputField": "final_answer"}))
+    child.edges.append(EdgeIR(id="child_e1", source="start", target="reply"))
+
+    monkeypatch.setattr("app.compiler.codegen.read_project", lambda project_id: child)
+
+    project = create_default_project("Parent Tool Agent")
+    imported = ImportedAgentConfig(id="agent_ref_worker", name="Worker Agent", projectId="worker_agent", role="sub_agent")
+    project.importedAgents.append(imported)
+    project.nodes.append(
+        NodeIR(
+            id="agent_1",
+            type=NodeType.AGENT,
+            label="Agent",
+            config={
+                "agentIdsJson": '["agent_ref_worker"]',
+                "agentRegistryJson": json.dumps([imported.model_dump(by_alias=True)], ensure_ascii=False),
+                "outputField": "answer",
+            },
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="agent_1"))
+
+    files = generate_project_files(project)
+    nodes_py = next(value for path, value in files.items() if path.endswith(f"{project.project.id}/nodes.py"))
+    embedded_py = next(value for path, value in files.items() if path.endswith(f"{project.project.id}/embedded_agents.py"))
+
+    assert "selected_embedded_agent_tool_configs" in nodes_py
+    assert "answer_agent_tool_calls" in nodes_py
+    assert "worker_agent" in embedded_py
+    assert "导出工程暂不支持" not in nodes_py
+    compile(nodes_py, "nodes.py", "exec")
+
+
+def test_codegen_rejects_embedded_agent_cycle(monkeypatch):
+    root = create_default_project("Root Cycle")
+    root.project.id = "root_cycle"
+    child = create_default_project("Child Cycle")
+    child.project.id = "child_cycle"
+    child.nodes.append(NodeIR(id="ref_root", type=NodeType.AGENT_REF, label="Root", config={"agentProjectId": "root_cycle"}))
+    child.edges.append(EdgeIR(id="child_e1", source="start", target="ref_root"))
+    root.nodes.append(NodeIR(id="ref_child", type=NodeType.AGENT_REF, label="Child", config={"agentProjectId": "child_cycle"}))
+    root.edges.append(EdgeIR(id="e1", source="start", target="ref_child"))
+
+    def fake_read_project(project_id):
+        return child if project_id == "child_cycle" else root
+
+    monkeypatch.setattr("app.compiler.codegen.read_project", fake_read_project)
+
+    try:
+        generate_project_files(root)
+    except RuntimeError as exc:
+        assert "循环引用" in str(exc)
+    else:
+        raise AssertionError("expected cycle export error")
+
+
+def test_codegen_converts_direct_mcp_api_key_to_env_placeholder():
+    project = create_default_project("MCP Direct Secret Export")
+    project.mcpServers.append(
+        MCPServerConfig(
+            id="exa",
+            name="Exa MCP",
+            transport="http",
+            url="https://mcp.exa.ai/mcp",
+            apiKeyMode="direct",
+            apiKey="direct-secret",
+            apiKeyHeader="x-api-key",
+            apiKeyPrefix="",
+        )
+    )
+
+    files = generate_project_files(project)
+    mcp_servers_py = next(value for path, value in files.items() if path.endswith("/mcp_servers.py"))
+
+    assert "direct-secret" not in mcp_servers_py
+    assert "EXA_MCP_API_KEY=replace_me" in files[".env.example"]
+    assert '"apiKeyMode": "env"' in mcp_servers_py
+    assert '"apiKeyHeader": "x-api-key"' in mcp_servers_py
 
 
 def test_codegen_supports_mvp_nodes():

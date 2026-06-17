@@ -1443,29 +1443,40 @@ function normalizeSkills(skills: SkillConfig[]): SkillConfig[] {
 function normalizeMcpServers(servers: MCPServerConfig[]): MCPServerConfig[] {
   return servers
     .filter((server) => server && typeof server.id === "string")
-    .map((server) => ({
-      id: server.id,
-      name: String(server.name || "未命名 MCP"),
-      transport: String(server.transport || "stdio"),
-      command: String(server.command || ""),
-      argsJson: String(server.argsJson || "[]"),
-      envJson: String(server.envJson || "{}"),
-      envVarsJson: String(server.envVarsJson || "[]"),
-      cwd: String(server.cwd || ""),
-      url: String(server.url || ""),
-      bearerTokenEnvVar: String(server.bearerTokenEnvVar || ""),
-      httpHeadersJson: String(server.httpHeadersJson || "{}"),
-      envHttpHeadersJson: String(server.envHttpHeadersJson || "{}"),
-      enabled: server.enabled !== false,
-      startupTimeoutSec: Math.max(1, Number(server.startupTimeoutSec || 10)),
-      toolTimeoutSec: Math.max(1, Number(server.toolTimeoutSec || 60)),
-      enabledToolsJson: String(server.enabledToolsJson || "[]"),
-      disabledToolsJson: String(server.disabledToolsJson || "[]"),
-      defaultToolsApprovalMode: String(server.defaultToolsApprovalMode || ""),
-      sourceType: String(server.sourceType || "manual"),
-      sourcePath: String(server.sourcePath || ""),
-      description: String(server.description || ""),
-    }));
+    .map((server) => {
+      const legacyBearerEnv = String(server.bearerTokenEnvVar || "");
+      const apiKeyMode = String(server.apiKeyMode || (server.apiKey && !server.apiKeyEnv ? "direct" : "env"));
+      const apiKeyHeader = String(server.apiKeyHeader || (legacyBearerEnv ? "Authorization" : "Authorization"));
+      const apiKeyPrefix = String(server.apiKeyPrefix || (apiKeyHeader.toLowerCase() === "authorization" ? "Bearer" : ""));
+      return {
+        id: server.id,
+        name: String(server.name || "未命名 MCP"),
+        transport: String(server.transport || "stdio"),
+        command: String(server.command || ""),
+        argsJson: String(server.argsJson || "[]"),
+        envJson: String(server.envJson || "{}"),
+        envVarsJson: String(server.envVarsJson || "[]"),
+        cwd: String(server.cwd || ""),
+        url: String(server.url || ""),
+        apiKey: apiKeyMode === "direct" ? String(server.apiKey || "") : "",
+        apiKeyEnv: apiKeyMode === "env" ? String(server.apiKeyEnv || legacyBearerEnv) : "",
+        apiKeyMode,
+        apiKeyHeader,
+        apiKeyPrefix,
+        bearerTokenEnvVar: legacyBearerEnv,
+        httpHeadersJson: String(server.httpHeadersJson || "{}"),
+        envHttpHeadersJson: String(server.envHttpHeadersJson || "{}"),
+        enabled: server.enabled !== false,
+        startupTimeoutSec: Math.max(1, Number(server.startupTimeoutSec || 10)),
+        toolTimeoutSec: Math.max(1, Number(server.toolTimeoutSec || 60)),
+        enabledToolsJson: String(server.enabledToolsJson || "[]"),
+        disabledToolsJson: String(server.disabledToolsJson || "[]"),
+        defaultToolsApprovalMode: String(server.defaultToolsApprovalMode || ""),
+        sourceType: String(server.sourceType || "manual"),
+        sourcePath: String(server.sourcePath || ""),
+        description: String(server.description || ""),
+      };
+    });
 }
 
 function normalizeRagKnowledgeBases(configs: RagKnowledgeBaseConfig[]): RagKnowledgeBaseConfig[] {
@@ -1518,7 +1529,8 @@ function normalizeRuntimeEnvironments(configs: RuntimeEnvironmentConfig[]): Runt
       description: String(config.description || "由当前 FastAPI 后端所在机器执行工具。"),
       allowedRootsJson: safeJsonList(config.allowedRootsJson, ["./"]),
       networkEnabled: config.networkEnabled !== false,
-      allowedHostsJson: safeJsonList(config.allowedHostsJson, ["api.duckduckgo.com"]),
+      allowAllHosts: config.allowAllHosts === true,
+      allowedHostsJson: config.allowAllHosts === true ? "[]" : safeJsonList(config.allowedHostsJson, ["api.duckduckgo.com"]),
       maxFileBytes: Math.max(1, Number(config.maxFileBytes || 1048576)),
       maxHttpBytes: Math.max(1, Number(config.maxHttpBytes || 262144)),
       allowDirectEdits: config.allowDirectEdits === true,
@@ -1557,6 +1569,7 @@ function newDefaultRuntimeEnvironment(): RuntimeEnvironmentConfig {
     description: "由当前 FastAPI 后端所在机器执行工具。",
     allowedRootsJson: JSON.stringify(["./"], null, 2),
     networkEnabled: true,
+    allowAllHosts: false,
     allowedHostsJson: JSON.stringify(["api.duckduckgo.com"], null, 2),
     maxFileBytes: 1048576,
     maxHttpBytes: 262144,
@@ -1768,6 +1781,18 @@ function defaultWriteFieldName(type: NodeType, key: string): string {
   }
 }
 
+function parseJsonStringList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
+  const text = String(value ?? "").trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed.map((item) => String(item).trim()).filter(Boolean) : [];
+  } catch {
+    return text.split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean);
+  }
+}
+
 function stateFieldsForNode(node: NodeIR): StateField[] {
   const config = node.config;
   switch (node.type) {
@@ -1775,8 +1800,20 @@ function stateFieldsForNode(node: NodeIR): StateField[] {
       return [{ name: "messages", type: "str", description: `${node.label} 输入` }];
     case "llm":
       return [stateFieldFromConfig(config, "outputField", "final_answer", "str", `${node.label} 输出`)];
-    case "agent":
-      return [stateFieldFromConfig(config, "outputField", "agent_result", "str", `${node.label} 输出`)];
+    case "agent": {
+      const output = stateFieldFromConfig(config, "outputField", "agent_result", "str", `${node.label} 输出`);
+      const mcpIds = parseJsonStringList(config.mcpServerIdsJson);
+      return mcpIds.length
+        ? [
+            output,
+            {
+              name: `${output.name}_mcp_tool_calls`,
+              type: "list",
+              description: "MCP 调用记录",
+            },
+          ]
+        : [output];
+    }
     case "tool": {
       const output = stateFieldFromConfig(config, "outputField", "tools_result", "str", `${node.label} 输出`);
       return [

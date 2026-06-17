@@ -125,6 +125,11 @@ class MCPServerConfig(BaseModel):
     env_vars_json: str = Field("[]", alias="envVarsJson")
     cwd: str = ""
     url: str = ""
+    api_key: str = Field("", alias="apiKey")
+    api_key_env: str = Field("", alias="apiKeyEnv")
+    api_key_mode: str = Field("env", alias="apiKeyMode")
+    api_key_header: str = Field("Authorization", alias="apiKeyHeader")
+    api_key_prefix: str = Field("Bearer", alias="apiKeyPrefix")
     bearer_token_env_var: str = Field("", alias="bearerTokenEnvVar")
     http_headers_json: str = Field("{}", alias="httpHeadersJson")
     env_http_headers_json: str = Field("{}", alias="envHttpHeadersJson")

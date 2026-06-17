@@ -421,6 +421,7 @@ def test_workspace_runtime_environments_are_persisted(tmp_path, monkeypatch):
             "description": "只允许 docs",
             "allowedRootsJson": json.dumps([str(tmp_path / "docs")]),
             "networkEnabled": False,
+            "allowAllHosts": True,
             "allowedHostsJson": "[]",
             "maxFileBytes": 4096,
             "maxHttpBytes": 8192,
@@ -432,6 +433,8 @@ def test_workspace_runtime_environments_are_persisted(tmp_path, monkeypatch):
     assert runtime_file.exists()
     assert saved.json()[0]["name"] == "本地文档环境"
     assert saved.json()[0]["networkEnabled"] is False
+    assert saved.json()[0]["allowAllHosts"] is True
+    assert saved.json()[0]["allowedHostsJson"] == "[]"
     assert client.get("/api/workspace/runtime-environments").json() == saved.json()
 
 
@@ -622,6 +625,115 @@ enabled = true
     assert remote["bearerTokenEnvVar"] == "FIGMA_OAUTH_TOKEN"
     assert "X-Figma-Region" in remote["httpHeadersJson"]
     assert client.get("/api/workspace/mcp").json() == body["allConfigs"]
+
+
+def test_workspace_mcp_inspect_returns_tools(monkeypatch):
+    def fake_inspect(config, runtime_environment=None):
+        assert config["url"] == "https://mcp.exa.ai/mcp"
+        return {
+            "ok": True,
+            "serverId": config["id"],
+            "serverName": config["name"],
+            "transport": config["transport"],
+            "tools": [
+                {
+                    "name": "web_search_exa",
+                    "title": "Web Search",
+                    "description": "Search web",
+                    "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}},
+                }
+            ],
+            "warnings": [],
+            "durationMs": 3.5,
+        }
+
+    monkeypatch.setattr(workspace_api, "inspect_mcp_server", fake_inspect)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/workspace/mcp/inspect",
+        json={
+            "id": "mcp_exa",
+            "name": "Exa MCP",
+            "transport": "http",
+            "url": "https://mcp.exa.ai/mcp",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["tools"][0]["name"] == "web_search_exa"
+    assert body["tools"][0]["inputSchema"]["properties"]["query"]["type"] == "string"
+
+
+def test_workspace_mcp_saves_api_key_modes(tmp_path, monkeypatch):
+    mcp_file = tmp_path / "mcp_servers.json"
+    monkeypatch.setattr(workspace_api, "WORKSPACE_MCP_FILE", mcp_file)
+    client = TestClient(app)
+
+    response = client.put(
+        "/api/workspace/mcp",
+        json=[
+            {
+                "id": "exa_env",
+                "name": "Exa Env",
+                "transport": "http",
+                "url": "https://mcp.exa.ai/mcp",
+                "apiKeyMode": "env",
+                "apiKeyEnv": "EXA_API_KEY",
+                "apiKey": "should-drop",
+                "apiKeyHeader": "x-api-key",
+                "apiKeyPrefix": "",
+            },
+            {
+                "id": "exa_direct",
+                "name": "Exa Direct",
+                "transport": "http",
+                "url": "https://mcp.exa.ai/mcp",
+                "apiKeyMode": "direct",
+                "apiKey": "direct-token",
+                "apiKeyEnv": "SHOULD_DROP",
+                "apiKeyHeader": "x-api-key",
+                "apiKeyPrefix": "",
+            },
+        ],
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    env_config = next(item for item in body if item["id"] == "exa_env")
+    direct_config = next(item for item in body if item["id"] == "exa_direct")
+    assert env_config["apiKeyMode"] == "env"
+    assert env_config["apiKeyEnv"] == "EXA_API_KEY"
+    assert env_config["apiKey"] == ""
+    assert direct_config["apiKeyMode"] == "direct"
+    assert direct_config["apiKey"] == "direct-token"
+    assert direct_config["apiKeyEnv"] == ""
+
+
+def test_workspace_mcp_inspect_returns_structured_failure(monkeypatch):
+    def fake_inspect(config, runtime_environment=None):
+        raise RuntimeError("connect failed")
+
+    monkeypatch.setattr(workspace_api, "inspect_mcp_server", fake_inspect)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/workspace/mcp/inspect",
+        json={
+            "id": "mcp_bad",
+            "name": "Bad MCP",
+            "transport": "http",
+            "url": "https://mcp.example.invalid/mcp",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert body["serverId"] == "mcp_bad"
+    assert "connect failed" in body["error"]
 
 
 def test_workspace_tools_imports_local_python_functions(tmp_path, monkeypatch):

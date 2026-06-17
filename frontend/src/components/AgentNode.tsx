@@ -354,6 +354,7 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
       return [
         { label: "Agent", value: text(config.agentName, "未选择 Agent") },
         { label: "协议", value: text(config.protocol, "handoff") },
+        { label: "输出", value: text(config.outputField, "agent_ref_result") },
       ];
   }
 }

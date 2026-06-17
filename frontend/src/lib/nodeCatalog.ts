@@ -73,8 +73,13 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         provider: "openai",
         model: "gpt-4.1-mini",
         systemPrompt: "你是一个可靠的业务 Agent，请基于上下文完成任务。",
+        userPrompt: "",
         tools: "",
         skillIdsJson: "[]",
+        agentIdsJson: "[]",
+        agentRegistryJson: "[]",
+        mcpServerIdsJson: "[]",
+        mcpServerRegistryJson: "[]",
         maxIterations: 4,
         outputField: "agent_result",
       };
@@ -180,6 +185,18 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
       return {
         serverId: "",
         serverName: "未选择 MCP",
+        mcpServerSnapshotJson: "[]",
+        mcpToolsJson: "[]",
+        toolName: "",
+        toolSelectionMode: "model",
+        toolSelectionInstruction: "",
+        toolSelectionModelProvider: "openai",
+        toolSelectionModel: "gpt-4.1-mini",
+        toolSelectionModelConfigId: "",
+        toolSelectionModelConfigName: "",
+        fallbackToHeuristic: false,
+        toolArgsJson: "{}",
+        toolInputSchemaJson: "{}",
         outputField: "mcp_result",
       };
     case "agent_ref":
@@ -187,6 +204,8 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         agentProjectId: "",
         agentName: "未选择 Agent",
         protocol: "handoff",
+        instruction: "",
+        outputField: "agent_ref_result",
       };
   }
 }

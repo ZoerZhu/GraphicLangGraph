@@ -21,6 +21,7 @@ class RuntimeEnvironmentConfig(BaseModel):
     description: str = "由当前 FastAPI 后端所在机器执行工具。"
     allowed_roots_json: str = Field("[]", alias="allowedRootsJson")
     network_enabled: bool = Field(True, alias="networkEnabled")
+    allow_all_hosts: bool = Field(False, alias="allowAllHosts")
     allowed_hosts_json: str = Field("[]", alias="allowedHostsJson")
     max_file_bytes: int = Field(1_048_576, alias="maxFileBytes")
     max_http_bytes: int = Field(262_144, alias="maxHttpBytes")
@@ -83,7 +84,8 @@ def normalize_runtime_environments(items: list[RuntimeEnvironmentConfig]) -> lis
                     "description": item.description.strip(),
                     "allowed_roots_json": _ensure_json_list_text(item.allowed_roots_json, [str(ROOT_DIR)]),
                     "network_enabled": item.network_enabled is not False,
-                    "allowed_hosts_json": _ensure_json_list_text(item.allowed_hosts_json, ["api.duckduckgo.com"]),
+                    "allow_all_hosts": item.allow_all_hosts is True,
+                    "allowed_hosts_json": "[]" if item.allow_all_hosts is True else _ensure_json_list_text(item.allowed_hosts_json, ["api.duckduckgo.com"]),
                     "max_file_bytes": _positive_int(item.max_file_bytes, 1_048_576),
                     "max_http_bytes": _positive_int(item.max_http_bytes, 262_144),
                     "allow_direct_edits": item.allow_direct_edits is True,

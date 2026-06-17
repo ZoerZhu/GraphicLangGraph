@@ -3030,6 +3030,136 @@ button.icon-only {
   height: 15px;
 }
 
+.mcp-inspect-actions,
+.mcp-inspector-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mcp-inspect-actions button,
+.mcp-inspector-actions button {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0 12px;
+  color: var(--ink);
+  background: #fff;
+  font-size: 12px;
+  font-weight: 720;
+  cursor: pointer;
+}
+
+.mcp-inspect-actions button:disabled,
+.mcp-inspector-actions button:disabled {
+  cursor: progress;
+  opacity: 0.62;
+}
+
+.mcp-inspect-result {
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(47, 111, 78, 0.24);
+  border-radius: 12px;
+  padding: 10px;
+  background: rgba(47, 111, 78, 0.06);
+}
+
+.mcp-inspect-result.is-error {
+  border-color: rgba(165, 53, 44, 0.24);
+  background: rgba(165, 53, 44, 0.06);
+}
+
+.mcp-inspect-result__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mcp-inspect-result__head strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.mcp-inspect-result__head small,
+.mcp-inspect-result p,
+.mcp-inspect-result li {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.mcp-inspect-result p,
+.mcp-inspect-result ul {
+  margin: 0;
+}
+
+.mcp-tool-inspect-list {
+  display: grid;
+  gap: 6px;
+}
+
+.mcp-tool-inspect-item {
+  display: grid;
+  gap: 2px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 7px;
+  background: rgba(255, 255, 255, 0.76);
+}
+
+.mcp-tool-inspect-item__head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.mcp-tool-inspect-item__head button {
+  min-height: 26px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+.mcp-tool-inspect-item strong,
+.mcp-tool-inspect-item small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-tool-inspect-item strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.mcp-tool-inspect-item small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.mcp-tool-inspect-item pre,
+.mcp-tool-inspect-item code {
+  max-height: 140px;
+  overflow: auto;
+  margin: 4px 0 0;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(10, 10, 10, 0.04);
+  color: var(--ink);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .tool-import-actions {
   display: flex;
   flex-wrap: wrap;
@@ -3798,6 +3928,34 @@ button.primary-danger:hover {
   border-radius: 14px;
   padding: 10px;
   background: rgba(255, 255, 255, 0.68);
+}
+
+.resource-summary {
+  display: grid;
+  gap: 2px;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(10, 10, 10, 0.035);
+}
+
+.resource-summary strong,
+.resource-summary span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resource-summary strong {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.resource-summary span {
+  font-size: 12px;
+  color: var(--ink);
 }
 
 .resource-model-card {

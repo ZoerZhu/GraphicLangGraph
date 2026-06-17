@@ -4,6 +4,7 @@ import {
   BrainCircuit,
   Check,
   Clock,
+  Copy,
   Database,
   Edit3,
   Eye,
@@ -13,6 +14,7 @@ import {
   Network,
   Plug,
   Plus,
+  RefreshCw,
   Save,
   Search,
   Server,
@@ -27,6 +29,7 @@ import {
   importWorkspaceSkillsFromSource,
   importWorkspaceToolsFromSource,
   inspectRagKnowledgeBasePath,
+  inspectWorkspaceMcpServer,
   listBuiltinToolPresets,
   uploadWorkspaceSkillFolder,
   uploadWorkspaceToolFolder,
@@ -35,6 +38,8 @@ import { useProjectStore } from "../store/projectStore";
 import type {
   EnvVarCheckResult,
   MCPServerConfig,
+  McpInspectResult,
+  McpToolInspection,
   McpImportResult,
   ModelConfig,
   ProjectListItem,
@@ -49,6 +54,11 @@ import type {
 type ManagerView = "agent" | "agents" | "tools" | "toolGroups" | "skills" | "skillGroups" | "mcp" | "rag" | "models";
 type ResourceEditorMode = "empty" | "create" | "edit";
 type ApiKeyMode = "env" | "direct";
+type ApiKeyConfigLike = {
+  apiKey?: string;
+  apiKeyEnv?: string;
+  apiKeyMode?: string;
+};
 type EnvCheckState = {
   status: "idle" | "checking" | "success" | "error" | "warning";
   message: string;
@@ -440,9 +450,9 @@ export function ManagementPage() {
     setManagerView("mcp");
   }
 
-  function saveMcpDraft() {
+function saveMcpDraft() {
     if (mcpEditorMode === "empty") return;
-    const normalized = { ...mcpDraft, name: mcpDraft.name.trim() || "未命名 MCP", transport: mcpDraft.transport.trim() || "stdio" };
+    const normalized = normalizeMcpDraft(mcpDraft);
     const exists = workspaceMcpServers.some((server) => server.id === normalized.id);
     const next = exists ? workspaceMcpServers.map((server) => (server.id === normalized.id ? normalized : server)) : [...workspaceMcpServers, normalized];
     void updateWorkspaceMcpServers(next);
@@ -1899,7 +1909,35 @@ function McpManagerContent({
   const [importing, setImporting] = useState(false);
   const [importMessage, setImportMessage] = useState("");
   const [importError, setImportError] = useState(false);
+  const [inspecting, setInspecting] = useState(false);
+  const [inspectResult, setInspectResult] = useState<McpInspectResult | null>(null);
+  const [showMcpApiKey, setShowMcpApiKey] = useState(false);
+  const [envCheck, setEnvCheck] = useState<EnvCheckState>({ status: "idle", message: "" });
   const showMcpEditor = editorMode !== "empty";
+  const apiKeyMode = apiKeyModeOf(draft);
+
+  useEffect(() => {
+    const envName = draft.apiKeyEnv.trim();
+    if (apiKeyMode !== "env") {
+      setEnvCheck({ status: "idle", message: "" });
+      return;
+    }
+    if (!envName) {
+      setEnvCheck({ status: "idle", message: "输入 .env 中的变量名后会自动检测。" });
+      return;
+    }
+    if (!isEnvName(envName)) {
+      setEnvCheck({ status: "error", message: "环境变量名格式不正确，应类似 EXA_API_KEY。" });
+      return;
+    }
+    setEnvCheck({ status: "checking", message: "正在检测 .env / 后端环境变量..." });
+    const timer = window.setTimeout(() => {
+      void checkWorkspaceEnvVar(envName)
+        .then((result) => setEnvCheck(envCheckFromResult(result)))
+        .catch((error) => setEnvCheck({ status: "error", message: error instanceof Error ? readableApiError(error.message) : "环境变量检测失败。" }));
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [apiKeyMode, draft.apiKeyEnv]);
 
   async function handleImport() {
     const source = importSource.trim();
@@ -1921,6 +1959,28 @@ function McpManagerContent({
       setImportError(true);
     } finally {
       setImporting(false);
+    }
+  }
+
+  async function handleInspect() {
+    setInspecting(true);
+    setInspectResult(null);
+    try {
+      const result = await inspectWorkspaceMcpServer(draft);
+      setInspectResult(result);
+    } catch (error) {
+      setInspectResult({
+        ok: false,
+        serverId: draft.id,
+        serverName: draft.name,
+        transport: draft.transport,
+        tools: [],
+        warnings: [],
+        durationMs: 0,
+        error: error instanceof Error ? readableApiError(error.message) : "MCP 连接测试失败。",
+      });
+    } finally {
+      setInspecting(false);
     }
   }
 
@@ -1991,9 +2051,60 @@ function McpManagerContent({
                   <Field label="URL">
                     <input placeholder="https://mcp.example.com/mcp" value={draft.url} onChange={(event) => onChange({ url: event.target.value })} />
                   </Field>
-                  <Field label="Bearer 令牌环境变量">
-                    <input placeholder="MCP_BEARER_TOKEN" value={draft.bearerTokenEnvVar} onChange={(event) => onChange({ bearerTokenEnvVar: event.target.value })} />
-                    <small className="model-config-note">只保存环境变量名，不保存真实 token。运行时由后端环境读取。</small>
+                  <Field label="API Key 来源">
+                    <div className="api-key-source" role="group" aria-label="MCP API Key 来源">
+                      <button
+                        className={apiKeyMode === "env" ? "is-active" : ""}
+                        onClick={() => onChange({ apiKeyMode: "env", apiKey: "" })}
+                        type="button"
+                      >
+                        从 .env 读取
+                      </button>
+                      <button
+                        className={apiKeyMode === "direct" ? "is-active" : ""}
+                        onClick={() => onChange({ apiKeyMode: "direct", apiKeyEnv: "", bearerTokenEnvVar: "" })}
+                        type="button"
+                      >
+                        直接写入
+                      </button>
+                    </div>
+                    <div className="inline-grid">
+                      <input
+                        placeholder="Header，例如 Authorization / x-api-key"
+                        value={draft.apiKeyHeader}
+                        onChange={(event) => onChange({ apiKeyHeader: event.target.value })}
+                      />
+                      <input
+                        placeholder="前缀，可为空；Authorization 常用 Bearer"
+                        value={draft.apiKeyPrefix}
+                        onChange={(event) => onChange({ apiKeyPrefix: event.target.value })}
+                      />
+                    </div>
+                    {apiKeyMode === "env" ? (
+                      <>
+                        <input
+                          value={draft.apiKeyEnv}
+                          placeholder="例如：EXA_API_KEY"
+                          onChange={(event) => onChange({ apiKeyEnv: event.target.value, bearerTokenEnvVar: event.target.value, apiKey: "", apiKeyMode: "env" })}
+                        />
+                        <small className={`env-check-status is-${envCheck.status}`}>{envCheck.message || "输入 .env 中的变量名后会自动检测。"}</small>
+                      </>
+                    ) : (
+                      <>
+                        <div className="secret-input">
+                          <input
+                            type={showMcpApiKey ? "text" : "password"}
+                            value={draft.apiKey}
+                            placeholder="输入 MCP API Key"
+                            onChange={(event) => onChange({ apiKey: event.target.value, apiKeyEnv: "", bearerTokenEnvVar: "", apiKeyMode: "direct" })}
+                          />
+                          <button className="icon-only" onClick={() => setShowMcpApiKey((value) => !value)} title={showMcpApiKey ? "隐藏 API Key" : "显示 API Key"} type="button">
+                            {showMcpApiKey ? <EyeOff size={15} /> : <Eye size={15} />}
+                          </button>
+                        </div>
+                        <small className="env-check-status is-warning">直接写入会保存到本地 workspace 配置；仅建议本机调试使用。</small>
+                      </>
+                    )}
                   </Field>
                   <Field label="静态 HTTP Headers JSON">
                     <textarea className="code-area" rows={4} value={draft.httpHeadersJson} onChange={(event) => onChange({ httpHeadersJson: event.target.value })} />
@@ -2044,6 +2155,13 @@ function McpManagerContent({
                   <option value="approve">approve</option>
                 </select>
               </Field>
+              <div className="mcp-inspect-actions">
+                <button disabled={inspecting} onClick={() => void handleInspect()} type="button">
+                  <RefreshCw size={15} />
+                  <span>{inspecting ? "测试中" : "测试连接 / 刷新工具"}</span>
+                </button>
+              </div>
+              {inspectResult ? <McpInspectResultPanel result={inspectResult} /> : null}
               <label className="mcp-import-toggle">
                 <input checked={draft.enabled} onChange={(event) => onChange({ enabled: event.target.checked })} type="checkbox" />
                 <span>启用该 MCP Server</span>
@@ -2062,6 +2180,91 @@ function McpManagerContent({
       </div>
     </div>
   );
+}
+
+function McpInspectResultPanel({ result }: { result: McpInspectResult }) {
+  return (
+    <div className={`mcp-inspect-result ${result.ok ? "" : "is-error"}`}>
+      <div className="mcp-inspect-result__head">
+        <strong>{result.ok ? `发现 ${result.tools.length} 个工具` : "连接测试失败"}</strong>
+        <small>{result.durationMs ? `${Math.round(result.durationMs)}ms` : result.transport}</small>
+      </div>
+      {result.error ? <p>{result.error}</p> : null}
+      {result.warnings.length ? (
+        <ul>
+          {result.warnings.map((warning) => (
+            <li key={warning}>{warning}</li>
+          ))}
+        </ul>
+      ) : null}
+      {result.tools.length ? (
+        <div className="mcp-tool-inspect-list">
+          {result.tools.map((tool) => (
+            <div key={tool.name} className="mcp-tool-inspect-item">
+              <div className="mcp-tool-inspect-item__head">
+                <strong>{tool.name}</strong>
+                <button type="button" onClick={() => copyMcpToolArgsExample(tool)}>
+                  <Copy size={13} />
+                  <span>复制参数示例</span>
+                </button>
+              </div>
+              <small>{tool.description || tool.title || "未填写描述"}</small>
+              <pre>{JSON.stringify(tool.inputSchema || {}, null, 2)}</pre>
+              <code>{JSON.stringify(mcpToolArgsExample(tool), null, 2)}</code>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function mcpToolArgsExample(tool: McpToolInspection) {
+  const schema = tool.inputSchema || {};
+  const properties = isRecord(schema.properties) ? schema.properties : {};
+  const required = Array.isArray(schema.required) ? schema.required.map((item) => String(item)) : [];
+  const lowerName = tool.name.toLowerCase();
+  const example: Record<string, unknown> = {};
+  if (lowerName.includes("search") || Object.prototype.hasOwnProperty.call(properties, "query")) {
+    example.query = "{{ state.messages }}";
+    return example;
+  }
+  if (Object.prototype.hasOwnProperty.call(properties, "url")) {
+    example.url = "{{ state.url }}";
+    return example;
+  }
+  if (Object.prototype.hasOwnProperty.call(properties, "urls")) {
+    example.urls = ["{{ state.url }}"];
+    return example;
+  }
+  const keys = required.length ? required : Object.keys(properties).slice(0, 3);
+  for (const key of keys) {
+    const property = isRecord(properties[key]) ? properties[key] : {};
+    example[key] = mcpExampleValueForSchema(property, key);
+  }
+  return example;
+}
+
+function mcpExampleValueForSchema(schema: Record<string, unknown>, key: string): unknown {
+  const type = String(schema.type || "").toLowerCase();
+  if (key.toLowerCase().includes("query")) return "{{ state.messages }}";
+  if (key.toLowerCase().includes("url")) return "{{ state.url }}";
+  if (type === "array") return [];
+  if (type === "boolean") return true;
+  if (type === "number" || type === "integer") return 1;
+  if (type === "object") return {};
+  return `{{ state.${key} }}`;
+}
+
+function copyMcpToolArgsExample(tool: McpToolInspection) {
+  const text = JSON.stringify(mcpToolArgsExample(tool), null, 2);
+  if (navigator.clipboard?.writeText) {
+    void navigator.clipboard.writeText(text);
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function RagManagerContent({
@@ -2951,6 +3154,35 @@ function normalizeModelDraft(config: ModelConfig): ModelConfig {
   };
 }
 
+function normalizeMcpDraft(config: MCPServerConfig): MCPServerConfig {
+  const apiKeyMode = apiKeyModeOf(config);
+  const apiKeyHeader = config.apiKeyHeader.trim() || (config.apiKey || config.apiKeyEnv || config.bearerTokenEnvVar ? "Authorization" : "");
+  const apiKeyPrefix = config.apiKeyPrefix.trim() || (apiKeyHeader.toLowerCase() === "authorization" ? "Bearer" : "");
+  const apiKeyEnv = apiKeyMode === "env" ? (config.apiKeyEnv.trim() || config.bearerTokenEnvVar.trim()) : "";
+  return {
+    ...config,
+    name: config.name.trim() || "未命名 MCP",
+    transport: config.transport.trim() || "stdio",
+    command: config.command.trim(),
+    cwd: config.cwd.trim(),
+    url: config.url.trim(),
+    apiKey: apiKeyMode === "direct" ? config.apiKey.trim() : "",
+    apiKeyEnv,
+    apiKeyMode,
+    apiKeyHeader,
+    apiKeyPrefix,
+    bearerTokenEnvVar: apiKeyMode === "env" && apiKeyHeader.toLowerCase() === "authorization" && apiKeyPrefix.toLowerCase() === "bearer" ? apiKeyEnv : "",
+    httpHeadersJson: safeJson(config.httpHeadersJson),
+    envHttpHeadersJson: safeJson(config.envHttpHeadersJson),
+    argsJson: safeJson(config.argsJson, "[]"),
+    envJson: safeJson(config.envJson),
+    envVarsJson: safeJson(config.envVarsJson, "[]"),
+    enabledToolsJson: safeJson(config.enabledToolsJson, "[]"),
+    disabledToolsJson: safeJson(config.disabledToolsJson, "[]"),
+    description: config.description.trim(),
+  };
+}
+
 function getModelConfigError(config: ModelConfig, configs: ModelConfig[]) {
   const provider = normalizeProviderId(config.provider);
   const name = config.name.trim();
@@ -2982,7 +3214,7 @@ function isEnvName(value: string) {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
-function apiKeyModeOf(config: Partial<ModelConfig>): ApiKeyMode {
+function apiKeyModeOf(config: ApiKeyConfigLike): ApiKeyMode {
   return config.apiKeyMode === "direct" || (config.apiKey && !config.apiKeyEnv) ? "direct" : "env";
 }
 
@@ -3125,8 +3357,19 @@ function parseJsonObject(json: string): Record<string, unknown> {
   }
 }
 
-function safeJson(json: string) {
-  return JSON.stringify(parseJsonObject(json), null, 2);
+function safeJson(json: string, fallback: unknown = {}) {
+  try {
+    const parsed = JSON.parse(json || JSON.stringify(fallback));
+    if (Array.isArray(fallback)) {
+      return JSON.stringify(Array.isArray(parsed) ? parsed : fallback, null, 2);
+    }
+    if (fallback && typeof fallback === "object") {
+      return JSON.stringify(parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : fallback, null, 2);
+    }
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return JSON.stringify(fallback, null, 2);
+  }
 }
 
 function valueToInput(value: unknown) {
@@ -3227,6 +3470,11 @@ function newMcpServer(): MCPServerConfig {
     envVarsJson: "[]",
     cwd: "",
     url: "",
+    apiKey: "",
+    apiKeyEnv: "",
+    apiKeyMode: "env",
+    apiKeyHeader: "Authorization",
+    apiKeyPrefix: "Bearer",
     bearerTokenEnvVar: "",
     httpHeadersJson: "{}",
     envHttpHeadersJson: "{}",

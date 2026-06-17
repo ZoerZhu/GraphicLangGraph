@@ -3,7 +3,7 @@ import sys
 from types import SimpleNamespace
 from pathlib import Path
 
-from app.ir.schemas import EdgeIR, EdgeKind, NodeIR, NodeType, SkillConfig, StateField, ToolConfig, create_default_project
+from app.ir.schemas import EdgeIR, EdgeKind, ImportedAgentConfig, MCPServerConfig, NodeIR, NodeType, SkillConfig, StateField, ToolConfig, create_default_project
 from app.runner import preview
 
 
@@ -337,6 +337,422 @@ def test_live_preview_skill_node_writes_skill_content():
 
     assert trace[0]["status"] == "ok"
     assert state["skill_context"] == "订单状态字段说明。"
+
+
+def test_live_preview_mcp_node_calls_configured_tool(monkeypatch):
+    seen = {}
+
+    def fake_invoke(server_config, tool_name, args, runtime_environment=None):
+        seen["server"] = server_config
+        seen["tool_name"] = tool_name
+        seen["args"] = args
+        return {
+            "ok": True,
+            "serverId": server_config["id"],
+            "serverName": server_config["name"],
+            "tool": tool_name,
+            "args": args,
+            "content": "Exa result",
+            "raw": {"items": [{"title": "Result"}]},
+        }
+
+    monkeypatch.setattr(preview, "invoke_mcp_tool", fake_invoke)
+
+    project = create_default_project("MCP Node 测试")
+    project.mcpServers.append(
+        MCPServerConfig(
+            id="mcp_exa",
+            name="Exa MCP",
+            transport="http",
+            url="https://mcp.exa.ai/mcp",
+        )
+    )
+    project.nodes.append(
+        NodeIR(
+            id="exa_search",
+            type=NodeType.MCP_NODE,
+            label="Exa MCP",
+            config={
+                "serverId": "mcp_exa",
+                "serverName": "Exa MCP",
+                "toolName": "web_search_exa",
+                "toolArgsJson": '{"query":"{{ state.messages }}"}',
+                "outputField": "mcp_result",
+            },
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="exa_search"))
+
+    trace, state = preview.run_project_preview(project, {"messages": "LangGraph MCP"}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert seen["tool_name"] == "web_search_exa"
+    assert seen["args"] == {"query": "LangGraph MCP"}
+    assert state["mcp_result"]["ok"] is True
+    assert state["mcp_result"]["content"] == "Exa result"
+
+
+def test_live_preview_mcp_node_auto_selects_single_tool(monkeypatch):
+    seen = {}
+
+    def fake_list_tools(server_config, runtime_environment=None, require_enabled=True):
+        return [{"name": "only_tool", "description": "Only tool", "inputSchema": {"type": "object", "properties": {}}}]
+
+    def fake_invoke(server_config, tool_name, args, runtime_environment=None):
+        seen["tool_name"] = tool_name
+        seen["args"] = args
+        return {"ok": True, "serverId": server_config["id"], "serverName": server_config["name"], "tool": tool_name, "args": args, "content": "ok", "raw": {}}
+
+    monkeypatch.setattr(preview, "list_mcp_tools", fake_list_tools)
+    monkeypatch.setattr(preview, "invoke_mcp_tool", fake_invoke)
+
+    project = create_default_project("MCP Auto Single")
+    project.mcpServers.append(MCPServerConfig(id="mcp_one", name="One MCP", transport="http", url="https://mcp.example.com/mcp"))
+    project.nodes.append(
+        NodeIR(
+            id="mcp_node",
+            type=NodeType.MCP_NODE,
+            label="MCP",
+            config={"serverId": "mcp_one", "serverName": "One MCP", "toolArgsJson": "{}", "outputField": "mcp_result"},
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="mcp_node"))
+
+    trace, state = preview.run_project_preview(project, {"messages": "hello"}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert seen == {"tool_name": "only_tool", "args": {}}
+    assert state["mcp_result"]["autoSelectedTool"] is True
+    assert state["mcp_result"]["availableTools"][0]["name"] == "only_tool"
+
+
+def test_live_preview_mcp_node_auto_selects_exa_search_and_query(monkeypatch):
+    seen = {}
+
+    def fake_list_tools(server_config, runtime_environment=None, require_enabled=True):
+        return [
+            {"name": "web_fetch_exa", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}}},
+            {"name": "web_search_exa", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+        ]
+
+    def fake_invoke(server_config, tool_name, args, runtime_environment=None):
+        seen["tool_name"] = tool_name
+        seen["args"] = args
+        return {"ok": True, "serverId": server_config["id"], "serverName": server_config["name"], "tool": tool_name, "args": args, "content": "search ok", "raw": {}}
+
+    monkeypatch.setattr(preview, "list_mcp_tools", fake_list_tools)
+    monkeypatch.setattr(preview, "invoke_mcp_tool", fake_invoke)
+
+    project = create_default_project("MCP Auto Exa")
+    project.mcpServers.append(MCPServerConfig(id="mcp_exa", name="Exa MCP", transport="http", url="https://mcp.exa.ai/mcp"))
+    project.nodes.append(
+        NodeIR(
+            id="mcp_node",
+            type=NodeType.MCP_NODE,
+            label="Exa",
+            config={"serverId": "mcp_exa", "serverName": "Exa MCP", "toolArgsJson": "{}", "outputField": "mcp_result"},
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="mcp_node"))
+
+    trace, state = preview.run_project_preview(project, {"chat": "搜索 MCP runtime"}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert seen == {"tool_name": "web_search_exa", "args": {"query": "搜索 MCP runtime"}}
+    assert state["mcp_result"]["autoSelectedTool"] is True
+
+
+def test_live_preview_mcp_node_model_selects_tool_and_args(monkeypatch):
+    calls = {"model": 0, "invoke": []}
+
+    def fake_list_tools(server_config, runtime_environment=None, require_enabled=True):
+        return [
+            {"name": "web_fetch_exa", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}}},
+            {"name": "web_search_exa", "description": "Search web", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+        ]
+
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        calls["model"] += 1
+        assert provider == "openai"
+        assert model == "gpt-4.1-mini"
+        assert "web_search_exa" in messages[0][1]
+        return FakeResponse(json.dumps({"tool": "web_search_exa", "args": {"query": "模型选择 MCP"}, "reason": "需要搜索"}, ensure_ascii=False))
+
+    def fake_invoke(server_config, tool_name, args, runtime_environment=None):
+        calls["invoke"].append({"tool": tool_name, "args": args})
+        return {"ok": True, "serverId": server_config["id"], "serverName": server_config["name"], "tool": tool_name, "args": args, "content": "ok", "raw": {}}
+
+    monkeypatch.setattr(preview, "list_mcp_tools", fake_list_tools)
+    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(preview, "invoke_mcp_tool", fake_invoke)
+
+    project = create_default_project("MCP Model Select")
+    project.mcpServers.append(MCPServerConfig(id="mcp_exa", name="Exa MCP", transport="http", url="https://mcp.exa.ai/mcp"))
+    project.nodes.append(
+        NodeIR(
+            id="mcp_node",
+            type=NodeType.MCP_NODE,
+            label="Exa",
+            config={
+                "serverId": "mcp_exa",
+                "serverName": "Exa MCP",
+                "toolSelectionMode": "model",
+                "toolArgsJson": '{"numResults": 3}',
+                "outputField": "mcp_result",
+            },
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="mcp_node"))
+
+    trace, state = preview.run_project_preview(project, {"messages": "查 MCP"}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert calls["model"] == 1
+    assert calls["invoke"] == [{"tool": "web_search_exa", "args": {"numResults": 3, "query": "模型选择 MCP"}}]
+    assert state["mcp_result"]["autoSelectedTool"] is True
+    assert state["mcp_result"]["selectedByModel"] is True
+    assert state["mcp_result"]["selectionMode"] == "model"
+    assert state["mcp_result"]["selectionReason"] == "需要搜索"
+
+
+def test_live_preview_mcp_node_model_select_invalid_tool_errors(monkeypatch):
+    def fake_list_tools(server_config, runtime_environment=None, require_enabled=True):
+        return [{"name": "web_search_exa"}]
+
+    monkeypatch.setattr(preview, "list_mcp_tools", fake_list_tools)
+    monkeypatch.setattr(preview, "_call_chat_model", lambda *args, **kwargs: FakeResponse('{"tool":"missing_tool","args":{}}'))
+
+    project = create_default_project("MCP Model Invalid")
+    project.mcpServers.append(MCPServerConfig(id="mcp_exa", name="Exa MCP", transport="http", url="https://mcp.exa.ai/mcp"))
+    project.nodes.append(
+        NodeIR(
+            id="mcp_node",
+            type=NodeType.MCP_NODE,
+            label="Exa",
+            config={"serverId": "mcp_exa", "serverName": "Exa MCP", "toolSelectionMode": "model"},
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="mcp_node"))
+
+    trace, _state = preview.run_project_preview(project, {"messages": "hello"}, "live")
+
+    assert trace[0]["status"] == "error"
+    assert "不存在或不可用" in trace[0]["detail"]
+
+
+def test_live_preview_mcp_node_auto_select_reports_ambiguous_tools(monkeypatch):
+    def fake_list_tools(server_config, runtime_environment=None, require_enabled=True):
+        return [{"name": "web_fetch_exa"}, {"name": "read_page"}]
+
+    monkeypatch.setattr(preview, "list_mcp_tools", fake_list_tools)
+
+    project = create_default_project("MCP Auto Ambiguous")
+    project.mcpServers.append(MCPServerConfig(id="mcp_exa", name="Exa MCP", transport="http", url="https://mcp.exa.ai/mcp"))
+    project.nodes.append(NodeIR(id="mcp_node", type=NodeType.MCP_NODE, label="Exa", config={"serverId": "mcp_exa", "serverName": "Exa MCP"}))
+    project.edges.append(EdgeIR(id="e1", source="start", target="mcp_node"))
+
+    trace, _state = preview.run_project_preview(project, {"messages": "hello"}, "live")
+
+    assert trace[0]["status"] == "error"
+    assert "web_fetch_exa" in trace[0]["detail"]
+    assert "read_page" in trace[0]["detail"]
+
+
+def test_live_preview_agent_can_call_selected_mcp_tool(monkeypatch):
+    calls = {"model": 0, "mcp": []}
+
+    def fake_list_tools(server_config, runtime_environment=None, require_enabled=True):
+        assert require_enabled is True
+        return [
+            {
+                "name": "web_search_exa",
+                "title": "Web Search",
+                "description": "Search web",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            }
+        ]
+
+    def fake_invoke(server_config, tool_name, args, runtime_environment=None):
+        calls["mcp"].append({"server": server_config["id"], "tool": tool_name, "args": args})
+        return {
+            "ok": True,
+            "serverId": server_config["id"],
+            "serverName": server_config["name"],
+            "tool": tool_name,
+            "args": args,
+            "content": "搜索结果：MCP runtime 已可用。",
+            "raw": {},
+        }
+
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        calls["model"] += 1
+        if calls["model"] == 1:
+            return FakeResponse(
+                json.dumps(
+                    {
+                        "tool_calls": [
+                            {
+                                "tool": "mcp_mcp_exa__web_search_exa",
+                                "args": {"query": "MCP runtime"},
+                            }
+                        ],
+                        "final_answer": "",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "Exa 查询完成"}, ensure_ascii=False))
+
+    monkeypatch.setattr(preview, "list_mcp_tools", fake_list_tools)
+    monkeypatch.setattr(preview, "invoke_mcp_tool", fake_invoke)
+    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+
+    project = create_default_project("Agent MCP 测试")
+    project.mcpServers.append(
+        MCPServerConfig(
+            id="mcp_exa",
+            name="Exa MCP",
+            transport="http",
+            url="https://mcp.exa.ai/mcp",
+        )
+    )
+    project.nodes.append(
+        NodeIR(
+            id="agent",
+            type=NodeType.AGENT,
+            label="Agent",
+            config={
+                "systemPrompt": "你可以使用 MCP 搜索。",
+                "mcpServerIdsJson": '["mcp_exa"]',
+                "mcpServerRegistryJson": json.dumps([project.mcpServers[0].model_dump(by_alias=True)], ensure_ascii=False),
+                "outputField": "agent_result",
+                "maxIterations": 3,
+            },
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="agent"))
+
+    trace, state = preview.run_project_preview(project, {"messages": "查 MCP runtime"}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert state["agent_result"] == "Exa 查询完成"
+    assert state["agent_result_mcp_tool_calls"][0]["tool"] == "mcp_mcp_exa__web_search_exa"
+    assert calls["mcp"] == [{"server": "mcp_exa", "tool": "web_search_exa", "args": {"query": "MCP runtime"}}]
+
+
+def test_live_preview_agent_can_call_imported_agent_as_tool(monkeypatch):
+    calls = {"model": 0}
+    child_project = create_default_project("Child Agent")
+    child_project.project.id = "child_agent"
+    child_project.nodes.append(
+        NodeIR(
+            id="reply",
+            type=NodeType.DIRECT_REPLY,
+            label="Child Reply",
+            config={"template": "子 Agent 收到：{{ state.messages }}", "outputField": "final_answer"},
+        )
+    )
+    child_project.edges.append(EdgeIR(id="child_e1", source="start", target="reply"))
+
+    def fake_read_project(project_id):
+        assert project_id == "child_agent"
+        return child_project
+
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        calls["model"] += 1
+        if calls["model"] == 1:
+            return FakeResponse(
+                json.dumps(
+                    {"tool_calls": [{"tool": "agent_agent_ref_child", "args": {"input": "处理退款问题"}}], "final_answer": ""},
+                    ensure_ascii=False,
+                )
+            )
+        return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "子 Agent 已处理"}, ensure_ascii=False))
+
+    monkeypatch.setattr(preview, "read_project", fake_read_project)
+    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+
+    project = create_default_project("Parent Agent")
+    imported = ImportedAgentConfig(id="agent_ref_child", name="Child Agent", projectId="child_agent", role="sub_agent")
+    project.importedAgents.append(imported)
+    project.nodes.append(
+        NodeIR(
+            id="agent",
+            type=NodeType.AGENT,
+            label="Parent",
+            config={
+                "systemPrompt": "你可以调用子 Agent。",
+                "agentIdsJson": '["agent_ref_child"]',
+                "agentRegistryJson": json.dumps([imported.model_dump(by_alias=True)], ensure_ascii=False),
+                "outputField": "agent_result",
+            },
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="agent"))
+
+    trace, state = preview.run_project_preview(project, {"messages": "需要退款"}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert state["agent_result"] == "子 Agent 已处理"
+    call = state["agent_result_agent_tool_calls"][0]
+    assert call["source"] == "agent"
+    assert call["agentName"] == "Child Agent"
+    assert call["observation"]["result"]["finalAnswer"] == "子 Agent 收到：处理退款问题"
+
+
+def test_live_preview_agent_ref_executes_bound_project(monkeypatch):
+    child_project = create_default_project("Child Ref Agent")
+    child_project.project.id = "child_ref"
+    child_project.nodes.append(
+        NodeIR(
+            id="reply",
+            type=NodeType.DIRECT_REPLY,
+            label="Child Reply",
+            config={"template": "ref: {{ state.messages }}", "outputField": "final_answer"},
+        )
+    )
+    child_project.edges.append(EdgeIR(id="child_e1", source="start", target="reply"))
+
+    monkeypatch.setattr(preview, "read_project", lambda project_id: child_project)
+
+    project = create_default_project("Parent Ref")
+    project.nodes.append(
+        NodeIR(
+            id="agent_ref",
+            type=NodeType.AGENT_REF,
+            label="Child Ref",
+            config={"agentProjectId": "child_ref", "agentName": "Child Ref Agent", "instruction": "处理：{{ state.messages }}", "outputField": "child_result"},
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="agent_ref"))
+
+    trace, state = preview.run_project_preview(project, {"messages": "订单"}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert state["child_result"]["ok"] is True
+    assert state["child_result"]["finalAnswer"] == "ref: 处理：订单"
+
+
+def test_live_preview_agent_ref_rejects_self_call():
+    project = create_default_project("Self Ref")
+    project.nodes.append(
+        NodeIR(
+            id="agent_ref",
+            type=NodeType.AGENT_REF,
+            label="Self",
+            config={"agentProjectId": project.project.id, "agentName": "Self"},
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="agent_ref"))
+
+    trace, _state = preview.run_project_preview(project, {"messages": "hello"}, "live")
+
+    assert trace[0]["status"] == "error"
+    assert "当前项目自身" in trace[0]["detail"]
 
 
 def test_live_preview_tools_node_can_call_registered_tool_multiple_times(monkeypatch, tmp_path: Path):

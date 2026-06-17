@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
@@ -11,9 +10,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.compiler import SmokeTestFailedError, SmokeTestResult, build_project, export_project_zip
 from app.config import EXPORTS_DIR, STORAGE_DIR, ensure_runtime_dirs
-from app.ir.sanitization import sanitized_project, sanitize_project_payload
+from app.ir.sanitization import sanitized_project
 from app.ir.schemas import ProjectIR, create_default_project
 from app.ir.validation import validate_project
+from app.project_store import project_path, read_project, write_project
 from app.runtime_environment import RuntimeEnvironmentConfig, resolve_runtime_environment
 from app.runner import iter_project_preview_events, run_project_preview as run_project_preview_engine
 
@@ -140,13 +140,13 @@ def create_project(payload: CreateProjectRequest | None = None) -> ProjectIR:
         payload.name if payload else "Untitled Agent",
         payload.kind if payload else "agent",
     )
-    _write_project(project)
+    write_project(project)
     return project
 
 
 @router.get("/projects/{project_id}", response_model=ProjectIR)
 def get_project(project_id: str) -> ProjectIR:
-    return _read_project(project_id)
+    return read_project(project_id)
 
 
 @router.put("/projects/{project_id}", response_model=ProjectIR)
@@ -154,13 +154,13 @@ def save_project(project_id: str, project: ProjectIR) -> ProjectIR:
     if project.project.id != project_id:
         project.project.id = project_id
     project = sanitized_project(project)
-    _write_project(project)
+    write_project(project)
     return project
 
 
 @router.delete("/projects/{project_id}", status_code=204)
 def delete_project(project_id: str) -> None:
-    path = _project_path(project_id)
+    path = project_path(project_id)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Project not found")
     path.unlink()
@@ -168,13 +168,13 @@ def delete_project(project_id: str) -> None:
 
 @router.post("/projects/{project_id}/validate")
 def validate_saved_project(project_id: str):
-    project = _read_project(project_id)
+    project = read_project(project_id)
     return validate_project(project)
 
 
 @router.post("/projects/{project_id}/compile", response_model=CompileResponse)
 def compile_saved_project(project_id: str) -> CompileResponse:
-    project = _read_project(project_id)
+    project = read_project(project_id)
     result = validate_project(project)
     if not result.valid:
         raise HTTPException(status_code=422, detail=[issue.model_dump() for issue in result.issues])
@@ -184,7 +184,7 @@ def compile_saved_project(project_id: str) -> CompileResponse:
 
 @router.post("/projects/{project_id}/run", response_model=RunPreviewResponse)
 def run_project_preview(project_id: str, payload: RunPreviewRequest | None = None) -> RunPreviewResponse:
-    project = _read_project(project_id)
+    project = read_project(project_id)
     request = payload or RunPreviewRequest()
     runtime_environment = resolve_runtime_environment(request.runtimeEnvironment, project.project.runtime_environment_id)
     result = validate_project(project)
@@ -210,7 +210,7 @@ def run_project_preview(project_id: str, payload: RunPreviewRequest | None = Non
 
 @router.post("/projects/{project_id}/run/stream")
 def stream_project_preview(project_id: str, payload: RunPreviewRequest | None = None) -> StreamingResponse:
-    project = _read_project(project_id)
+    project = read_project(project_id)
     request = payload or RunPreviewRequest(mode="live")
     runtime_environment = resolve_runtime_environment(request.runtimeEnvironment, project.project.runtime_environment_id)
 
@@ -255,7 +255,7 @@ def stream_project_preview(project_id: str, payload: RunPreviewRequest | None = 
 
 @router.post("/projects/{project_id}/export", response_model=ExportResponse)
 def export_saved_project(project_id: str) -> ExportResponse:
-    project = _read_project(project_id)
+    project = read_project(project_id)
     result = validate_project(project)
     if not result.valid:
         raise HTTPException(status_code=422, detail=[issue.model_dump() for issue in result.issues])
@@ -283,26 +283,6 @@ def download_export(export_id: str):
     if not zip_path.exists():
         raise HTTPException(status_code=404, detail="Export not found")
     return FileResponse(zip_path, filename=zip_path.name, media_type="application/zip")
-
-
-def _project_path(project_id: str) -> Path:
-    ensure_runtime_dirs()
-    safe_id = "".join(ch for ch in project_id if ch.isalnum() or ch in "-_")
-    if not safe_id:
-        raise HTTPException(status_code=400, detail="Invalid project id")
-    return STORAGE_DIR / f"{safe_id}.json"
-
-
-def _read_project(project_id: str) -> ProjectIR:
-    path = _project_path(project_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Project not found")
-    return ProjectIR.model_validate_json(path.read_text(encoding="utf-8"))
-
-
-def _write_project(project: ProjectIR) -> None:
-    path = _project_path(project.project.id)
-    path.write_text(json.dumps(sanitize_project_payload(project), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _json_line(payload: dict[str, Any]) -> str:

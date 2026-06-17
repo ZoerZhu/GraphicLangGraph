@@ -131,6 +131,11 @@ export interface MCPServerConfig {
   envVarsJson: string;
   cwd: string;
   url: string;
+  apiKey: string;
+  apiKeyEnv: string;
+  apiKeyMode: "env" | "direct" | string;
+  apiKeyHeader: string;
+  apiKeyPrefix: string;
   bearerTokenEnvVar: string;
   httpHeadersJson: string;
   envHttpHeadersJson: string;
@@ -151,6 +156,24 @@ export interface McpImportResult {
   importPath: string;
   detectedFiles: string[];
   warnings: string[];
+}
+
+export interface McpToolInspection {
+  name: string;
+  title: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+export interface McpInspectResult {
+  ok: boolean;
+  serverId: string;
+  serverName: string;
+  transport: string;
+  tools: McpToolInspection[];
+  warnings: string[];
+  durationMs: number;
+  error: string;
 }
 
 export interface ModelConfig {
@@ -181,6 +204,7 @@ export interface RuntimeEnvironmentConfig {
   description: string;
   allowedRootsJson: string;
   networkEnabled: boolean;
+  allowAllHosts: boolean;
   allowedHostsJson: string;
   maxFileBytes: number;
   maxHttpBytes: number;

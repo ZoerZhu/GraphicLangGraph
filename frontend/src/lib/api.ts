@@ -4,6 +4,7 @@ import type {
   EnvVarCheckResult,
   ExportResponse,
   MCPServerConfig,
+  McpInspectResult,
   McpImportResult,
   ModelConfig,
   ProjectIR,
@@ -26,6 +27,7 @@ import {
   EditSessionSchema,
   ExportResponseSchema,
   EnvVarCheckSchema,
+  McpInspectResultSchema,
   McpImportResultSchema,
   McpServerConfigListSchema,
   ModelConfigListSchema,
@@ -250,6 +252,14 @@ export async function importWorkspaceMcpServers(payload: { sourceType: "local" |
     body: JSON.stringify(payload),
   });
   return McpImportResultSchema.parse(data) as McpImportResult;
+}
+
+export async function inspectWorkspaceMcpServer(config: MCPServerConfig): Promise<McpInspectResult> {
+  const data = await request("/api/workspace/mcp/inspect", {
+    method: "POST",
+    body: JSON.stringify(config),
+  });
+  return McpInspectResultSchema.parse(data) as McpInspectResult;
 }
 
 export async function listWorkspaceModelConfigs(): Promise<ModelConfig[]> {
