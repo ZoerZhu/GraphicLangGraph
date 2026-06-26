@@ -1,5 +1,7 @@
 import type {
   CommandRunResult,
+  DataShapingPathsResult,
+  DataShapingPreviewResult,
   EditSession,
   EnvVarCheckResult,
   ExportResponse,
@@ -25,6 +27,8 @@ import type {
 } from "../types";
 import {
   CommandRunResultSchema,
+  DataShapingPathsResultSchema,
+  DataShapingPreviewResultSchema,
   EditSessionSchema,
   ExportResponseSchema,
   EnvVarCheckSchema,
@@ -363,6 +367,32 @@ export async function runProjectPreview(
     body: JSON.stringify({ input, mode, modelConfig, runtimeEnvironment }),
   });
   return RunPreviewResultSchema.parse(data) as RunPreviewResult;
+}
+
+export async function listDataShapingPaths(
+  projectId: string,
+  state: Record<string, unknown> = {},
+  runId = "",
+): Promise<DataShapingPathsResult> {
+  const data = await request(`/api/projects/${projectId}/data-shaping/paths`, {
+    method: "POST",
+    body: JSON.stringify({ state, runId }),
+  });
+  return DataShapingPathsResultSchema.parse(data) as DataShapingPathsResult;
+}
+
+export async function previewDataShapingNode(
+  projectId: string,
+  nodeId: string,
+  state: Record<string, unknown> = {},
+  runId = "",
+  modelConfig?: ModelConfig,
+): Promise<DataShapingPreviewResult> {
+  const data = await request(`/api/projects/${projectId}/data-shaping/preview`, {
+    method: "POST",
+    body: JSON.stringify({ nodeId, state, runId, modelConfig }),
+  });
+  return DataShapingPreviewResultSchema.parse(data) as DataShapingPreviewResult;
 }
 
 export async function listProjectRunHistory(projectId: string): Promise<RunHistoryRecord[]> {

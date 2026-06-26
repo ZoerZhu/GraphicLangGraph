@@ -274,6 +274,55 @@ def test_codegen_exports_json_extractor_model_call():
     compile(nodes_py, "nodes.py", "exec")
 
 
+def test_codegen_exports_workflow_core_v2_transform_schema_and_repair():
+    project = create_default_project("Workflow Core v2 Export")
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="assign_v2",
+                type=NodeType.VARIABLE_ASSIGN,
+                label="Assign v2",
+                config={
+                    "assignmentsJson": json.dumps(
+                        [
+                            {
+                                "target": "titles_text",
+                                "operation": "overwrite",
+                                "sourceType": "state",
+                                "source": "task_plan.tasks[].title",
+                                "transform": "join",
+                                "transformArgsJson": '{"separator": ","}',
+                            }
+                        ]
+                    )
+                },
+            ),
+            NodeIR(
+                id="validator_v2",
+                type=NodeType.JSON_VALIDATOR,
+                label="Validator v2",
+                config={
+                    "inputField": "task_plan",
+                    "schemaPreset": "task_plan_v1",
+                    "repairEnabled": True,
+                    "repairResultField": "repair_result",
+                },
+            ),
+        ]
+    )
+    project.edges.extend([EdgeIR(id="e1", source="start", target="assign_v2"), EdgeIR(id="e2", source="assign_v2", target="validator_v2")])
+
+    files = generate_project_files(project)
+    nodes_py = next(value for path, value in files.items() if path.endswith("/nodes.py"))
+
+    assert "_apply_mapping_transform" in nodes_py
+    assert "_repair_json_output" in nodes_py
+    assert "task_plan_v1" in nodes_py
+    assert "anyOf" in nodes_py
+    assert "tasks[].title" in nodes_py
+    compile(nodes_py, "nodes.py", "exec")
+
+
 def test_codegen_exports_flow_control_nodes():
     project = create_default_project("Flow Control Export")
     project.state.fields.extend(

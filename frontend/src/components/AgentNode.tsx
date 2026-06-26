@@ -334,13 +334,15 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
     case "json_extractor":
       return [
         { label: "模型", value: text(config.model, "gpt-4.1-mini") },
-        { label: "Schema", value: `${parseObjectList(config.schemaFieldsJson).length} 字段` },
+        { label: "Schema", value: text(config.schemaPreset, `${parseObjectList(config.schemaFieldsJson).length} 字段`) },
+        { label: "修复", value: config.repairEnabled ? "开启" : "关闭" },
         { label: "输出", value: text(config.outputField, "extracted_json") },
       ];
     case "json_validator":
       return [
         { label: "输入", value: text(config.inputField, "extracted_json") },
-        { label: "Schema", value: `${parseObjectList(config.schemaFieldsJson).length} 字段` },
+        { label: "Schema", value: text(config.schemaPreset, `${parseObjectList(config.schemaFieldsJson).length} 字段`) },
+        { label: "修复", value: config.repairEnabled ? "开启" : "关闭" },
         { label: "结果", value: text(config.validationField, "validation_result") },
       ];
     case "for_each":

@@ -55,12 +55,23 @@ export const NODE_CATALOG: NodeCatalogItem[] = [
 export function createNode(type: NodeType, index: number, position = { x: 180, y: 180 }): NodeIR {
   const id = `${type}_${Math.random().toString(16).slice(2, 8)}`;
   const base = NODE_CATALOG.find((item) => item.type === type);
+  const config = defaultConfig(type);
+  if (type === "json_extractor") {
+    config.outputField = `extracted_json_${index}`;
+    config.validationField = `validation_result_${index}`;
+    config.repairResultField = `repair_result_${index}`;
+  }
+  if (type === "json_validator") {
+    config.outputField = `validated_json_${index}`;
+    config.validationField = `validation_result_${index}`;
+    config.repairResultField = `repair_result_${index}`;
+  }
   return {
     id,
     type,
     label: base?.title ?? type,
     position,
-    config: defaultConfig(type),
+    config,
     inputs: defaultInputs(type),
     outputs: defaultOutputs(type),
   };
@@ -161,6 +172,7 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         inputMappingsJson: JSON.stringify([{ name: "input", sourceType: "state", source: "messages", valueType: "string" }], null, 2),
         inputText: "{{ state.messages }}",
         instruction: "抽取可供后续节点消费的结构化 JSON。",
+        schemaPreset: "task_plan_v1",
         schemaFieldsJson: JSON.stringify(
           [
             { name: "tasks", type: "array", required: true, description: "任务数组" },
@@ -170,10 +182,14 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         ),
         outputField: "extracted_json",
         validationField: "validation_result",
+        repairEnabled: false,
+        repairInstruction: "修复为 Task Splitter 可直接消费的任务规划 JSON。",
+        repairResultField: "repair_result",
       };
     case "json_validator":
       return {
         inputField: "extracted_json",
+        schemaPreset: "task_plan_v1",
         schemaFieldsJson: JSON.stringify(
           [
             { name: "tasks", type: "array", required: true, description: "任务数组" },
@@ -183,6 +199,9 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         ),
         outputField: "validated_json",
         validationField: "validation_result",
+        repairEnabled: false,
+        repairInstruction: "修复为 Task Splitter 可直接消费的任务规划 JSON。",
+        repairResultField: "repair_result",
       };
     case "for_each":
       return {

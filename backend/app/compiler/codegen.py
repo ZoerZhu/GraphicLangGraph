@@ -438,7 +438,8 @@ import re
 from typing import Any
 
 
-TEMPLATE_RE = re.compile(r"{{\\s*state\\.([a-zA-Z_][a-zA-Z0-9_]*)\\s*}}")
+TEMPLATE_RE = re.compile(r"{{\\s*state\\.([a-zA-Z_][a-zA-Z0-9_\\.\\[\\]]*)\\s*}}")
+_MISSING = object()
 
 
 def env(key: str, default: str = "") -> str:
@@ -447,10 +448,59 @@ def env(key: str, default: str = "") -> str:
 
 def render_template(template: str, state: dict[str, Any]) -> str:
     def replace(match: re.Match[str]) -> str:
-        value = state.get(match.group(1), "")
-        return "" if value is None else str(value)
+        value = _get_path(state, match.group(1), "")
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            import json
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
 
     return TEMPLATE_RE.sub(replace, template)
+
+
+def _get_path(value: Any, path: str, default: Any = None) -> Any:
+    parts = [item for item in str(path or "").split(".") if item]
+    if not parts:
+        return value
+    resolved = _get_path_parts(value, parts)
+    return default if resolved is _MISSING else resolved
+
+
+def _get_path_parts(value: Any, parts: list[str]) -> Any:
+    if not parts:
+        return value
+    part = parts[0]
+    if part.endswith("[]"):
+        key = part[:-2]
+        collection = _get_path_part(value, key) if key else value
+        if not isinstance(collection, list):
+            return []
+        values: list[Any] = []
+        for item in collection:
+            child = _get_path_parts(item, parts[1:])
+            if child is _MISSING:
+                continue
+            if isinstance(child, list):
+                values.extend(child)
+            else:
+                values.append(child)
+        return values
+    next_value = _get_path_part(value, part)
+    if next_value is _MISSING:
+        return _MISSING
+    return _get_path_parts(next_value, parts[1:])
+
+
+def _get_path_part(value: Any, part: str) -> Any:
+    if part == "":
+        return value
+    if isinstance(value, dict):
+        return value.get(part, _MISSING)
+    if isinstance(value, list) and part.isdigit():
+        index = int(part)
+        return value[index] if 0 <= index < len(value) else _MISSING
+    return _MISSING
 '''
 
 
@@ -3192,9 +3242,12 @@ def _node_function(node: NodeIR, project: ProjectIR) -> str:
         input_mappings = json.dumps(_json_object_list(node.config.get("inputMappingsJson")), ensure_ascii=False)
         input_text = json.dumps(str(node.config.get("inputText", "")))
         instruction = json.dumps(str(node.config.get("instruction", "")))
-        schema = json.dumps(_json_schema_from_fields(node.config.get("schemaFieldsJson")), ensure_ascii=False)
+        repair_instruction = json.dumps(str(node.config.get("repairInstruction", "")))
+        repair_enabled = "True" if _truthy(node.config.get("repairEnabled")) else "False"
+        schema = json.dumps(_json_schema_from_config(node.config), ensure_ascii=False)
         output_field = json.dumps(str(node.config.get("outputField", "extracted_json")))
         validation_field = json.dumps(str(node.config.get("validationField", "validation_result")))
+        repair_field = json.dumps(str(node.config.get("repairResultField", "repair_result")))
         return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
     model_ref = _chat_model({provider}, {model}, {base_url}, {api_key_env}, {api_version}, {organization})
     inputs = _resolve_input_mappings({input_mappings}, state)
@@ -3205,20 +3258,57 @@ def _node_function(node: NodeIR, project: ProjectIR) -> str:
         ("system", _json_extractor_system_prompt({instruction}, schema)),
         ("user", "请从以下输入中抽取结构化 JSON：\\n" + source_text),
     ])
-    output = _parse_json_object_from_text(getattr(response, "content", str(response)))
+    raw_content = getattr(response, "content", str(response))
+    parse_error = ""
+    try:
+        output = _parse_json_object_from_text(raw_content)
+    except RuntimeError as exc:
+        output = {{}}
+        parse_error = str(exc)
     validation = _validation_result(output, schema)
-    return {{{output_field}: output, {validation_field}: validation}}
+    if parse_error:
+        validation["errors"].insert(0, parse_error)
+        validation["valid"] = False
+    repair_result = None
+    if {repair_enabled} and not validation["valid"]:
+        repair_result = _repair_json_output(model_ref, {repair_instruction}, output, schema, validation["errors"], source_text, raw_content)
+        if repair_result.get("ok") and isinstance(repair_result.get("output"), dict):
+            output = repair_result["output"]
+            validation = repair_result["validation"]
+    delta = {{{output_field}: output, {validation_field}: validation}}
+    if repair_result is not None:
+        delta[{repair_field}] = repair_result
+    return delta
 '''
     if node.type == NodeType.JSON_VALIDATOR:
+        provider = json.dumps(str(node.config.get("provider", "openai")))
+        model = json.dumps(str(node.config.get("model", "gpt-4.1-mini")))
+        base_url = json.dumps(str(node.config.get("baseUrl", "")))
+        api_key_env = json.dumps(str(node.config.get("apiKeyEnv", "")))
+        api_version = json.dumps(str(node.config.get("apiVersion", "")))
+        organization = json.dumps(str(node.config.get("organization", "")))
         input_field = json.dumps(str(node.config.get("inputField", "extracted_json")))
         output_field = json.dumps(str(node.config.get("outputField", "validated_json")))
         validation_field = json.dumps(str(node.config.get("validationField", "validation_result")))
-        schema = json.dumps(_json_schema_from_fields(node.config.get("schemaFieldsJson")), ensure_ascii=False)
+        repair_instruction = json.dumps(str(node.config.get("repairInstruction", "")))
+        repair_enabled = "True" if _truthy(node.config.get("repairEnabled")) else "False"
+        repair_field = json.dumps(str(node.config.get("repairResultField", "repair_result")))
+        schema = json.dumps(_json_schema_from_config(node.config), ensure_ascii=False)
         return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
     schema = {schema}
     value = _get_path(state, {input_field})
     validation = _validation_result(value, schema)
-    return {{{output_field}: value, {validation_field}: validation}}
+    repair_result = None
+    if {repair_enabled} and not validation["valid"]:
+        model_ref = _chat_model({provider}, {model}, {base_url}, {api_key_env}, {api_version}, {organization})
+        repair_result = _repair_json_output(model_ref, {repair_instruction}, value, schema, validation["errors"], _state_value_to_text(state.get("messages", "")), "")
+        if repair_result.get("ok") and isinstance(repair_result.get("output"), dict):
+            value = repair_result["output"]
+            validation = repair_result["validation"]
+    delta = {{{output_field}: value, {validation_field}: validation}}
+    if repair_result is not None:
+        delta[{repair_field}] = repair_result
+    return delta
 '''
     if node.type == NodeType.FOR_EACH:
         maps = _for_each_codegen_maps(project, node)
@@ -3913,6 +4003,15 @@ def _agent_user_content(state: AgentState, user_prompt: str = "") -> str:
     return "用户输入：\\n" + user_text + "\\n\\n当前流程 state：\\n" + json.dumps(dict(state), ensure_ascii=False, default=str, indent=2)
 
 
+_MISSING = object()
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled", "approve", "auto"}
+
+
 def _resolve_input_mappings(mappings: list[dict[str, Any]], state: AgentState) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for mapping in mappings:
@@ -3921,14 +4020,20 @@ def _resolve_input_mappings(mappings: list[dict[str, Any]], state: AgentState) -
         name = str(mapping.get("name") or "").strip()
         if not name:
             continue
-        source_type = str(mapping.get("sourceType") or mapping.get("source_type") or "state").strip().lower()
-        source = str(mapping.get("source") or "")
-        value_type = str(mapping.get("valueType") or mapping.get("value_type") or "auto")
-        result[name] = _resolve_mapping_value(source_type, source, value_type, state)
+        result[name] = _resolve_mapping_entry(mapping, state)
     return result
 
 
-def _resolve_mapping_value(source_type: str, source: str, value_type: str, state: AgentState) -> Any:
+def _resolve_mapping_entry(mapping: dict[str, Any], state: AgentState) -> Any:
+    source_type = str(mapping.get("sourceType") or mapping.get("source_type") or "state").strip().lower()
+    source = str(mapping.get("source") or "")
+    value_type = str(mapping.get("valueType") or mapping.get("value_type") or "auto")
+    transform = str(mapping.get("transform") or "none").strip().lower()
+    transform_args = _render_transform_args(mapping.get("transformArgsJson") or mapping.get("transform_args_json"), state)
+    return _resolve_mapping_value(source_type, source, value_type, state, transform, transform_args)
+
+
+def _resolve_mapping_value(source_type: str, source: str, value_type: str, state: AgentState, transform: str = "none", transform_args: dict[str, Any] | None = None) -> Any:
     if source_type == "state":
         value = _get_path(state, source)
     elif source_type == "literal":
@@ -3937,7 +4042,68 @@ def _resolve_mapping_value(source_type: str, source: str, value_type: str, state
         value = json.loads(render_template(source, state))
     else:
         value = render_template(source, state)
+    value = _apply_mapping_transform(value, transform, transform_args or {}, state)
     return _coerce_mapped_value(value, value_type)
+
+
+def _render_transform_args(value: Any, state: AgentState) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    parsed = json.loads(render_template(text, state))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Transform 参数必须是 JSON object。")
+    return parsed
+
+
+def _apply_mapping_transform(value: Any, transform: str, args: dict[str, Any], state: AgentState) -> Any:
+    kind = str(transform or "none").strip().lower()
+    if kind in {"", "none"}:
+        return value
+    if kind == "default":
+        return _resolve_transform_value(args.get("value", args.get("default")), state) if _is_empty_value(value) else value
+    if kind == "coalesce":
+        candidates = [value]
+        raw_candidates = args.get("candidates", [])
+        if not isinstance(raw_candidates, list):
+            raw_candidates = [raw_candidates]
+        candidates.extend(_resolve_transform_value(candidate, state) for candidate in raw_candidates)
+        for candidate in candidates:
+            if not _is_empty_value(candidate):
+                return candidate
+        return None
+    if kind == "split":
+        separator = str(args.get("separator", "\\n"))
+        text = _state_value_to_text(value)
+        parts = text.split(separator) if separator else list(text)
+        if _truthy(args.get("trim", True)):
+            parts = [part.strip() for part in parts]
+        if _truthy(args.get("dropEmpty", args.get("drop_empty", True))):
+            parts = [part for part in parts if part != ""]
+        return parts
+    if kind == "join":
+        separator = str(args.get("separator", "\\n"))
+        values = value if isinstance(value, list) else ([] if value is None else [value])
+        return separator.join(_state_value_to_text(item) for item in values)
+    if kind == "pick":
+        return _pick_paths(value, _normalize_string_list(args.get("paths") or args.get("fields")))
+    if kind == "omit":
+        return _omit_paths(value, _normalize_string_list(args.get("paths") or args.get("fields")))
+    raise RuntimeError(f"不支持的 Transform：{transform}")
+
+
+def _resolve_transform_value(value: Any, state: AgentState) -> Any:
+    if isinstance(value, dict) and ("sourceType" in value or "source" in value):
+        return _resolve_mapping_entry(value, state)
+    if isinstance(value, str):
+        return render_template(value, state)
+    return value
+
+
+def _is_empty_value(value: Any) -> bool:
+    return value is None or value == "" or value == [] or value == {}
 
 
 def _coerce_mapped_value(value: Any, value_type: str) -> Any:
@@ -3958,26 +4124,55 @@ def _coerce_mapped_value(value: Any, value_type: str) -> Any:
 
 
 def _get_path(value: Any, path: str, default: Any = None) -> Any:
-    current = value
-    for part in [item for item in str(path or "").split(".") if item]:
-        if isinstance(current, dict):
-            if part not in current:
-                return default
-            current = current.get(part)
-        elif isinstance(current, list) and part.isdigit():
-            index = int(part)
-            if index < 0 or index >= len(current):
-                return default
-            current = current[index]
-        else:
-            return default
-    return current
+    parts = [item for item in str(path or "").split(".") if item]
+    if not parts:
+        return value
+    resolved = _get_path_parts(value, parts)
+    return default if resolved is _MISSING else resolved
+
+
+def _get_path_parts(value: Any, parts: list[str]) -> Any:
+    if not parts:
+        return value
+    part = parts[0]
+    if part.endswith("[]"):
+        key = part[:-2]
+        collection = _get_path_part(value, key) if key else value
+        if not isinstance(collection, list):
+            return []
+        values: list[Any] = []
+        for item in collection:
+            child = _get_path_parts(item, parts[1:])
+            if child is _MISSING:
+                continue
+            if isinstance(child, list):
+                values.extend(child)
+            else:
+                values.append(child)
+        return values
+    next_value = _get_path_part(value, part)
+    if next_value is _MISSING:
+        return _MISSING
+    return _get_path_parts(next_value, parts[1:])
+
+
+def _get_path_part(value: Any, part: str) -> Any:
+    if part == "":
+        return value
+    if isinstance(value, dict):
+        return value.get(part, _MISSING)
+    if isinstance(value, list) and part.isdigit():
+        index = int(part)
+        return value[index] if 0 <= index < len(value) else _MISSING
+    return _MISSING
 
 
 def _set_path(target: dict[str, Any], path: str, value: Any, base: dict[str, Any] | None = None) -> None:
     parts = [item for item in str(path or "").split(".") if item]
     if not parts:
         return
+    if any(part.endswith("[]") for part in parts):
+        raise RuntimeError(f"写入路径不支持数组通配：{path}")
     if len(parts) == 1:
         target[parts[0]] = value
         return
@@ -3996,6 +4191,50 @@ def _set_path(target: dict[str, Any], path: str, value: Any, base: dict[str, Any
             current[part] = child
         current = child
     current[parts[-1]] = value
+
+
+def _pick_paths(value: Any, paths: list[str]) -> Any:
+    if not paths:
+        return value
+    result: dict[str, Any] = {}
+    for path in paths:
+        picked = _get_path(value, path, _MISSING)
+        if picked is _MISSING:
+            continue
+        _set_path(result, path.replace("[].", "."), picked)
+    return result
+
+
+def _omit_paths(value: Any, paths: list[str]) -> Any:
+    try:
+        result = json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except TypeError:
+        return value
+    for path in paths:
+        _delete_path(result, path)
+    return result
+
+
+def _delete_path(value: Any, path: str) -> None:
+    parts = [item for item in str(path or "").split(".") if item]
+    if not parts:
+        return
+    current = value
+    for part in parts[:-1]:
+        if isinstance(current, dict):
+            current = current.get(part)
+        elif isinstance(current, list) and part.isdigit():
+            index = int(part)
+            current = current[index] if 0 <= index < len(current) else None
+        else:
+            return
+    leaf = parts[-1]
+    if isinstance(current, dict):
+        current.pop(leaf, None)
+    elif isinstance(current, list) and leaf.isdigit():
+        index = int(leaf)
+        if 0 <= index < len(current):
+            current.pop(index)
 
 
 def _run_for_each_node(
@@ -4165,7 +4404,14 @@ def _run_variable_assign(assignments: list[dict[str, Any]], inputs: dict[str, An
         source_type = str(raw.get("sourceType") or raw.get("source_type") or "template").strip().lower()
         source = str(raw.get("source") if raw.get("source") is not None else raw.get("value") if raw.get("value") is not None else "")
         value_type = str(raw.get("valueType") or raw.get("value_type") or "auto")
-        value = inputs.get(source) if source_type == "input" else _resolve_mapping_value(source_type, source, value_type, {**dict(state), **delta})
+        transform = str(raw.get("transform") or "none").strip().lower()
+        transform_args = _render_transform_args(raw.get("transformArgsJson") or raw.get("transform_args_json"), {**dict(state), **delta})
+        if source_type == "input":
+            value = inputs.get(source)
+            value = _apply_mapping_transform(value, transform, transform_args, {**dict(state), **delta})
+            value = _coerce_mapped_value(value, value_type)
+        else:
+            value = _resolve_mapping_value(source_type, source, value_type, {**dict(state), **delta}, transform, transform_args)
         previous = _get_path({**dict(state), **delta}, target)
         if operation == "clear":
             next_value = None
@@ -4198,6 +4444,16 @@ def _validate_json_value(value: Any, schema: dict[str, Any], path: str) -> list[
         return [f"{path} expected {expected_type}, got {type(value).__name__}"]
     if "enum" in schema and isinstance(schema.get("enum"), list) and value not in schema["enum"]:
         errors.append(f"{path} must be one of {schema['enum']}")
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list) and any_of:
+        if not any(_schema_condition_matches(value, item) for item in any_of if isinstance(item, dict)):
+            errors.append(f"{path} must satisfy at least one anyOf condition")
+    if expected_type == "array" and isinstance(value, list):
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict) and item_schema:
+            for index, item in enumerate(value):
+                errors.extend(_validate_json_value(item, item_schema, f"{path}[{index}]"))
+        return errors
     if expected_type != "object" or not isinstance(value, dict):
         return errors
     properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
@@ -4211,6 +4467,18 @@ def _validate_json_value(value: Any, schema: dict[str, Any], path: str) -> list[
         if isinstance(property_schema, dict):
             errors.extend(_validate_json_value(value.get(key), property_schema, f"{path}.{key}"))
     return errors
+
+
+def _schema_condition_matches(value: Any, schema: dict[str, Any]) -> bool:
+    if not isinstance(value, dict):
+        return False
+    required = {str(item) for item in schema.get("required", []) if str(item)}
+    for key in required:
+        if key not in value or value.get(key) in (None, ""):
+            return False
+    if schema.get("properties") or schema.get("type"):
+        return not _validate_json_value(value, {**schema, "anyOf": []}, "$")
+    return True
 
 
 def _json_type_matches(value: Any, expected_type: str) -> bool:
@@ -4234,6 +4502,30 @@ def _json_extractor_system_prompt(instruction: str, schema: dict[str, Any]) -> s
     if instruction.strip():
         prompt += "\\n\\n抽取说明：\\n" + instruction.strip()
     return prompt + "\\n\\nJSON Schema：\\n" + json.dumps(schema, ensure_ascii=False, indent=2)
+
+
+def _repair_json_output(model_ref: Any, instruction: str, value: Any, schema: dict[str, Any], errors: list[str], source_text: str, raw_content: str = "") -> dict[str, Any]:
+    system_prompt = "你是 JSON Repair。请把候选内容修复为严格符合 JSON Schema 的 JSON object。只输出 JSON object，不要输出 Markdown 或解释。不要编造与输入无关的信息。"
+    if instruction.strip():
+        system_prompt += "\\n\\n修复说明：\\n" + instruction.strip()
+    system_prompt += "\\n\\nJSON Schema：\\n" + json.dumps(schema, ensure_ascii=False, indent=2)
+    payload = {"validationErrors": errors, "candidate": value, "rawContent": raw_content, "sourceText": source_text}
+    response = model_ref.invoke([
+        ("system", system_prompt),
+        ("user", "请修复以下 JSON 候选内容：\\n" + json.dumps(payload, ensure_ascii=False, default=str, indent=2)),
+    ])
+    response_content = getattr(response, "content", str(response))
+    result: dict[str, Any] = {"attempted": True, "ok": False, "errors": list(errors), "before": _compact_value(value), "raw": _compact_value(response_content)}
+    try:
+        repaired = _parse_json_object_from_text(response_content)
+    except RuntimeError as exc:
+        result["errors"] = [*list(errors), str(exc)]
+        return result
+    validation = _validation_result(repaired, schema)
+    result.update({"ok": validation["valid"], "output": repaired, "validation": validation, "after": _compact_value(repaired)})
+    if not validation["valid"]:
+        result["errors"] = validation["errors"]
+    return result
 
 
 def _last_message_content(value: Any) -> str:
@@ -4766,6 +5058,35 @@ def _json_object_list(value: Any) -> list[dict[str, Any]]:
     return [item for item in _json_list(value) if isinstance(item, dict)]
 
 
+def _json_schema_from_config(config: dict[str, Any]) -> dict[str, Any]:
+    if str(config.get("schemaPreset") or "").strip() == "task_plan_v1":
+        return _task_plan_json_schema()
+    return _json_schema_from_fields(config.get("schemaFieldsJson"))
+
+
+def _task_plan_json_schema() -> dict[str, Any]:
+    task_item = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "可选任务 ID；不填时自动生成 task_1、task_2。"},
+            "title": {"type": "string", "description": "任务标题，简短可扫描。"},
+            "goal": {"type": "string", "description": "Worker 需要完成的具体目标。"},
+            "description": {"type": "string", "description": "goal 的别名；仅在 goal 为空时使用。"},
+            "targetFiles": {"type": "array", "items": {"type": "string"}, "description": "建议优先读取的文件路径。"},
+            "suggestedTools": {"type": "array", "items": {"type": "string"}, "description": "建议 Worker 使用的工具名。"},
+        },
+        "anyOf": [{"required": ["title"]}, {"required": ["goal"]}],
+        "additionalProperties": True,
+    }
+    return {
+        "type": "object",
+        "properties": {"tasks": {"type": "array", "items": task_item, "description": "Task Splitter 可直接解析的任务数组。"}},
+        "required": ["tasks"],
+        "additionalProperties": True,
+        "x-graphic-preset": "task_plan_v1",
+    }
+
+
 def _json_schema_from_fields(value: Any) -> dict[str, Any]:
     properties: dict[str, Any] = {}
     required: list[str] = []
@@ -4773,21 +5094,7 @@ def _json_schema_from_fields(value: Any) -> dict[str, Any]:
         name = str(field.get("name") or "").strip()
         if not name:
             continue
-        field_type = str(field.get("type") or "string").strip().lower()
-        if field_type not in {"string", "number", "integer", "boolean", "object", "array"}:
-            field_type = "string"
-        schema: dict[str, Any] = {"type": field_type}
-        description = str(field.get("description") or "").strip()
-        if description:
-            schema["description"] = description
-        enum_values = _enum_values(field.get("enumValues") or field.get("enum_values"))
-        if enum_values:
-            schema["enum"] = enum_values
-        default_value = _field_default_value(field.get("defaultValue"))
-        if default_value is not None:
-            schema["default"] = default_value
-        if field_type == "array":
-            schema.setdefault("items", {})
+        schema = _json_schema_for_field(field)
         properties[name] = schema
         if str(field.get("required") or "").strip().lower() in {"1", "true", "yes", "on"} or field.get("required") is True:
             required.append(name)
@@ -4795,6 +5102,38 @@ def _json_schema_from_fields(value: Any) -> dict[str, Any]:
     if required:
         result["required"] = required
     return result
+
+
+def _json_schema_for_field(field: dict[str, Any]) -> dict[str, Any]:
+    field_type = str(field.get("type") or "string").strip().lower()
+    if field_type not in {"string", "number", "integer", "boolean", "object", "array"}:
+        field_type = "string"
+    schema: dict[str, Any] = {"type": field_type}
+    description = str(field.get("description") or "").strip()
+    if description:
+        schema["description"] = description
+    enum_values = _enum_values(field.get("enumValues") or field.get("enum_values"))
+    if enum_values:
+        schema["enum"] = enum_values
+    default_value = _field_default_value(field.get("defaultValue"))
+    if default_value is not None:
+        schema["default"] = default_value
+    if field_type == "object":
+        child_schema = _json_schema_from_fields(field.get("children") or field.get("fields"))
+        schema["properties"] = child_schema.get("properties", {})
+        if child_schema.get("required"):
+            schema["required"] = child_schema["required"]
+        schema["additionalProperties"] = True
+    if field_type == "array":
+        item_fields = _json_object_list(field.get("itemFields") or field.get("item_fields"))
+        item_type = str(field.get("itemType") or field.get("item_type") or "").strip().lower()
+        if item_fields:
+            schema["items"] = _json_schema_from_fields(item_fields)
+        elif item_type in {"string", "number", "integer", "boolean", "object", "array"}:
+            schema["items"] = {"type": item_type}
+        else:
+            schema["items"] = {}
+    return schema
 
 
 def _enum_values(value: Any) -> list[str]:
@@ -4816,6 +5155,12 @@ def _field_default_value(value: Any) -> Any:
         return json.loads(text)
     except ValueError:
         return text
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled", "approve", "auto"}
 
 
 def _parse_json_object(value: str) -> dict[str, Any]:

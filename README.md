@@ -36,3 +36,14 @@ npm run dev
 
 - 模拟运行：不调用模型或外部接口，只模拟路径、state 写入和分支选择。
 - 真实运行：v1 支持 LLM、Retriever、Condition / AI Router 和 Direct Reply；需要先安装后端开发依赖，并配置对应模型供应商的环境变量，例如 `OPENAI_API_KEY`。
+
+## Workflow Core 数据塑形
+
+Workspace 已支持 `Variable Assign`、`Template`、`JSON Extractor`、`JSON Validator` 数据塑形节点。v2 增强点包括：
+
+- 字段路径选择与预览：可从 State、节点输出和运行历史中选择字段，支持 `a.b.0` 与 `tasks[].goal`。
+- 输入映射轻量转换：支持 `default/coalesce/split/join/pick/omit`。
+- Task Plan 预设：`schemaPreset=task_plan_v1` 可生成 Task Splitter 可消费的 `{ "tasks": [...] }`。
+- 校验修复：Extractor / Validator 可在校验失败时调用模型修复一次，并写入 `repair_result`。
+
+内置模板「结构化任务并行 Worker」演示了 `JSON Extractor -> JSON Validator/Task Splitter -> Parallel Tools` 的基本闭环。

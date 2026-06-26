@@ -1077,6 +1077,153 @@ def test_json_validator_invalid_branch_is_business_route():
     assert state["final_answer"] == "invalid"
 
 
+def test_workflow_core_v2_paths_transforms_and_task_plan_preset():
+    project = create_default_project("Workflow Core v2")
+    project.state.fields.extend(
+        [
+            StateField(name="joined_titles", type="str"),
+            StateField(name="fallback_value", type="str"),
+            StateField(name="picked_profile", type="dict"),
+            StateField(name="task_validation", type="dict"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="assign",
+                type=NodeType.VARIABLE_ASSIGN,
+                label="Assign",
+                config={
+                    "assignmentsJson": json.dumps(
+                        [
+                            {
+                                "target": "joined_titles",
+                                "operation": "overwrite",
+                                "sourceType": "state",
+                                "source": "task_plan.tasks[].title",
+                                "transform": "join",
+                                "transformArgsJson": '{"separator": ","}',
+                                "valueType": "string",
+                            },
+                            {
+                                "target": "fallback_value",
+                                "operation": "overwrite",
+                                "sourceType": "state",
+                                "source": "missing",
+                                "transform": "coalesce",
+                                "transformArgsJson": '{"candidates":[{"sourceType":"state","source":"messages"},"fallback"]}',
+                                "valueType": "string",
+                            },
+                            {
+                                "target": "picked_profile",
+                                "operation": "overwrite",
+                                "sourceType": "state",
+                                "source": "profile",
+                                "transform": "pick",
+                                "transformArgsJson": '{"paths":["name"]}',
+                                "valueType": "json",
+                            },
+                        ]
+                    ),
+                    "resultField": "assignment_result",
+                },
+            ),
+            NodeIR(
+                id="validator",
+                type=NodeType.JSON_VALIDATOR,
+                label="Validator",
+                config={"inputField": "task_plan", "schemaPreset": "task_plan_v1", "validationField": "task_validation", "outputField": "validated_plan"},
+            ),
+        ]
+    )
+    project.edges.extend([EdgeIR(id="e1", source="start", target="assign"), EdgeIR(id="e2", source="assign", target="validator")])
+
+    _trace, state = preview.run_project_preview(
+        project,
+        {
+            "messages": "from message",
+            "profile": {"name": "Ada", "secret": "hidden"},
+            "task_plan": {"tasks": [{"title": "分析入口"}, {"goal": "阅读后端"}]},
+        },
+        "live",
+    )
+
+    assert state["joined_titles"] == "分析入口"
+    assert state["fallback_value"] == "from message"
+    assert state["picked_profile"] == {"name": "Ada"}
+    assert state["task_validation"]["valid"] is True
+
+
+def test_json_validator_repair_success_overwrites_output(monkeypatch):
+    calls = []
+
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        calls.append(messages)
+        return FakeResponse(json.dumps({"tasks": [{"goal": "修复后的任务"}]}, ensure_ascii=False))
+
+    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+
+    project = create_default_project("Validator Repair")
+    project.nodes.append(
+        NodeIR(
+            id="validator",
+            type=NodeType.JSON_VALIDATOR,
+            label="Validator",
+            config={
+                "inputField": "candidate",
+                "schemaPreset": "task_plan_v1",
+                "repairEnabled": True,
+                "outputField": "validated_json",
+                "validationField": "validation_result",
+                "repairResultField": "repair_result",
+            },
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="validator"))
+
+    trace, state = preview.run_project_preview(project, {"candidate": {"tasks": [{"targetFiles": ["x.py"]}]}}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert len(calls) == 1
+    assert state["validation_result"]["valid"] is True
+    assert state["validated_json"]["tasks"][0]["goal"] == "修复后的任务"
+    assert state["repair_result"]["ok"] is True
+
+
+def test_json_extractor_non_json_repair_failure_routes_invalid(monkeypatch):
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        return FakeResponse("still not json")
+
+    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+
+    project = create_default_project("Extractor Repair Failure")
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="extract",
+                type=NodeType.JSON_EXTRACTOR,
+                label="Extractor",
+                config={
+                    "schemaPreset": "task_plan_v1",
+                    "repairEnabled": True,
+                    "outputField": "extracted_json",
+                    "validationField": "validation_result",
+                    "repairResultField": "repair_result",
+                },
+                outputs=[{"id": "valid", "type": "condition", "label": "valid"}, {"id": "invalid", "type": "condition", "label": "invalid"}],
+            ),
+            NodeIR(id="reply_invalid", type=NodeType.DIRECT_REPLY, label="Invalid", config={"template": "invalid", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend([EdgeIR(id="e1", source="start", target="extract"), EdgeIR(id="e2", source="extract", target="reply_invalid", kind=EdgeKind.CONDITIONAL, sourceHandle="invalid")])
+
+    trace, state = preview.run_project_preview(project, {"messages": "拆任务"}, "live")
+
+    assert [item["nodeId"] for item in trace] == ["extract", "reply_invalid"]
+    assert state["validation_result"]["valid"] is False
+    assert state["repair_result"]["ok"] is False
+
+
 def test_for_each_runs_item_chain_and_merge_reducers_isolated():
     project = create_default_project("ForEach Merge")
     project.state.fields.extend(

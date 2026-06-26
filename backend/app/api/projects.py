@@ -16,7 +16,12 @@ from app.ir.validation import validate_project
 from app.project_store import project_path, read_project, write_project
 from app.run_store import clear_run_records, delete_run_record, list_run_records, save_run_record
 from app.runtime_environment import RuntimeEnvironmentConfig, resolve_runtime_environment
-from app.runner import iter_project_preview_events, run_project_preview as run_project_preview_engine
+from app.runner import (
+    collect_data_shaping_paths,
+    iter_project_preview_events,
+    preview_data_shaping_node,
+    run_project_preview as run_project_preview_engine,
+)
 
 
 router = APIRouter(prefix="/api", tags=["projects"])
@@ -70,6 +75,18 @@ class RunPreviewRequest(BaseModel):
     mode: Literal["dry", "live"] = "dry"
     modelConfig: RunModelConfig | None = None
     runtimeEnvironment: RuntimeEnvironmentConfig | None = None
+
+
+class DataShapingPathsRequest(BaseModel):
+    runId: str = ""
+    state: dict[str, Any] = Field(default_factory=dict)
+
+
+class DataShapingPreviewRequest(BaseModel):
+    nodeId: str
+    runId: str = ""
+    state: dict[str, Any] = Field(default_factory=dict)
+    modelConfig: RunModelConfig | None = None
 
 
 class RunTraceItem(BaseModel):
@@ -217,6 +234,31 @@ def run_project_preview(project_id: str, payload: RunPreviewRequest | None = Non
     )
 
 
+@router.post("/projects/{project_id}/data-shaping/paths")
+def list_project_data_shaping_paths(project_id: str, payload: DataShapingPathsRequest | None = None) -> dict[str, Any]:
+    project = read_project(project_id)
+    request = payload or DataShapingPathsRequest()
+    run_record = _find_run_record(project_id, request.runId)
+    return {
+        "paths": collect_data_shaping_paths(project, request.state, run_record),
+    }
+
+
+@router.post("/projects/{project_id}/data-shaping/preview")
+def preview_project_data_shaping(project_id: str, payload: DataShapingPreviewRequest) -> dict[str, Any]:
+    project = read_project(project_id)
+    run_record = _find_run_record(project_id, payload.runId)
+    state = payload.state or _output_state_from_run_record(run_record)
+    result = preview_data_shaping_node(
+        project,
+        payload.nodeId,
+        state,
+        payload.modelConfig.model_dump(by_alias=True) if payload.modelConfig else None,
+    )
+    result["paths"] = collect_data_shaping_paths(project, state, run_record)
+    return result
+
+
 @router.get("/projects/{project_id}/runs")
 def list_project_runs(project_id: str) -> list[dict[str, Any]]:
     read_project(project_id)
@@ -239,6 +281,23 @@ def delete_project_run(project_id: str, run_id: str) -> None:
 def clear_project_runs(project_id: str) -> None:
     read_project(project_id)
     clear_run_records(project_id)
+
+
+def _find_run_record(project_id: str, run_id: str) -> dict[str, Any] | None:
+    if not run_id:
+        return None
+    for record in list_run_records(project_id):
+        if str(record.get("id") or "") == run_id:
+            return record
+    return None
+
+
+def _output_state_from_run_record(record: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        return {}
+    result = record.get("result") if isinstance(record.get("result"), dict) else {}
+    output_state = result.get("outputState") if isinstance(result.get("outputState"), dict) else {}
+    return dict(output_state)
 
 
 @router.post("/projects/{project_id}/run/stream")

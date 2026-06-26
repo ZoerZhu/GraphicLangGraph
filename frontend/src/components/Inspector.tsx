@@ -1,8 +1,8 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { Plus, RefreshCw, Trash2, X } from "lucide-react";
-import { inspectWorkspaceMcpServer } from "../lib/api";
+import { inspectWorkspaceMcpServer, listDataShapingPaths, previewDataShapingNode } from "../lib/api";
 import { useProjectStore } from "../store/projectStore";
-import type { ImportedAgentConfig, MCPServerConfig, McpInspectResult, McpToolInspection, ModelConfig, NodeIR, ProjectListItem, RagKnowledgeBaseConfig, ResourceGroupConfig, SkillConfig, StateField, ToolConfig } from "../types";
+import type { DataShapingPath, DataShapingPreviewResult, ImportedAgentConfig, MCPServerConfig, McpInspectResult, McpToolInspection, ModelConfig, NodeIR, ProjectListItem, RagKnowledgeBaseConfig, ResourceGroupConfig, SkillConfig, StateField, ToolConfig } from "../types";
 import { FloatingPanel } from "./FloatingPanel";
 
 export function Inspector() {
@@ -17,6 +17,10 @@ export function Inspector() {
   const workspaceModelConfigs = useProjectStore((state) => state.workspaceModelConfigs);
   const workspaceRagKnowledgeBases = useProjectStore((state) => state.workspaceRagKnowledgeBases);
   const workspaceResourceGroups = useProjectStore((state) => state.workspaceResourceGroups);
+  const runInput = useProjectStore((state) => state.runInput);
+  const runHistoryRecords = useProjectStore((state) => state.runHistoryRecords);
+  const selectedRunHistoryId = useProjectStore((state) => state.selectedRunHistoryId);
+  const selectedRunModelConfigId = useProjectStore((state) => state.selectedRunModelConfigId);
   const updateNode = useProjectStore((state) => state.updateNode);
   const updateNodeConfig = useProjectStore((state) => state.updateNodeConfig);
   const updateSkills = useProjectStore((state) => state.updateSkills);
@@ -24,6 +28,9 @@ export function Inspector() {
   const setStateFields = useProjectStore((state) => state.setStateFields);
   const [mcpInspecting, setMcpInspecting] = useState(false);
   const [mcpInspectResult, setMcpInspectResult] = useState<McpInspectResult | null>(null);
+  const [dataPaths, setDataPaths] = useState<DataShapingPath[]>([]);
+  const [dataPreview, setDataPreview] = useState<DataShapingPreviewResult | null>(null);
+  const [dataPreviewing, setDataPreviewing] = useState(false);
 
   const node = useMemo(
     () => project?.nodes.find((item) => item.id === selectedNodeId) ?? null,
@@ -56,6 +63,10 @@ export function Inspector() {
     [availableAgents, availableImportedAgents],
   );
   const availableModelConfigs = useMemo(() => buildModelConfigOptions(workspaceModelConfigs), [workspaceModelConfigs]);
+  const selectedRunModelConfig = useMemo(
+    () => workspaceModelConfigs.find((config) => config.id === selectedRunModelConfigId && config.enabled),
+    [selectedRunModelConfigId, workspaceModelConfigs],
+  );
   const availableRagKnowledgeBases = useMemo(() => workspaceRagKnowledgeBases.filter((item) => item.enabled), [workspaceRagKnowledgeBases]);
   const detectedStateFields = useMemo(() => detectStateFieldsFromNodes(project?.nodes ?? []), [project?.nodes]);
   const resourceInspector = Boolean(node && ["agent", "tool", "parallel_tools", "mcp_node"].includes(node.type));
@@ -158,6 +169,36 @@ export function Inspector() {
       });
     } finally {
       setMcpInspecting(false);
+    }
+  }
+
+  async function refreshDataShapingPaths() {
+    if (!project) return;
+    const runId = selectedRunHistoryId ?? runHistoryRecords[0]?.id ?? "";
+    const result = await listDataShapingPaths(project.project.id, parseJsonRecord(runInput), runId);
+    setDataPaths(result.paths);
+  }
+
+  async function previewDataShaping(targetNode: NodeIR) {
+    if (!project) return;
+    setDataPreviewing(true);
+    try {
+      const runId = selectedRunHistoryId ?? runHistoryRecords[0]?.id ?? "";
+      const result = await previewDataShapingNode(project.project.id, targetNode.id, parseJsonRecord(runInput), runId, selectedRunModelConfig);
+      setDataPreview(result);
+      if (result.paths) setDataPaths(result.paths);
+    } catch (error) {
+      setDataPreview({
+        ok: false,
+        nodeId: targetNode.id,
+        nodeType: targetNode.type,
+        inputs: {},
+        delta: {},
+        detail: "",
+        errors: [error instanceof Error ? error.message : "预览失败"],
+      });
+    } finally {
+      setDataPreviewing(false);
     }
   }
 
@@ -501,15 +542,26 @@ export function Inspector() {
           </Field>
         </InspectorSplit>
       )}
+      {isDataShapingNode(node.type) && (
+        <DataShapingPreviewControls
+          paths={dataPaths}
+          preview={dataPreview?.nodeId === node.id ? dataPreview : null}
+          previewing={dataPreviewing}
+          onRefresh={() => void refreshDataShapingPaths()}
+          onPreview={() => void previewDataShaping(node)}
+        />
+      )}
       {node.type === "variable_assign" && (
         <>
           <InputMappingsEditor
             value={node.config.inputMappingsJson}
             onChange={(value) => updateNodeConfig(node.id, { inputMappingsJson: value })}
+            paths={dataPaths}
           />
           <AssignmentsEditor
             value={node.config.assignmentsJson}
             onChange={(value) => updateNodeConfig(node.id, { assignmentsJson: value })}
+            paths={dataPaths}
           />
           <Field label="赋值摘要字段">
             <input
@@ -524,6 +576,7 @@ export function Inspector() {
           <InputMappingsEditor
             value={node.config.inputMappingsJson}
             onChange={(value) => updateNodeConfig(node.id, { inputMappingsJson: value })}
+            paths={dataPaths}
           />
           <Field label="模板">
             <textarea
@@ -565,7 +618,14 @@ export function Inspector() {
           <InputMappingsEditor
             value={node.config.inputMappingsJson}
             onChange={(value) => updateNodeConfig(node.id, { inputMappingsJson: value })}
+            paths={dataPaths}
           />
+          <Field label="Schema 预设">
+            <select value={String(node.config.schemaPreset ?? "")} onChange={(event) => updateNodeConfig(node.id, { schemaPreset: event.target.value })}>
+              <option value="">自定义 Schema</option>
+              <option value="task_plan_v1">Task Plan v1</option>
+            </select>
+          </Field>
           <Field label="输入文本模板">
             <textarea
               rows={3}
@@ -584,6 +644,7 @@ export function Inspector() {
             value={node.config.schemaFieldsJson}
             onChange={(value) => updateNodeConfig(node.id, { schemaFieldsJson: value })}
           />
+          <RepairFields node={node} updateNodeConfig={updateNodeConfig} />
           <div className="inline-grid">
             <Field label="输出字段">
               <input
@@ -597,6 +658,12 @@ export function Inspector() {
                 onChange={(event) => updateNodeConfig(node.id, { validationField: event.target.value })}
               />
             </Field>
+            <Field label="修复结果字段">
+              <input
+                value={String(node.config.repairResultField ?? "repair_result")}
+                onChange={(event) => updateNodeConfig(node.id, { repairResultField: event.target.value })}
+              />
+            </Field>
           </div>
         </>
       )}
@@ -608,10 +675,30 @@ export function Inspector() {
               onChange={(event) => updateNodeConfig(node.id, { inputField: event.target.value })}
             />
           </Field>
+          <Field label="Schema 预设">
+            <select value={String(node.config.schemaPreset ?? "")} onChange={(event) => updateNodeConfig(node.id, { schemaPreset: event.target.value })}>
+              <option value="">自定义 Schema</option>
+              <option value="task_plan_v1">Task Plan v1</option>
+            </select>
+          </Field>
           <SchemaFieldsEditor
             value={node.config.schemaFieldsJson}
             onChange={(value) => updateNodeConfig(node.id, { schemaFieldsJson: value })}
           />
+          {Boolean(node.config.repairEnabled) ? (
+            <ModelSelectionFields
+              config={node.config}
+              defaultModel="gpt-4.1-mini"
+              defaultProvider="openai"
+              modelConfigs={availableModelConfigs}
+              nodeId={node.id}
+              providerLabel="修复模型配置"
+              providerManualLabel="修复模型供应商"
+              providerNote="仅在校验失败且开启修复时调用模型。"
+              updateNodeConfig={updateNodeConfig}
+            />
+          ) : null}
+          <RepairFields node={node} updateNodeConfig={updateNodeConfig} />
           <div className="inline-grid">
             <Field label="输出字段">
               <input
@@ -623,6 +710,12 @@ export function Inspector() {
               <input
                 value={String(node.config.validationField ?? "validation_result")}
                 onChange={(event) => updateNodeConfig(node.id, { validationField: event.target.value })}
+              />
+            </Field>
+            <Field label="修复结果字段">
+              <input
+                value={String(node.config.repairResultField ?? "repair_result")}
+                onChange={(event) => updateNodeConfig(node.id, { repairResultField: event.target.value })}
               />
             </Field>
           </div>
@@ -1279,11 +1372,101 @@ export function Inspector() {
   );
 }
 
-function InputMappingsEditor({ value, onChange }: { value: unknown; onChange: (value: string) => void }) {
+function DataShapingPreviewControls({
+  paths,
+  preview,
+  previewing,
+  onRefresh,
+  onPreview,
+}: {
+  paths: DataShapingPath[];
+  preview: DataShapingPreviewResult | null;
+  previewing: boolean;
+  onRefresh: () => void;
+  onPreview: () => void;
+}) {
+  return (
+    <section className="config-preview">
+      <div className="config-table__head">
+        <span>数据预览</span>
+        <span className="history-record__actions">
+          <button type="button" onClick={onRefresh}>
+            <RefreshCw size={14} />
+            刷新字段
+          </button>
+          <button type="button" disabled={previewing} onClick={onPreview}>
+            <RefreshCw size={14} />
+            {previewing ? "预览中" : "预览节点"}
+          </button>
+        </span>
+      </div>
+      <small className="model-config-note">字段来源：State 声明、节点输出、当前或选中运行历史。已发现 {paths.length} 个路径。</small>
+      {preview ? (
+        <RuntimePreviewBlock value={preview} />
+      ) : null}
+    </section>
+  );
+}
+
+function RuntimePreviewBlock({ value }: { value: DataShapingPreviewResult }) {
+  const shown = {
+    ok: value.ok,
+    detail: value.detail,
+    errors: value.errors,
+    inputs: value.inputs,
+    delta: value.delta,
+    validation: value.validation,
+    repair: value.repair,
+  };
+  return <pre className="code-preview">{JSON.stringify(shown, null, 2)}</pre>;
+}
+
+function RepairFields({ node, updateNodeConfig }: { node: NodeIR; updateNodeConfig: (nodeId: string, patch: Record<string, unknown>) => void }) {
+  return (
+    <>
+      <Field label="校验失败自动修复">
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={Boolean(node.config.repairEnabled)}
+            onChange={(event) => updateNodeConfig(node.id, { repairEnabled: event.target.checked })}
+          />
+          <span>失败时调用模型尝试修复一次</span>
+        </label>
+      </Field>
+      <Field label="修复说明">
+        <textarea
+          rows={3}
+          value={String(node.config.repairInstruction ?? "")}
+          onChange={(event) => updateNodeConfig(node.id, { repairInstruction: event.target.value })}
+        />
+      </Field>
+    </>
+  );
+}
+
+function PathDatalist({ id, paths }: { id: string; paths: DataShapingPath[] }) {
+  return (
+    <datalist id={id}>
+      {paths.slice(0, 200).map((item) => (
+        <option key={`${item.source}:${item.path}`} value={item.path}>
+          {item.type} · {item.source}
+        </option>
+      ))}
+    </datalist>
+  );
+}
+
+function isDataShapingNode(type: string) {
+  return ["variable_assign", "template", "json_extractor", "json_validator"].includes(type);
+}
+
+function InputMappingsEditor({ value, onChange, paths = [] }: { value: unknown; onChange: (value: string) => void; paths?: DataShapingPath[] }) {
   const rows = parseObjectList(value);
   const updateRow = (index: number, patch: Record<string, unknown>) => onChange(stringifyObjectList(rows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row))));
   const addRow = () => onChange(stringifyObjectList([...rows, { name: "input", sourceType: "state", source: "messages", valueType: "string" }]));
   const removeRow = (index: number) => onChange(stringifyObjectList(rows.filter((_row, rowIndex) => rowIndex !== index)));
+  const listId = "data-shaping-paths";
   return (
     <div className="config-table">
       <div className="config-table__head">
@@ -1302,7 +1485,7 @@ function InputMappingsEditor({ value, onChange }: { value: unknown; onChange: (v
             <option value="literal">literal</option>
             <option value="json">json</option>
           </select>
-          <input value={String(row.source ?? "")} onChange={(event) => updateRow(index, { source: event.target.value })} placeholder="messages 或 {{ state.messages }}" />
+          <input list={listId} value={String(row.source ?? "")} onChange={(event) => updateRow(index, { source: event.target.value })} placeholder="messages 或 {{ state.messages }}" />
           <select value={String(row.valueType ?? "auto")} onChange={(event) => updateRow(index, { valueType: event.target.value })}>
             <option value="auto">auto</option>
             <option value="string">string</option>
@@ -1311,21 +1494,33 @@ function InputMappingsEditor({ value, onChange }: { value: unknown; onChange: (v
             <option value="boolean">boolean</option>
             <option value="json">json</option>
           </select>
+          <select value={String(row.transform ?? "none")} onChange={(event) => updateRow(index, { transform: event.target.value })}>
+            <option value="none">none</option>
+            <option value="default">default</option>
+            <option value="coalesce">coalesce</option>
+            <option value="split">split</option>
+            <option value="join">join</option>
+            <option value="pick">pick</option>
+            <option value="omit">omit</option>
+          </select>
+          <input value={String(row.transformArgsJson ?? "")} onChange={(event) => updateRow(index, { transformArgsJson: event.target.value })} placeholder='{"separator":"\\n"}' />
           <button className="icon-only" type="button" onClick={() => removeRow(index)} title="删除映射">
             <Trash2 size={14} />
           </button>
         </div>
       ))}
+      <PathDatalist id={listId} paths={paths} />
       {rows.length === 0 ? <small className="model-config-note">未配置时节点仍可直接读取 state。</small> : null}
     </div>
   );
 }
 
-function AssignmentsEditor({ value, onChange }: { value: unknown; onChange: (value: string) => void }) {
+function AssignmentsEditor({ value, onChange, paths = [] }: { value: unknown; onChange: (value: string) => void; paths?: DataShapingPath[] }) {
   const rows = parseObjectList(value);
   const updateRow = (index: number, patch: Record<string, unknown>) => onChange(stringifyObjectList(rows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row))));
   const addRow = () => onChange(stringifyObjectList([...rows, { target: "assigned_value", operation: "overwrite", sourceType: "template", source: "{{ state.messages }}", valueType: "string" }]));
   const removeRow = (index: number) => onChange(stringifyObjectList(rows.filter((_row, rowIndex) => rowIndex !== index)));
+  const listId = "data-shaping-paths";
   return (
     <div className="config-table">
       <div className="config-table__head">
@@ -1351,7 +1546,7 @@ function AssignmentsEditor({ value, onChange }: { value: unknown; onChange: (val
             <option value="json">json</option>
             <option value="input">input</option>
           </select>
-          <input value={String(row.source ?? "")} onChange={(event) => updateRow(index, { source: event.target.value })} placeholder="source" />
+          <input list={listId} value={String(row.source ?? "")} onChange={(event) => updateRow(index, { source: event.target.value })} placeholder="source" />
           <select value={String(row.valueType ?? "auto")} onChange={(event) => updateRow(index, { valueType: event.target.value })}>
             <option value="auto">auto</option>
             <option value="string">string</option>
@@ -1360,11 +1555,22 @@ function AssignmentsEditor({ value, onChange }: { value: unknown; onChange: (val
             <option value="boolean">boolean</option>
             <option value="json">json</option>
           </select>
+          <select value={String(row.transform ?? "none")} onChange={(event) => updateRow(index, { transform: event.target.value })}>
+            <option value="none">none</option>
+            <option value="default">default</option>
+            <option value="coalesce">coalesce</option>
+            <option value="split">split</option>
+            <option value="join">join</option>
+            <option value="pick">pick</option>
+            <option value="omit">omit</option>
+          </select>
+          <input value={String(row.transformArgsJson ?? "")} onChange={(event) => updateRow(index, { transformArgsJson: event.target.value })} placeholder='{"paths":["a.b"]}' />
           <button className="icon-only" type="button" onClick={() => removeRow(index)} title="删除赋值">
             <Trash2 size={14} />
           </button>
         </div>
       ))}
+      <PathDatalist id={listId} paths={paths} />
     </div>
   );
 }
@@ -1420,25 +1626,59 @@ function SchemaFieldsEditor({ value, onChange }: { value: unknown; onChange: (va
         </button>
       </div>
       {rows.map((row, index) => (
-        <div className="config-table__row config-table__row--schema" key={index}>
-          <input value={String(row.name ?? "")} onChange={(event) => updateRow(index, { name: event.target.value })} placeholder="字段名" />
-          <select value={String(row.type ?? "string")} onChange={(event) => updateRow(index, { type: event.target.value })}>
-            <option value="string">string</option>
-            <option value="number">number</option>
-            <option value="integer">integer</option>
-            <option value="boolean">boolean</option>
-            <option value="object">object</option>
-            <option value="array">array</option>
-          </select>
-          <label className="checkbox-row config-table__checkbox">
-            <input type="checkbox" checked={Boolean(row.required)} onChange={(event) => updateRow(index, { required: event.target.checked })} />
-            <span>必填</span>
-          </label>
-          <input value={String(row.description ?? "")} onChange={(event) => updateRow(index, { description: event.target.value })} placeholder="描述" />
-          <input value={String(row.enumValues ?? "")} onChange={(event) => updateRow(index, { enumValues: event.target.value })} placeholder="枚举，可选" />
-          <button className="icon-only" type="button" onClick={() => removeRow(index)} title="删除字段">
-            <Trash2 size={14} />
-          </button>
+        <div className="config-table__schema-row" key={index}>
+          <div className="config-table__row config-table__row--schema">
+            <input value={String(row.name ?? "")} onChange={(event) => updateRow(index, { name: event.target.value })} placeholder="字段名" />
+            <select value={String(row.type ?? "string")} onChange={(event) => updateRow(index, { type: event.target.value })}>
+              <option value="string">string</option>
+              <option value="number">number</option>
+              <option value="integer">integer</option>
+              <option value="boolean">boolean</option>
+              <option value="object">object</option>
+              <option value="array">array</option>
+            </select>
+            <label className="checkbox-row config-table__checkbox">
+              <input type="checkbox" checked={Boolean(row.required)} onChange={(event) => updateRow(index, { required: event.target.checked })} />
+              <span>必填</span>
+            </label>
+            <input value={String(row.description ?? "")} onChange={(event) => updateRow(index, { description: event.target.value })} placeholder="描述" />
+            <input value={String(row.enumValues ?? "")} onChange={(event) => updateRow(index, { enumValues: event.target.value })} placeholder="枚举，可选" />
+            <button className="icon-only" type="button" onClick={() => removeRow(index)} title="删除字段">
+              <Trash2 size={14} />
+            </button>
+          </div>
+          {String(row.type ?? "") === "array" ? (
+            <div className="inline-grid">
+              <Field label="数组元素类型">
+                <select value={String(row.itemType ?? "")} onChange={(event) => updateRow(index, { itemType: event.target.value })}>
+                  <option value="">自动</option>
+                  <option value="string">string</option>
+                  <option value="number">number</option>
+                  <option value="integer">integer</option>
+                  <option value="boolean">boolean</option>
+                  <option value="object">object</option>
+                </select>
+              </Field>
+              <Field label="数组对象字段 JSON">
+                <textarea
+                  rows={3}
+                  value={stringifyNestedFields(row.itemFields)}
+                  onChange={(event) => updateRow(index, { itemFields: parseNestedFields(event.target.value) })}
+                  placeholder='[{"name":"title","type":"string","required":true}]'
+                />
+              </Field>
+            </div>
+          ) : null}
+          {String(row.type ?? "") === "object" ? (
+            <Field label="对象子字段 JSON">
+              <textarea
+                rows={3}
+                value={stringifyNestedFields(row.children)}
+                onChange={(event) => updateRow(index, { children: parseNestedFields(event.target.value) })}
+                placeholder='[{"name":"name","type":"string"}]'
+              />
+            </Field>
+          ) : null}
         </div>
       ))}
       {rows.length === 0 ? <small className="model-config-note">至少添加一个字段，Extractor/Validator 才能校验输出。</small> : null}
@@ -1848,6 +2088,24 @@ function parseObjectList(value: unknown): Array<Record<string, unknown>> {
   }
 }
 
+function stringifyNestedFields(value: unknown): string {
+  const rows = parseObjectList(value);
+  return rows.length ? JSON.stringify(rows, null, 2) : "";
+}
+
+function parseNestedFields(value: string): Array<Record<string, unknown>> {
+  return parseObjectList(value);
+}
+
+function parseJsonRecord(value: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
 function parseMcpToolList(value: unknown): McpToolInspection[] {
   if (Array.isArray(value)) {
     return value.filter(isMcpToolInspection);
@@ -2009,10 +2267,12 @@ function detectStateFieldsFromNodes(nodes: NodeIR[]): DetectedStateField[] {
       case "json_extractor":
         fields.push(detectedFieldFromConfig(node, "outputField", "extracted_json", "dict", "JSON 抽取结果"));
         fields.push(detectedFieldFromConfig(node, "validationField", "validation_result", "dict", "JSON 校验结果"));
+        fields.push(detectedFieldFromConfig(node, "repairResultField", "repair_result", "dict", "JSON 修复结果"));
         break;
       case "json_validator":
         fields.push(detectedFieldFromConfig(node, "outputField", "validated_json", "dict", "JSON 校验输出"));
         fields.push(detectedFieldFromConfig(node, "validationField", "validation_result", "dict", "JSON 校验结果"));
+        fields.push(detectedFieldFromConfig(node, "repairResultField", "repair_result", "dict", "JSON 修复结果"));
         break;
       case "for_each":
         if (normalizeStateFieldName(node.config.resultField)) {

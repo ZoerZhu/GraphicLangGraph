@@ -373,6 +373,31 @@ export interface RunHistoryRecord {
   runtimeNodes: Record<string, NodeRuntimeState>;
 }
 
+export interface DataShapingPath {
+  path: string;
+  type: string;
+  source: string;
+  label: string;
+  value?: unknown;
+}
+
+export interface DataShapingPathsResult {
+  paths: DataShapingPath[];
+}
+
+export interface DataShapingPreviewResult {
+  ok: boolean;
+  nodeId: string;
+  nodeType: string;
+  inputs: Record<string, unknown>;
+  delta: Record<string, unknown>;
+  validation?: unknown;
+  repair?: unknown;
+  detail: string;
+  errors: string[];
+  paths?: DataShapingPath[];
+}
+
 export type RunHistoryReplayMode = "details" | "overlay";
 
 export interface RunHistoryGraphSnapshot {

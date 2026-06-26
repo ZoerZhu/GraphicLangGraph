@@ -2198,11 +2198,13 @@ function stateFieldsForNode(node: NodeIR): StateField[] {
       return [
         stateFieldFromConfig(config, "outputField", "extracted_json", "dict", `${node.label} 抽取结果`),
         stateFieldFromConfig(config, "validationField", "validation_result", "dict", `${node.label} 校验结果`),
+        stateFieldFromConfig(config, "repairResultField", "repair_result", "dict", `${node.label} 修复结果`),
       ];
     case "json_validator":
       return [
         stateFieldFromConfig(config, "outputField", "validated_json", "dict", `${node.label} 校验输出`),
         stateFieldFromConfig(config, "validationField", "validation_result", "dict", `${node.label} 校验结果`),
+        stateFieldFromConfig(config, "repairResultField", "repair_result", "dict", `${node.label} 修复结果`),
       ];
     case "for_each":
       return normalizeFieldName(config.resultField)

@@ -447,3 +447,28 @@ export const RunHistoryRecordSchema = z.object({
 });
 
 export const RunHistoryRecordListSchema = z.array(RunHistoryRecordSchema);
+
+export const DataShapingPathSchema = z.object({
+  path: z.string(),
+  type: z.string(),
+  source: z.string(),
+  label: z.string(),
+  value: z.unknown().optional(),
+});
+
+export const DataShapingPathsResultSchema = z.object({
+  paths: z.array(DataShapingPathSchema),
+});
+
+export const DataShapingPreviewResultSchema = z.object({
+  ok: z.boolean(),
+  nodeId: z.string(),
+  nodeType: z.string(),
+  inputs: z.record(z.unknown()),
+  delta: z.record(z.unknown()),
+  validation: z.unknown().optional().nullable(),
+  repair: z.unknown().optional().nullable(),
+  detail: z.string(),
+  errors: z.array(z.string()),
+  paths: z.array(DataShapingPathSchema).optional(),
+});
