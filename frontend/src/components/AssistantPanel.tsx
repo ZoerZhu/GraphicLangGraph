@@ -44,6 +44,12 @@ export function AssistantPanel() {
         }} type="button">
           客服工单
         </button>
+        <button onClick={() => {
+          setPrompt("帮我做一个并发任务处理流程，先校验结构化任务 JSON，再并发处理每个任务并汇总结果。");
+          setPreviewTemplateId(null);
+        }} type="button">
+          并发任务
+        </button>
         <button className="primary" onClick={() => setPreviewTemplateId(pickTemplateId(prompt))} type="button">
           <Send size={15} />
           <span>生成预览</span>
@@ -75,6 +81,7 @@ export function AssistantPanel() {
 function pickTemplateId(prompt: string) {
   const normalized = prompt.trim();
   if (/客服|售后|订单|退款/.test(normalized)) return "customer_support";
+  if (/并发|foreach|for each|任务处理|task plan|结构化任务|错误兜底|merge/i.test(normalized)) return "flow_control_task_processing";
   if (/知识库|问答|文档|rag|检索/i.test(normalized)) return "knowledge_qa";
   return "knowledge_qa";
 }

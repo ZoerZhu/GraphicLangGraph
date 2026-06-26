@@ -420,6 +420,86 @@ def test_codegen_exports_top_level_error_edge_routing():
     compile(graph_py, "graph.py", "exec")
 
 
+def test_codegen_exports_runtime_policy_helper_and_parallel_for_each():
+    project = create_default_project("Flow v2 Export")
+    project.state.fields.extend(
+        [
+            StateField(name="items", type="list"),
+            StateField(name="merged_results", type="list"),
+            StateField(name="merge_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="each_1",
+                type=NodeType.FOR_EACH,
+                label="ForEach",
+                config={
+                    "itemsField": "items",
+                    "itemField": "current_item",
+                    "indexField": "current_index",
+                    "executionMode": "parallel",
+                    "maxConcurrency": 2,
+                    "preserveOrder": True,
+                    "itemFailurePolicy": "collect_errors",
+                    "retryPolicyJson": json.dumps({"enabled": True, "maxRetries": 1, "backoffMs": 0}),
+                    "resultField": "for_each_result",
+                },
+            ),
+            NodeIR(id="template_1", type=NodeType.TEMPLATE, label="Template", config={"template": "{{ state.current_item }}", "outputType": "text", "outputField": "item_result"}),
+            NodeIR(id="merge_1", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_results }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each_1"),
+            EdgeIR(id="e2", source="each_1", target="template_1", sourceHandle="item"),
+            EdgeIR(id="e3", source="template_1", target="merge_1"),
+            EdgeIR(id="e4", source="merge_1", target="reply_1"),
+        ]
+    )
+
+    generated = generate_project_files(project)
+    nodes_py = next(value for path, value in generated.items() if path.endswith("/nodes.py"))
+
+    assert "_run_node_with_policy" in nodes_py
+    assert "def _glg_each_1_body" in nodes_py
+    assert '"parallel"' in nodes_py
+    assert '"collect_errors"' in nodes_py
+    assert "ThreadPoolExecutor" in nodes_py
+    compile(nodes_py, "nodes.py", "exec")
+
+
+def test_codegen_exports_branch_merge_mode():
+    project = create_default_project("Branch Merge Export")
+    project.state.fields.extend([StateField(name="branch_result", type="str"), StateField(name="merged_branch", type="str"), StateField(name="merge_result", type="dict"), StateField(name="final_answer", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(id="branch_template", type=NodeType.TEMPLATE, label="Branch", config={"template": "A", "outputType": "text", "outputField": "branch_result"}),
+            NodeIR(id="merge_branch", type=NodeType.MERGE, label="Branch Merge", config={"mergeMode": "branch", "reducersJson": json.dumps([{"target": "merged_branch", "source": "branch_result", "reducer": "overwrite"}]), "resultField": "merge_result"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_branch }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="branch_template"),
+            EdgeIR(id="e2", source="branch_template", target="merge_branch"),
+            EdgeIR(id="e3", source="merge_branch", target="reply"),
+        ]
+    )
+
+    generated = generate_project_files(project)
+    nodes_py = next(value for path, value in generated.items() if path.endswith("/nodes.py"))
+
+    assert '_apply_merge_reducers(dict(state), [dict(state)]' in nodes_py
+    assert '"branch"' in nodes_py
+    assert '"mergeMode": merge_mode' in nodes_py
+    compile(nodes_py, "nodes.py", "exec")
+
+
 def test_codegen_embeds_agent_ref_project(monkeypatch):
     child = create_default_project("Child Export Agent")
     child.project.id = "child_export_agent"

@@ -482,6 +482,11 @@ export interface RunTraceItem {
   iterationIndex?: number | null;
   iterationItem?: unknown;
   sourceNodeId?: string | null;
+  attempts?: Array<Record<string, unknown>>;
+  errorPolicy?: string | null;
+  timeoutSec?: number | null;
+  parallel?: boolean | null;
+  itemFailurePolicy?: string | null;
   position?: Position | null;
 }
 
@@ -501,6 +506,11 @@ export interface NodeRuntimeState {
   iterationIndex?: number | null;
   iterationItem?: unknown;
   sourceNodeId?: string | null;
+  attempts?: Array<Record<string, unknown>>;
+  errorPolicy?: string | null;
+  timeoutSec?: number | null;
+  parallel?: boolean | null;
+  itemFailurePolicy?: string | null;
   nodeType?: NodeType;
   position?: Position | null;
 }

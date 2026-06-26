@@ -10,9 +10,10 @@ import json
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, Literal
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from urllib import request as urllib_request
@@ -78,6 +79,20 @@ OPENAI_COMPATIBLE_BASE_URLS = {
     "groq": "https://api.groq.com/openai/v1",
     "ollama": "http://localhost:11434/v1",
 }
+
+
+class NodePolicyError(RuntimeError):
+    def __init__(self, node: NodeIR, original: Exception, payload: dict[str, Any], attempts: list[dict[str, Any]], policy: dict[str, Any]):
+        super().__init__(str(payload.get("message") or original))
+        self.node = node
+        self.original = original
+        self.payload = payload
+        self.attempts = attempts
+        self.policy = policy
+
+
+class NodeTimeoutError(RuntimeError):
+    pass
 PROVIDER_ALIASES = {
     "google": "google_genai",
 }
@@ -250,12 +265,14 @@ def _walk_project(
         before = dict(state)
         started = time.perf_counter()
         handled_error_target: str | None = None
+        trace_meta: dict[str, Any] = {}
         try:
-            delta, detail = _execute_node(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+            delta, detail, trace_meta = _execute_node_with_policy(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             state.update(delta)
             status = "ok"
         except Exception as exc:  # Keep the preview response structured instead of surfacing a 500.
             handled_error_target = _error_execution_target(node, outgoing)
+            trace_meta = _trace_meta_from_exception(exc)
             if handled_error_target:
                 delta = {"last_error": _runtime_error_payload(node, exc)}
                 state.update(delta)
@@ -276,6 +293,7 @@ def _walk_project(
                 "durationMs": round((time.perf_counter() - started) * 1000, 2),
                 "inputState": _compact_state(before),
                 "outputDelta": _compact_state(delta),
+                **trace_meta,
             }
         )
         if status == "error" or node.type == NodeType.DIRECT_REPLY:
@@ -343,17 +361,21 @@ def _walk_project_events(
         started = time.perf_counter()
         handled_error_target: str | None = None
         child_trace_items: list[dict[str, Any]] = []
+        trace_meta: dict[str, Any] = {}
         try:
             if mode == "live" and node.type == NodeType.PARALLEL_TOOLS:
                 delta, detail = yield from _execute_live_parallel_tools_events(project, node, state, model_config, runtime_environment, tools)
+                trace_meta = _successful_policy_trace_meta(node, [])
             elif mode == "live" and node.type == NodeType.FOR_EACH:
                 delta, detail, child_trace_items = yield from _execute_for_each_node_events(project, node, state, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+                trace_meta = _successful_policy_trace_meta(node, [])
             else:
-                delta, detail = _execute_node(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+                delta, detail, trace_meta = _execute_node_with_policy(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             state.update(delta)
             status = "ok"
         except Exception as exc:  # Keep streamed events structured instead of surfacing a 500.
             handled_error_target = _error_execution_target(node, outgoing)
+            trace_meta = _trace_meta_from_exception(exc)
             if handled_error_target:
                 delta = {"last_error": _runtime_error_payload(node, exc)}
                 state.update(delta)
@@ -373,6 +395,7 @@ def _walk_project_events(
             "durationMs": round((time.perf_counter() - started) * 1000, 2),
             "inputState": _compact_state(before),
             "outputDelta": _compact_state(delta),
+            **trace_meta,
         }
         trace.extend(child_trace_items)
         trace.append(trace_item)
@@ -427,6 +450,88 @@ def _execute_node(
     if mode == "dry":
         return _execute_dry_node(node, state, skills, tools)
     return _execute_live_node(node, project, state, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+
+
+def _execute_node_with_policy(
+    node: NodeIR,
+    project: ProjectIR,
+    state: dict[str, Any],
+    mode: RunMode,
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    skills: SkillRuntimeConfig,
+    tools: ToolRuntimeConfig,
+    mcp_servers: McpRuntimeConfig,
+    agents: AgentRuntimeConfig,
+    agent_depth: int,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    policy = _node_runtime_policy(node.config)
+    attempts: list[dict[str, Any]] = []
+    max_attempts = 1 + (policy["maxRetries"] if policy["retryEnabled"] else 0)
+    last_exc: Exception | None = None
+    for attempt_index in range(1, max_attempts + 1):
+        started = time.perf_counter()
+        try:
+            delta, detail = _call_node_with_timeout(
+                lambda: _execute_node(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth),
+                policy["timeoutSec"],
+            )
+            attempts.append(
+                {
+                    "attempt": attempt_index,
+                    "status": "ok",
+                    "durationMs": round((time.perf_counter() - started) * 1000, 2),
+                }
+            )
+            if attempt_index > 1:
+                detail = f"{detail}；重试第 {attempt_index} 次后成功。"
+            return delta, detail, _successful_policy_trace_meta(node, attempts)
+        except Exception as exc:
+            last_exc = exc
+            error_type = _policy_error_type(exc)
+            attempts.append(
+                {
+                    "attempt": attempt_index,
+                    "status": "error",
+                    "durationMs": round((time.perf_counter() - started) * 1000, 2),
+                    "errorType": error_type,
+                    "message": str(exc),
+                }
+            )
+            if attempt_index < max_attempts and _should_retry_error(policy, error_type, exc):
+                backoff_ms = min(max(policy["backoffMs"], 0) * attempt_index, 5000)
+                if backoff_ms:
+                    time.sleep(backoff_ms / 1000)
+                continue
+            break
+    assert last_exc is not None
+    payload = _runtime_error_payload(node, last_exc)
+    payload["attempts"] = attempts
+    payload["errorPolicy"] = policy["errorPolicy"]
+    if policy["timeoutSec"]:
+        payload["timeoutSec"] = policy["timeoutSec"]
+    policy_name = policy["errorPolicy"]
+    if policy_name == "fallback":
+        delta = _fallback_policy_delta(node, state, policy, payload)
+        return delta, f"{payload['errorType']}: {payload['message']}；已按 fallback 策略继续。", _failed_policy_trace_meta(node, attempts, policy)
+    if policy_name == "continue":
+        field = policy["errorOutputField"] or "last_error"
+        return {field: payload}, f"{payload['errorType']}: {payload['message']}；已按 continue 策略继续。", _failed_policy_trace_meta(node, attempts, policy)
+    raise NodePolicyError(node, last_exc, payload, attempts, policy)
+
+
+def _call_node_with_timeout(fn, timeout_sec: float | None) -> tuple[dict[str, Any], str]:
+    if not timeout_sec:
+        return fn()
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn)
+    try:
+        return future.result(timeout=timeout_sec)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise NodeTimeoutError(f"节点执行超过 {timeout_sec}s。") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _execute_dry_node(node: NodeIR, state: dict[str, Any], skills: SkillRuntimeConfig, tools: ToolRuntimeConfig) -> tuple[dict[str, Any], str]:
@@ -1532,30 +1637,97 @@ def _execute_for_each_node(
     items = list(items)[:max_items]
     item_states: list[dict[str, Any]] = []
     iterations: list[dict[str, Any]] = []
-    for index, item in enumerate(items):
-        item_state = dict(state)
-        item_state[item_field] = item
-        item_state[index_field] = index
-        reached_merge = _run_for_each_item_chain(
-            item_start,
-            merge_node.id,
-            item_state,
-            project,
-            nodes,
-            outgoing,
-            mode,
-            model_config,
-            runtime_environment,
-            skills,
-            tools,
-            mcp_servers,
-            agents,
-            agent_depth,
-        )
-        if not reached_merge:
-            raise RuntimeError(f"ForEach 第 {index + 1} 项没有到达 Merge 节点。")
-        item_states.append(item_state)
-        iterations.append({"index": index, "item": _compact_value(item), "output": _compact_state(item_state)})
+    execution_mode = str(config.get("executionMode") or "sequential").strip().lower()
+    item_failure_policy = str(config.get("itemFailurePolicy") or "fail_fast").strip().lower()
+    preserve_order = _bool_config(config.get("preserveOrder"), True)
+    parallel = mode == "live" and execution_mode == "parallel" and len(items) > 1
+    if parallel:
+        max_concurrency = min(_positive_int(config.get("maxConcurrency"), 3), 12)
+        futures = {}
+        with ThreadPoolExecutor(max_workers=min(max_concurrency, len(items))) as executor:
+            for index, item in enumerate(items):
+                futures[
+                    executor.submit(
+                        _run_for_each_item_job,
+                        index,
+                        item,
+                        state,
+                        item_field,
+                        index_field,
+                        item_start,
+                        merge_node.id,
+                        project,
+                        nodes,
+                        outgoing,
+                        mode,
+                        model_config,
+                        runtime_environment,
+                        skills,
+                        tools,
+                        mcp_servers,
+                        agents,
+                        agent_depth,
+                    )
+                ] = (index, item)
+            results: list[dict[str, Any]] = []
+            for future in as_completed(futures):
+                index, item = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    if item_failure_policy != "collect_errors":
+                        raise
+                    item_state = dict(state)
+                    item_state[item_field] = item
+                    item_state[index_field] = index
+                    error_payload = _runtime_error_payload(node, exc)
+                    item_state["last_error"] = error_payload
+                    item_state.setdefault("item_result", {"ok": False, "error": error_payload})
+                    results.append({"index": index, "item": item, "itemState": item_state, "reachedMerge": True, "error": error_payload})
+        if preserve_order:
+            results.sort(key=lambda item: int(item["index"]))
+        for result in results:
+            if not result.get("reachedMerge"):
+                raise RuntimeError(f"ForEach 第 {int(result['index']) + 1} 项没有到达 Merge 节点。")
+            item_state = result["itemState"]
+            item_states.append(item_state)
+            iteration = {"index": result["index"], "item": _compact_value(result["item"]), "output": _compact_state(item_state)}
+            if result.get("error"):
+                iteration["error"] = _compact_value(result["error"])
+            iterations.append(iteration)
+    else:
+        for index, item in enumerate(items):
+            item_state = dict(state)
+            item_state[item_field] = item
+            item_state[index_field] = index
+            try:
+                reached_merge = _run_for_each_item_chain(
+                    item_start,
+                    merge_node.id,
+                    item_state,
+                    project,
+                    nodes,
+                    outgoing,
+                    mode,
+                    model_config,
+                    runtime_environment,
+                    skills,
+                    tools,
+                    mcp_servers,
+                    agents,
+                    agent_depth,
+                )
+            except Exception as exc:
+                if item_failure_policy != "collect_errors":
+                    raise
+                error_payload = _runtime_error_payload(node, exc)
+                item_state["last_error"] = error_payload
+                item_state.setdefault("item_result", {"ok": False, "error": error_payload})
+                reached_merge = True
+            if not reached_merge:
+                raise RuntimeError(f"ForEach 第 {index + 1} 项没有到达 Merge 节点。")
+            item_states.append(item_state)
+            iterations.append({"index": index, "item": _compact_value(item), "output": _compact_state(item_state)})
 
     delta, detail = _execute_merge_node(merge_node, state, item_states)
     merge_result_field = str(merge_node.config.get("resultField", "merge_result")).strip() or "merge_result"
@@ -1569,8 +1741,11 @@ def _execute_for_each_node(
             "count": len(items),
             "mergeNodeId": merge_node.id,
             "iterations": iterations,
+            "parallel": parallel,
+            "itemFailurePolicy": item_failure_policy,
         }
-    return delta, f"ForEach 顺序处理 {len(items)} 项；{detail}"
+    mode_label = "并发" if parallel else "顺序"
+    return delta, f"ForEach {mode_label}处理 {len(items)} 项；{detail}"
 
 
 def _execute_for_each_node_events(
@@ -1612,33 +1787,116 @@ def _execute_for_each_node_events(
     item_states: list[dict[str, Any]] = []
     iterations: list[dict[str, Any]] = []
     child_trace_items: list[dict[str, Any]] = []
-    for index, item in enumerate(items):
-        item_state = dict(state)
-        item_state[item_field] = item
-        item_state[index_field] = index
-        reached_merge = yield from _run_for_each_item_chain_events(
-            item_start,
-            merge_node.id,
-            item_state,
-            project,
-            nodes,
-            outgoing,
-            model_config,
-            runtime_environment,
-            skills,
-            tools,
-            mcp_servers,
-            agents,
-            agent_depth,
-            node,
-            index,
-            item,
-            child_trace_items,
-        )
-        if not reached_merge:
-            raise RuntimeError(f"ForEach 第 {index + 1} 项没有到达 Merge 节点。")
-        item_states.append(item_state)
-        iterations.append({"index": index, "item": _compact_value(item), "output": _compact_state(item_state)})
+    execution_mode = str(config.get("executionMode") or "sequential").strip().lower()
+    item_failure_policy = str(config.get("itemFailurePolicy") or "fail_fast").strip().lower()
+    preserve_order = _bool_config(config.get("preserveOrder"), True)
+    parallel = execution_mode == "parallel" and len(items) > 1
+    if parallel:
+        max_concurrency = min(_positive_int(config.get("maxConcurrency"), 3), 12)
+        futures = {}
+        event_queue: Queue[dict[str, Any]] = Queue()
+        with ThreadPoolExecutor(max_workers=min(max_concurrency, len(items))) as executor:
+            for index, item in enumerate(items):
+                futures[
+                    executor.submit(
+                        _collect_for_each_item_events,
+                        item_start,
+                        merge_node.id,
+                        dict(state),
+                        item_field,
+                        index_field,
+                        item,
+                        index,
+                        project,
+                        nodes,
+                        outgoing,
+                        model_config,
+                        runtime_environment,
+                        skills,
+                        tools,
+                        mcp_servers,
+                        agents,
+                        agent_depth,
+                        node,
+                        event_queue,
+                    )
+                ] = (index, item)
+            results: list[dict[str, Any]] = []
+            pending = set(futures)
+            while pending:
+                try:
+                    yield event_queue.get(timeout=0.05)
+                except Empty:
+                    pass
+                for future in [item for item in pending if item.done()]:
+                    pending.remove(future)
+                    index, item = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        if item_failure_policy != "collect_errors":
+                            raise
+                        item_state = dict(state)
+                        item_state[item_field] = item
+                        item_state[index_field] = index
+                        error_payload = _runtime_error_payload(node, exc)
+                        item_state["last_error"] = error_payload
+                        item_state.setdefault("item_result", {"ok": False, "error": error_payload})
+                        result = {"index": index, "item": item, "itemState": item_state, "reachedMerge": True, "events": [], "childTrace": [], "error": error_payload}
+                    results.append(result)
+                    child_trace_items.extend(result.get("childTrace", []))
+            while True:
+                try:
+                    yield event_queue.get_nowait()
+                except Empty:
+                    break
+        if preserve_order:
+            results.sort(key=lambda item: int(item["index"]))
+        for result in results:
+            if not result.get("reachedMerge"):
+                raise RuntimeError(f"ForEach 第 {int(result['index']) + 1} 项没有到达 Merge 节点。")
+            item_state = result["itemState"]
+            item_states.append(item_state)
+            iteration = {"index": result["index"], "item": _compact_value(result["item"]), "output": _compact_state(item_state)}
+            if result.get("error"):
+                iteration["error"] = _compact_value(result["error"])
+            iterations.append(iteration)
+    else:
+        for index, item in enumerate(items):
+            item_state = dict(state)
+            item_state[item_field] = item
+            item_state[index_field] = index
+            try:
+                reached_merge = yield from _run_for_each_item_chain_events(
+                    item_start,
+                    merge_node.id,
+                    item_state,
+                    project,
+                    nodes,
+                    outgoing,
+                    model_config,
+                    runtime_environment,
+                    skills,
+                    tools,
+                    mcp_servers,
+                    agents,
+                    agent_depth,
+                    node,
+                    index,
+                    item,
+                    child_trace_items,
+                )
+            except Exception as exc:
+                if item_failure_policy != "collect_errors":
+                    raise
+                error_payload = _runtime_error_payload(node, exc)
+                item_state["last_error"] = error_payload
+                item_state.setdefault("item_result", {"ok": False, "error": error_payload})
+                reached_merge = True
+            if not reached_merge:
+                raise RuntimeError(f"ForEach 第 {index + 1} 项没有到达 Merge 节点。")
+            item_states.append(item_state)
+            iterations.append({"index": index, "item": _compact_value(item), "output": _compact_state(item_state)})
 
     delta, detail = _execute_merge_node(merge_node, state, item_states)
     merge_result_field = str(merge_node.config.get("resultField", "merge_result")).strip() or "merge_result"
@@ -1652,8 +1910,110 @@ def _execute_for_each_node_events(
             "count": len(items),
             "mergeNodeId": merge_node.id,
             "iterations": iterations,
+            "parallel": parallel,
+            "itemFailurePolicy": item_failure_policy,
         }
-    return delta, f"ForEach 顺序处理 {len(items)} 项；{detail}", child_trace_items
+    mode_label = "并发" if parallel else "顺序"
+    return delta, f"ForEach {mode_label}处理 {len(items)} 项；{detail}", child_trace_items
+
+
+def _run_for_each_item_job(
+    index: int,
+    item: Any,
+    base_state: dict[str, Any],
+    item_field: str,
+    index_field: str,
+    item_start: str,
+    merge_node_id: str,
+    project: ProjectIR,
+    nodes: dict[str, NodeIR],
+    outgoing: dict[str, list],
+    mode: RunMode,
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    skills: SkillRuntimeConfig,
+    tools: ToolRuntimeConfig,
+    mcp_servers: McpRuntimeConfig,
+    agents: AgentRuntimeConfig,
+    agent_depth: int,
+) -> dict[str, Any]:
+    item_state = dict(base_state)
+    item_state[item_field] = item
+    item_state[index_field] = index
+    reached_merge = _run_for_each_item_chain(
+        item_start,
+        merge_node_id,
+        item_state,
+        project,
+        nodes,
+        outgoing,
+        mode,
+        model_config,
+        runtime_environment,
+        skills,
+        tools,
+        mcp_servers,
+        agents,
+        agent_depth,
+    )
+    return {"index": index, "item": item, "itemState": item_state, "reachedMerge": reached_merge}
+
+
+def _collect_for_each_item_events(
+    start_node_id: str,
+    merge_node_id: str,
+    item_state: dict[str, Any],
+    item_field: str,
+    index_field: str,
+    item: Any,
+    index: int,
+    project: ProjectIR,
+    nodes: dict[str, NodeIR],
+    outgoing: dict[str, list],
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    skills: SkillRuntimeConfig,
+    tools: ToolRuntimeConfig,
+    mcp_servers: McpRuntimeConfig,
+    agents: AgentRuntimeConfig,
+    agent_depth: int,
+    parent_node: NodeIR,
+    event_queue: Queue[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    item_state[item_field] = item
+    item_state[index_field] = index
+    child_trace: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    generator = _run_for_each_item_chain_events(
+        start_node_id,
+        merge_node_id,
+        item_state,
+        project,
+        nodes,
+        outgoing,
+        model_config,
+        runtime_environment,
+        skills,
+        tools,
+        mcp_servers,
+        agents,
+        agent_depth,
+        parent_node,
+        index,
+        item,
+        child_trace,
+    )
+    reached_merge = False
+    while True:
+        try:
+            event = next(generator)
+            events.append(event)
+            if event_queue is not None:
+                event_queue.put(event)
+        except StopIteration as stop:
+            reached_merge = bool(stop.value)
+            break
+    return {"index": index, "item": item, "itemState": item_state, "reachedMerge": reached_merge, "events": events, "childTrace": child_trace}
 
 
 def _run_for_each_item_chain(
@@ -1682,7 +2042,7 @@ def _run_for_each_item_chain(
         if child.type in {NodeType.FOR_EACH, NodeType.MERGE}:
             raise RuntimeError(f"ForEach v1 不支持嵌套或提前执行 {child.type} 节点。")
         try:
-            delta, _detail = _execute_node(child, project, item_state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+            delta, _detail, _trace_meta = _execute_node_with_policy(child, project, item_state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             item_state.update(delta)
         except Exception as exc:
             error_target = _error_execution_target(child, outgoing)
@@ -1744,12 +2104,14 @@ def _run_for_each_item_chain_events(
         }
         started = time.perf_counter()
         handled_error_target: str | None = None
+        trace_meta: dict[str, Any] = {}
         try:
-            delta, detail = _execute_node(child, project, item_state, "live", model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+            delta, detail, trace_meta = _execute_node_with_policy(child, project, item_state, "live", model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             item_state.update(delta)
             status = "ok"
         except Exception as exc:
             handled_error_target = _error_execution_target(child, outgoing)
+            trace_meta = _trace_meta_from_exception(exc)
             delta = {"last_error": _runtime_error_payload(child, exc)}
             item_state.update(delta)
             detail = f"{_format_error(exc)}；已转入 error 分支。" if handled_error_target else _format_error(exc)
@@ -1763,6 +2125,7 @@ def _run_for_each_item_chain_events(
             "durationMs": round((time.perf_counter() - started) * 1000, 2),
             "inputState": _compact_state(before),
             "outputDelta": _compact_state(delta),
+            **trace_meta,
             **event_meta,
         }
         child_trace_items.append(trace_item)
@@ -1783,6 +2146,7 @@ def _run_for_each_item_chain_events(
 
 def _execute_merge_node(node: NodeIR, state: dict[str, Any], item_states: list[dict[str, Any]]) -> tuple[dict[str, Any], str]:
     config = node.config
+    merge_mode = str(config.get("mergeMode") or "auto").strip().lower() or "auto"
     reducers = _json_object_list(config.get("reducersJson"))
     if not reducers:
         reducers = [{"target": "merged_results", "source": "item_result", "reducer": "append"}]
@@ -1811,10 +2175,12 @@ def _execute_merge_node(node: NodeIR, state: dict[str, Any], item_states: list[d
     if result_field:
         delta[result_field] = {
             "ok": True,
+            "mergeMode": merge_mode,
             "itemCount": len(item_states),
             "reducers": summaries,
         }
-    return delta, f"Merge 聚合 {len(item_states)} 项，写入 {len(summaries)} 个字段"
+    mode_label = "Branch Merge" if merge_mode == "branch" else "Merge"
+    return delta, f"{mode_label} 聚合 {len(item_states)} 项，写入 {len(summaries)} 个字段"
 
 
 def _reduce_values(operation: str, values: list[Any], previous: Any, target: str) -> Any:
@@ -5676,6 +6042,88 @@ def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
+def _bool_config(value: Any, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _node_runtime_policy(config: dict[str, Any]) -> dict[str, Any]:
+    retry = _parse_json_object(str(config.get("retryPolicyJson") or "{}"))
+    error_policy = str(config.get("errorPolicy") or "default").strip().lower() or "default"
+    if error_policy not in {"default", "fail_fast", "route_error", "continue", "fallback"}:
+        error_policy = "default"
+    timeout_sec = _optional_positive_float(config.get("nodeTimeoutSec"))
+    max_retries = min(_non_negative_int(retry.get("maxRetries"), 0), 5)
+    return {
+        "retryEnabled": _truthy(retry.get("enabled")) and max_retries > 0,
+        "maxRetries": max_retries,
+        "backoffMs": min(_non_negative_int(retry.get("backoffMs"), 0), 30_000),
+        "retryOnErrorTypes": [str(item).strip() for item in retry.get("retryOnErrorTypes", []) if str(item).strip()] if isinstance(retry.get("retryOnErrorTypes"), list) else [],
+        "timeoutSec": timeout_sec,
+        "errorPolicy": error_policy,
+        "fallbackOutputJson": str(config.get("fallbackOutputJson") or "{}"),
+        "errorOutputField": str(config.get("errorOutputField") or "").strip(),
+    }
+
+
+def _should_retry_error(policy: dict[str, Any], error_type: str, exc: Exception) -> bool:
+    allowed = set(policy.get("retryOnErrorTypes") or [])
+    if not allowed:
+        return True
+    return error_type in allowed or exc.__class__.__name__ in allowed
+
+
+def _policy_error_type(exc: Exception) -> str:
+    if isinstance(exc, NodeTimeoutError):
+        return "timeout"
+    if isinstance(exc, NodePolicyError):
+        return str(exc.payload.get("errorType") or "node_error")
+    return exc.__class__.__name__
+
+
+def _fallback_policy_delta(node: NodeIR, state: dict[str, Any], policy: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        delta = _render_json_object(str(policy.get("fallbackOutputJson") or "{}"), state, "fallbackOutputJson")
+    except RuntimeError as exc:
+        raise NodePolicyError(node, exc, _runtime_error_payload(node, exc), [], policy) from exc
+    if policy.get("errorOutputField"):
+        delta[str(policy["errorOutputField"])] = payload
+    return delta
+
+
+def _successful_policy_trace_meta(node: NodeIR, attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    policy = _node_runtime_policy(node.config)
+    meta: dict[str, Any] = {}
+    if attempts and (len(attempts) > 1 or attempts[0].get("status") != "ok"):
+        meta["attempts"] = attempts
+    if policy["timeoutSec"]:
+        meta["timeoutSec"] = policy["timeoutSec"]
+    if policy["errorPolicy"] != "default":
+        meta["errorPolicy"] = policy["errorPolicy"]
+    if node.type == NodeType.FOR_EACH:
+        meta["parallel"] = str(node.config.get("executionMode") or "sequential").strip().lower() == "parallel"
+        meta["itemFailurePolicy"] = str(node.config.get("itemFailurePolicy") or "fail_fast").strip().lower()
+    return meta
+
+
+def _failed_policy_trace_meta(node: NodeIR, attempts: list[dict[str, Any]], policy: dict[str, Any]) -> dict[str, Any]:
+    meta = _successful_policy_trace_meta(node, attempts)
+    if attempts:
+        meta["attempts"] = attempts
+    if policy.get("errorPolicy"):
+        meta["errorPolicy"] = policy["errorPolicy"]
+    return meta
+
+
+def _trace_meta_from_exception(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, NodePolicyError):
+        return _failed_policy_trace_meta(exc.node, exc.attempts, exc.policy)
+    return {}
+
+
 def _normalize_input(input_state: dict[str, Any]) -> dict[str, Any]:
     state = dict(input_state)
     if "messages" not in state:
@@ -5755,6 +6203,14 @@ def _optional_positive_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _optional_positive_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _non_negative_int(value: Any, fallback: int) -> int:
     try:
         parsed = int(value)
@@ -5772,6 +6228,9 @@ def _positive_float(value: Any, fallback: float) -> float:
 
 
 def _format_error(exc: Exception) -> str:
+    if isinstance(exc, NodePolicyError):
+        payload = exc.payload
+        return f"{payload.get('errorType')}: {payload.get('message')}"
     if isinstance(exc, LiveRunUnsupportedError):
         return str(exc)
     return f"{exc.__class__.__name__}: {exc}"
@@ -5810,12 +6269,14 @@ def _error_execution_target(node: NodeIR, outgoing: dict[str, list]) -> str | No
 
 
 def _runtime_error_payload(node: NodeIR, exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, NodePolicyError):
+        return dict(exc.payload)
     return {
         "ok": False,
         "nodeId": node.id,
         "nodeType": str(node.type),
         "nodeLabel": node.label,
-        "errorType": exc.__class__.__name__,
+        "errorType": _policy_error_type(exc),
         "message": str(exc),
     }
 

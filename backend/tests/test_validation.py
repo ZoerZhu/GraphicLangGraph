@@ -205,6 +205,99 @@ def test_validates_merge_reducers():
     assert any(issue.code == "MERGE_REDUCER_OPERATION" for issue in result.issues)
 
 
+def test_validates_flow_control_v2_config_bounds():
+    project = create_default_project("Bad Flow Control v2")
+    project.state.fields.extend(
+        [
+            StateField(name="items", type="list"),
+            StateField(name="item", type="dict"),
+            StateField(name="index", type="int"),
+            StateField(name="item_result", type="str"),
+            StateField(name="merged_results", type="list"),
+            StateField(name="merge_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="each",
+                type=NodeType.FOR_EACH,
+                label="ForEach",
+                config={
+                    "itemsField": "items",
+                    "itemField": "item",
+                    "indexField": "index",
+                    "executionMode": "turbo",
+                    "maxConcurrency": 99,
+                    "itemFailurePolicy": "ignore",
+                },
+            ),
+            NodeIR(id="worker", type=NodeType.TEMPLATE, label="Worker", config={"template": "ok", "outputField": "item_result"}),
+            NodeIR(
+                id="merge",
+                type=NodeType.MERGE,
+                label="Merge",
+                config={"mergeMode": "wait_all", "reducersJson": '[{"target":"merged_results","source":"item_result","reducer":"append"}]', "resultField": "merge_result"},
+            ),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_results }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="worker", sourceHandle="item"),
+            EdgeIR(id="e3", source="worker", target="merge"),
+            EdgeIR(id="e4", source="merge", target="reply"),
+        ]
+    )
+
+    result = validate_project(project)
+
+    assert not result.valid
+    assert any(issue.code == "FOR_EACH_EXECUTION_MODE" for issue in result.issues)
+    assert any(issue.code == "FOR_EACH_MAX_CONCURRENCY" for issue in result.issues)
+    assert any(issue.code == "FOR_EACH_ITEM_FAILURE_POLICY" for issue in result.issues)
+    assert any(issue.code == "MERGE_MODE" for issue in result.issues)
+
+
+def test_validates_runtime_policy_config_bounds():
+    project = create_default_project("Bad Runtime Policy")
+    project.state.fields.append(StateField(name="final_answer", type="str"))
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="template",
+                type=NodeType.TEMPLATE,
+                label="Template",
+                config={
+                    "template": "ok",
+                    "outputField": "final_answer",
+                    "retryPolicyJson": '{"enabled": true, "maxRetries": 9}',
+                    "nodeTimeoutSec": 601,
+                    "errorPolicy": "skip",
+                    "fallbackOutputJson": "[1]",
+                },
+            ),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.final_answer }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="template"),
+            EdgeIR(id="e2", source="template", target="reply"),
+        ]
+    )
+
+    result = validate_project(project)
+
+    assert not result.valid
+    assert any(issue.code == "RUNTIME_RETRY_MAX" for issue in result.issues)
+    assert any(issue.code == "RUNTIME_NODE_TIMEOUT" for issue in result.issues)
+    assert any(issue.code == "RUNTIME_ERROR_POLICY" for issue in result.issues)
+    assert any(issue.code == "RUNTIME_FALLBACK_OBJECT" for issue in result.issues)
+
+
 def test_rejects_undeclared_state_write():
     project = create_default_project()
     project.nodes.extend(

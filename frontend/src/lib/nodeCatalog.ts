@@ -37,8 +37,8 @@ export const NODE_CATALOG: NodeCatalogItem[] = [
   { type: "template", title: "Template", description: "渲染文本或 JSON 到 state", icon: Braces },
   { type: "json_extractor", title: "JSON Extractor", description: "按 Schema 抽取结构化 JSON", icon: Braces },
   { type: "json_validator", title: "JSON Validator", description: "校验 JSON 并输出分支", icon: GitBranch },
-  { type: "for_each", title: "ForEach", description: "顺序迭代数组并执行子链路", icon: Repeat },
-  { type: "merge", title: "Merge", description: "按 Reducer 聚合迭代结果", icon: GitMerge },
+  { type: "for_each", title: "ForEach", description: "顺序或并发迭代数组并执行子链路", icon: Repeat },
+  { type: "merge", title: "Merge", description: "聚合 ForEach 或分支结果", icon: GitMerge },
   { type: "error_handler", title: "Error Handler", description: "处理 error 分支并格式化错误", icon: TriangleAlert },
   { type: "retriever", title: "Retriever", description: "检索知识库上下文", icon: Database },
   { type: "condition", title: "Condition", description: "规则分支路由", icon: GitBranch },
@@ -209,10 +209,15 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         itemField: "current_item",
         indexField: "current_index",
         maxItems: 50,
+        executionMode: "sequential",
+        maxConcurrency: 3,
+        preserveOrder: true,
+        itemFailurePolicy: "fail_fast",
         resultField: "",
       };
     case "merge":
       return {
+        mergeMode: "auto",
         reducersJson: JSON.stringify(
           [
             { target: "merged_results", source: "item_result", reducer: "append" },

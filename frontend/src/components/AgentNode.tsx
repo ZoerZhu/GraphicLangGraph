@@ -70,7 +70,7 @@ export function AgentNode({ id, data, selected }: { id: string; data: AgentNodeD
   const handlePortClick = useProjectStore((state) => state.handlePortClick);
   const selectNode = useProjectStore((state) => state.selectNode);
   const runActive = useProjectStore((state) => state.runActive);
-  const summary = nodeSummary(data.nodeType, data.config);
+  const summary = withRuntimePolicySummary(nodeSummary(data.nodeType, data.config), data.nodeType, data.config);
   const selectedTools = data.nodeType === "tool" || data.nodeType === "parallel_tools" ? selectedToolNames(data.config) : [];
   const runtime = data.runtime ?? null;
   const [runtimeOpen, setRuntimeOpen] = useState(false);
@@ -349,10 +349,12 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
       return [
         { label: "数组", value: text(config.itemsField, "worker_tasks") },
         { label: "Item", value: text(config.itemField, "current_item") },
+        { label: "模式", value: text(config.executionMode, "sequential") === "parallel" ? `Parallel ${text(config.maxConcurrency, "3")}` : "Sequential" },
         { label: "上限", value: text(config.maxItems, "50") },
       ];
     case "merge":
       return [
+        { label: "模式", value: text(config.mergeMode, "auto") },
         { label: "Reducer", value: `${parseObjectList(config.reducersJson).length} 个` },
         { label: "结果", value: text(config.resultField, "merge_result") },
       ];
@@ -415,6 +417,23 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
   }
 }
 
+function withRuntimePolicySummary(rows: { label: string; value: string }[], type: NodeType, config: Record<string, unknown>) {
+  if (type === "start" || type === "parallel_worker") return rows;
+  const retry = parseFirstObject(config.retryPolicyJson);
+  const extras: { label: string; value: string }[] = [];
+  if (retry.enabled && Number(retry.maxRetries ?? 0) > 0) {
+    extras.push({ label: "Retry", value: `x${Number(retry.maxRetries)}` });
+  }
+  if (Number(config.nodeTimeoutSec ?? 0) > 0) {
+    extras.push({ label: "Timeout", value: `${Number(config.nodeTimeoutSec)}s` });
+  }
+  const errorPolicy = text(config.errorPolicy, "default");
+  if (errorPolicy && errorPolicy !== "default") {
+    extras.push({ label: "失败", value: errorPolicy });
+  }
+  return [...rows, ...extras].slice(0, 5);
+}
+
 function text(value: unknown, fallback: string) {
   if (typeof value === "string" && value.trim()) return value.trim();
   if (typeof value === "number" || typeof value === "boolean") return String(value);
@@ -450,6 +469,18 @@ function parseObjectList(value: unknown): Array<Record<string, unknown>> {
       : [];
   } catch {
     return [];
+  }
+}
+
+function parseFirstObject(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  const textValue = String(value ?? "").trim();
+  if (!textValue) return {};
+  try {
+    const parsed = JSON.parse(textValue);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
   }
 }
 

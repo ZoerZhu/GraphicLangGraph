@@ -728,7 +728,7 @@ export function Inspector() {
               value={String(node.config.itemsField ?? "worker_tasks")}
               onChange={(event) => updateNodeConfig(node.id, { itemsField: event.target.value })}
             />
-            <small className="model-config-note">读取 state 中的数组字段；也支持形如 {"{ tasks: [] }"} 的任务规划对象。</small>
+            <small className="model-config-note">读取 state 中的数组字段；也支持包含 tasks 数组的任务规划对象。</small>
           </Field>
           <div className="inline-grid">
             <Field label="Item 字段">
@@ -762,11 +762,64 @@ export function Inspector() {
               />
             </Field>
           </div>
-          <small className="model-config-note">从 item 端口连接循环体首节点，循环体末尾连接 Merge；error 端口用于整体异常兜底。</small>
+          <div className="inline-grid">
+            <Field label="执行模式">
+              <select
+                value={String(node.config.executionMode ?? "sequential")}
+                onChange={(event) => updateNodeConfig(node.id, { executionMode: event.target.value })}
+              >
+                <option value="sequential">顺序执行</option>
+                <option value="parallel">并发执行</option>
+              </select>
+            </Field>
+            <Field label="最大并发">
+              <input
+                type="number"
+                min={1}
+                max={12}
+                value={String(node.config.maxConcurrency ?? 3)}
+                onChange={(event) => updateNodeConfig(node.id, { maxConcurrency: Number(event.target.value) })}
+              />
+              <small className="model-config-note">仅并发执行时生效；建议从 2-4 开始，避免模型或工具限流。</small>
+            </Field>
+          </div>
+          <div className="inline-grid">
+            <Field label="失败策略">
+              <select
+                value={String(node.config.itemFailurePolicy ?? "fail_fast")}
+                onChange={(event) => updateNodeConfig(node.id, { itemFailurePolicy: event.target.value })}
+              >
+                <option value="fail_fast">失败即停止</option>
+                <option value="collect_errors">收集错误并继续</option>
+              </select>
+            </Field>
+            <Field label="结果顺序">
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={node.config.preserveOrder !== false}
+                  onChange={(event) => updateNodeConfig(node.id, { preserveOrder: event.target.checked })}
+                />
+                <span>按输入顺序聚合</span>
+              </label>
+            </Field>
+          </div>
+          <small className="model-config-note">collect_errors 会把失败 item 写入迭代摘要并继续处理其他项；fail_fast 会立即停止。循环体末尾必须连接 Merge。</small>
         </>
       )}
       {node.type === "merge" && (
         <>
+          <Field label="Merge 模式">
+            <select
+              value={String(node.config.mergeMode ?? "auto")}
+              onChange={(event) => updateNodeConfig(node.id, { mergeMode: event.target.value })}
+            >
+              <option value="auto">auto</option>
+              <option value="for_each">ForEach 聚合</option>
+              <option value="branch">Branch Merge</option>
+            </select>
+            <small className="model-config-note">auto 会按上下文兼容旧流程；ForEach 聚合读取每轮 itemState；Branch Merge 用于条件分支汇合，只聚合当前实际执行分支。</small>
+          </Field>
           <ReducersEditor
             value={node.config.reducersJson}
             paths={dataPaths}
@@ -1369,9 +1422,80 @@ export function Inspector() {
           </Field>
         </>
       )}
+      {isRuntimePolicyNode(node.type) ? <RuntimePolicyFields node={node} updateNodeConfig={updateNodeConfig} /> : null}
       </div>
     </FloatingPanel>
   );
+}
+
+function RuntimePolicyFields({
+  node,
+  updateNodeConfig,
+}: {
+  node: NodeIR;
+  updateNodeConfig: (nodeId: string, patch: Record<string, unknown>) => void;
+}) {
+  return (
+    <details className="config-preview">
+      <summary>高级运行策略</summary>
+      <Field label="Retry Policy JSON">
+        <textarea
+          className="code-area"
+          rows={5}
+          value={String(node.config.retryPolicyJson ?? "{}")}
+          onChange={(event) => updateNodeConfig(node.id, { retryPolicyJson: event.target.value })}
+          placeholder={'{ "enabled": true, "maxRetries": 2, "backoffMs": 300, "retryOnErrorTypes": [] }'}
+        />
+        <small className="model-config-note">maxRetries 上限 5；retryOnErrorTypes 为空时会对所有异常重试。</small>
+      </Field>
+      <div className="inline-grid">
+        <Field label="节点超时（秒）">
+          <input
+            type="number"
+            min={0}
+            max={600}
+            step={0.1}
+            value={String(node.config.nodeTimeoutSec ?? 0)}
+            onChange={(event) => updateNodeConfig(node.id, { nodeTimeoutSec: Number(event.target.value) })}
+          />
+        </Field>
+        <Field label="失败策略">
+          <select
+            value={String(node.config.errorPolicy ?? "default")}
+            onChange={(event) => updateNodeConfig(node.id, { errorPolicy: event.target.value })}
+          >
+            <option value="default">default</option>
+            <option value="fail_fast">fail_fast</option>
+            <option value="route_error">route_error</option>
+            <option value="continue">continue</option>
+            <option value="fallback">fallback</option>
+          </select>
+        </Field>
+      </div>
+      <Field label="错误输出字段">
+        <input
+          value={String(node.config.errorOutputField ?? "")}
+          onChange={(event) => updateNodeConfig(node.id, { errorOutputField: event.target.value })}
+          placeholder="留空则使用 last_error"
+        />
+      </Field>
+      <Field label="Fallback 输出 JSON">
+        <textarea
+          className="code-area"
+          rows={5}
+          value={String(node.config.fallbackOutputJson ?? "{}")}
+          onChange={(event) => updateNodeConfig(node.id, { fallbackOutputJson: event.target.value })}
+          placeholder={'{ "fallback_result": "默认值" }'}
+        />
+        <small className="model-config-note">仅 errorPolicy=fallback 时合并到 state；不要在这里写入密钥或大体积内容。</small>
+      </Field>
+      <small className="model-config-note">默认策略不改变旧流程：有 error 边则进入 error 分支，无 error 边则停止；continue 会沿普通输出继续。</small>
+    </details>
+  );
+}
+
+function isRuntimePolicyNode(type: string) {
+  return !["start", "parallel_worker"].includes(type);
 }
 
 function DataShapingPreviewControls({
@@ -1583,6 +1707,9 @@ const MERGE_REDUCER_PRESETS = [
   { label: "merge stats", row: { target: "stats", source: "stats", reducer: "merge" } },
   { label: "first summary", row: { target: "first_summary", source: "summary", reducer: "first" } },
   { label: "last summary", row: { target: "last_summary", source: "summary", reducer: "last" } },
+  { label: "overwrite branch_result", row: { target: "branch_result", source: "branch_result", reducer: "overwrite" } },
+  { label: "merge branch_context", row: { target: "branch_context", source: "branch_context", reducer: "merge" } },
+  { label: "append branch_event", row: { target: "branch_events", source: "branch_event", reducer: "append" } },
 ];
 
 function ReducersEditor({

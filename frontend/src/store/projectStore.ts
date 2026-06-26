@@ -2825,6 +2825,11 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
       iterationIndex: event.traceItem.iterationIndex ?? null,
       iterationItem: event.traceItem.iterationItem,
       sourceNodeId: event.traceItem.sourceNodeId ?? null,
+      attempts: event.traceItem.attempts,
+      errorPolicy: event.traceItem.errorPolicy ?? null,
+      timeoutSec: event.traceItem.timeoutSec ?? null,
+      parallel: event.traceItem.parallel ?? null,
+      itemFailurePolicy: event.traceItem.itemFailurePolicy ?? null,
     };
     return {
       runRunning: true,

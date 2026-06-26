@@ -180,8 +180,8 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
   },
   {
     id: "flow_control_task_processing",
-    name: "结构化任务处理 Flow Control",
-    description: "抽取并校验 Task Plan，顺序 ForEach 处理每个任务，Merge 聚合结果后直接回复。",
+    name: "并发任务处理 Flow Control v2",
+    description: "校验 Task Plan，并发 ForEach 处理每个任务，收集单项错误，Merge 聚合结果后直接回复。",
     kind: "agent",
     fields: [
       { name: "task_plan", type: "dict", description: "结构化任务规划" },
@@ -230,11 +230,15 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
         maxTasks: 6,
         fallbackToSingleTask: false,
       }),
-      node("foreach_tasks_fc", "for_each", "逐项处理任务", 1140, 220, {
+      node("foreach_tasks_fc", "for_each", "并发处理任务", 1140, 220, {
         itemsField: "worker_tasks",
         itemField: "current_item",
         indexField: "current_index",
         maxItems: 20,
+        executionMode: "parallel",
+        maxConcurrency: 3,
+        preserveOrder: true,
+        itemFailurePolicy: "collect_errors",
         resultField: "foreach_result",
       }, [{ id: "in", type: "control", label: "输入" }], [
         { id: "item", type: "control", label: "item" },
@@ -245,6 +249,9 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
         template: "任务 {{ state.current_index }} 已处理：{{ state.current_item }}",
         outputType: "text",
         outputField: "item_result",
+        retryPolicyJson: JSON.stringify({ enabled: true, maxRetries: 1, backoffMs: 100, retryOnErrorTypes: [] }, null, 2),
+        errorPolicy: "route_error",
+        nodeTimeoutSec: 0,
       }),
       node("item_error_handler_fc", "error_handler", "单项错误处理", 1400, 420, {
         errorField: "last_error",
@@ -252,6 +259,7 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
         outputField: "item_result",
       }),
       node("merge_results_fc", "merge", "聚合任务结果", 1660, 220, {
+        mergeMode: "for_each",
         reducersJson: JSON.stringify([{ target: "merged_results", source: "item_result", reducer: "append" }], null, 2),
         resultField: "merge_result",
       }),

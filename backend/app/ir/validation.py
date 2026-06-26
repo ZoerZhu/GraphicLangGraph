@@ -87,6 +87,7 @@ def validate_project(project: ProjectIR) -> ValidationResult:
 
     for node in project.nodes:
         _validate_plain_secrets(node.id, node.config, issues)
+        _validate_runtime_policy(node.id, node.type, node.config, issues)
         if node.type == NodeType.CONDITION:
             _validate_condition(node.id, node.config, outgoing[node.id], issues)
         if node.type == NodeType.AI_ROUTER:
@@ -470,6 +471,18 @@ def _validate_for_each(
         max_items = 0
     if max_items < 1 or max_items > 100:
         issues.append(_issue("FOR_EACH_MAX_ITEMS", "ForEach 最大迭代项数必须在 1-100 之间。", nodeId=node_id, field="maxItems"))
+    execution_mode = str(config.get("executionMode") or "sequential").strip().lower()
+    if execution_mode not in {"sequential", "parallel"}:
+        issues.append(_issue("FOR_EACH_EXECUTION_MODE", "ForEach executionMode 只能是 sequential 或 parallel。", nodeId=node_id, field="executionMode"))
+    try:
+        max_concurrency = int(config.get("maxConcurrency", 3))
+    except (TypeError, ValueError):
+        max_concurrency = 0
+    if max_concurrency < 1 or max_concurrency > 12:
+        issues.append(_issue("FOR_EACH_MAX_CONCURRENCY", "ForEach 最大并发必须在 1-12 之间。", nodeId=node_id, field="maxConcurrency"))
+    item_failure_policy = str(config.get("itemFailurePolicy") or "fail_fast").strip().lower()
+    if item_failure_policy not in {"fail_fast", "collect_errors"}:
+        issues.append(_issue("FOR_EACH_ITEM_FAILURE_POLICY", "ForEach itemFailurePolicy 只能是 fail_fast 或 collect_errors。", nodeId=node_id, field="itemFailurePolicy"))
 
     item_edges = [edge for edge in outgoing[node_id] if edge.kind != EdgeKind.ERROR and edge.sourceHandle == "item"]
     if not item_edges:
@@ -555,6 +568,9 @@ def _reachable_flow_control_ids(start_id: str, outgoing: dict, nodes_by_id: dict
 
 
 def _validate_merge(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
+    merge_mode = str(config.get("mergeMode") or "auto").strip().lower()
+    if merge_mode not in {"auto", "for_each", "branch"}:
+        issues.append(_issue("MERGE_MODE", "Merge mergeMode 只能是 auto、for_each 或 branch。", nodeId=node_id, field="mergeMode"))
     reducers = _json_object_list(config.get("reducersJson"))
     if not reducers:
         issues.append(_issue("MERGE_REDUCERS_REQUIRED", "Merge 至少需要一个 Reducer。", nodeId=node_id, field="reducersJson"))
@@ -577,6 +593,45 @@ def _validate_error_handler(node_id: str, config: dict, issues: list[ValidationI
         issues.append(_issue("ERROR_HANDLER_OUTPUT_FIELD", "Error Handler 必须配置输出字段。", nodeId=node_id, field="outputField"))
     if not _clean_field(config.get("errorField")):
         issues.append(_issue("ERROR_HANDLER_ERROR_FIELD", "Error Handler 必须配置 errorField。", nodeId=node_id, field="errorField"))
+
+
+def _validate_runtime_policy(node_id: str, node_type: NodeType, config: dict, issues: list[ValidationIssue]) -> None:
+    if node_type in {NodeType.START, NodeType.PARALLEL_WORKER}:
+        return
+    retry_raw = str(config.get("retryPolicyJson") or "").strip()
+    if retry_raw:
+        try:
+            retry = json.loads(retry_raw)
+        except ValueError:
+            issues.append(_issue("RUNTIME_RETRY_POLICY_JSON", "Retry Policy 必须是合法 JSON object。", nodeId=node_id, field="retryPolicyJson"))
+            retry = {}
+        if retry and not isinstance(retry, dict):
+            issues.append(_issue("RUNTIME_RETRY_POLICY_OBJECT", "Retry Policy 必须是 JSON object。", nodeId=node_id, field="retryPolicyJson"))
+        if isinstance(retry, dict):
+            try:
+                max_retries = int(retry.get("maxRetries", 0))
+            except (TypeError, ValueError):
+                max_retries = -1
+            if max_retries < 0 or max_retries > 5:
+                issues.append(_issue("RUNTIME_RETRY_MAX", "maxRetries 必须在 0-5 之间。", nodeId=node_id, field="retryPolicyJson"))
+    try:
+        timeout_sec = float(config.get("nodeTimeoutSec") or 0)
+    except (TypeError, ValueError):
+        timeout_sec = -1
+    if timeout_sec < 0 or timeout_sec > 600:
+        issues.append(_issue("RUNTIME_NODE_TIMEOUT", "节点超时必须在 0-600 秒之间。", nodeId=node_id, field="nodeTimeoutSec"))
+    error_policy = str(config.get("errorPolicy") or "default").strip().lower()
+    if error_policy not in {"default", "fail_fast", "route_error", "continue", "fallback"}:
+        issues.append(_issue("RUNTIME_ERROR_POLICY", "errorPolicy 只能是 default、fail_fast、route_error、continue 或 fallback。", nodeId=node_id, field="errorPolicy"))
+    fallback_raw = str(config.get("fallbackOutputJson") or "").strip()
+    if fallback_raw:
+        try:
+            fallback = json.loads(fallback_raw)
+        except ValueError:
+            issues.append(_issue("RUNTIME_FALLBACK_JSON", "Fallback 输出必须是合法 JSON object。", nodeId=node_id, field="fallbackOutputJson"))
+            fallback = {}
+        if fallback and not isinstance(fallback, dict):
+            issues.append(_issue("RUNTIME_FALLBACK_OBJECT", "Fallback 输出必须是 JSON object。", nodeId=node_id, field="fallbackOutputJson"))
 
 
 def _validate_custom_function(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:

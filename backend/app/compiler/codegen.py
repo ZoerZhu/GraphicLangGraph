@@ -2977,7 +2977,7 @@ def _nodes_py(project: ProjectIR) -> str:
         "import json",
         "import re",
         "import time",
-        "from concurrent.futures import ThreadPoolExecutor, as_completed",
+        "from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed",
         "from typing import Any",
         "from pathlib import Path",
         "import httpx",
@@ -3000,8 +3000,8 @@ def _nodes_py(project: ProjectIR) -> str:
         if node.type in {NodeType.START, NodeType.PARALLEL_WORKER}:
             continue
         source = _node_function(node, project)
-        if node.id in top_level_error_targets:
-            source = _wrap_error_node_function(source, py_name(node.id), node)
+        if node.id in top_level_error_targets or _node_has_runtime_policy(node):
+            source = _wrap_policy_node_function(source, py_name(node.id), node, has_error_edge=node.id in top_level_error_targets)
         body.append(source)
         body.append("")
     body.append(_nodes_helpers())
@@ -3018,21 +3018,37 @@ def _top_level_error_targets(project: ProjectIR) -> dict[str, str]:
     }
 
 
-def _wrap_error_node_function(source: str, function_name: str, node: NodeIR) -> str:
+def _node_has_runtime_policy(node: NodeIR) -> bool:
+    config = node.config
+    retry = str(config.get("retryPolicyJson") or "").strip()
+    error_policy = str(config.get("errorPolicy") or "").strip().lower()
+    return bool(
+        retry
+        or _positive_int(config.get("nodeTimeoutSec"), 0)
+        or error_policy not in {"", "default"}
+        or str(config.get("fallbackOutputJson") or "").strip()
+        or str(config.get("errorOutputField") or "").strip()
+    )
+
+
+def _wrap_policy_node_function(source: str, function_name: str, node: NodeIR, has_error_edge: bool = False) -> str:
     impl_name = f"_glg_{function_name}_body"
     wrapped_source = source.replace(f"def {function_name}(", f"def {impl_name}(", 1)
     node_meta = json.dumps({"type": str(node.type), "label": node.label}, ensure_ascii=False)
+    config = json.dumps(node.config, ensure_ascii=False)
     return wrapped_source + f'''
 
 
 def {function_name}(state: AgentState) -> dict[str, Any]:
     try:
-        result = {impl_name}(state)
+        result = _run_node_with_policy(state, {impl_name}, {config}, {node.id!r}, {node_meta})
         if isinstance(result, dict):
             result["_glg_error_from"] = ""
             return result
         return {{"_glg_error_from": ""}}
     except Exception as exc:
+        if not {has_error_edge!r}:
+            raise
         return {{
             "last_error": _runtime_error_payload({node.id!r}, {node_meta}, exc),
             "_glg_error_from": {node.id!r},
@@ -3356,6 +3372,10 @@ def _node_function(node: NodeIR, project: ProjectIR) -> str:
         index_field = json.dumps(str(node.config.get("indexField", "current_index")))
         max_items = min(_positive_int(node.config.get("maxItems"), 50), 100)
         result_field = json.dumps(str(node.config.get("resultField") or ""))
+        execution_mode = json.dumps(str(node.config.get("executionMode") or "sequential"))
+        max_concurrency = min(_positive_int(node.config.get("maxConcurrency"), 3), 12)
+        preserve_order = "False" if node.config.get("preserveOrder") is False else "True"
+        item_failure_policy = json.dumps(str(node.config.get("itemFailurePolicy") or "fail_fast"))
         function_entries = ", ".join(f"{key!r}: {value}" for key, value in maps["functionNames"].items())
         return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
     node_functions = {{{function_entries}}}
@@ -3375,13 +3395,18 @@ def _node_function(node: NodeIR, project: ProjectIR) -> str:
         {json.dumps(maps["mergeReducers"], ensure_ascii=False)},
         {json.dumps(maps["mergeResultField"])},
         {result_field},
+        {execution_mode},
+        {max_concurrency},
+        {preserve_order},
+        {item_failure_policy},
     )
 '''
     if node.type == NodeType.MERGE:
         reducers = json.dumps(_json_object_list(node.config.get("reducersJson")), ensure_ascii=False)
         result_field = json.dumps(str(node.config.get("resultField", "merge_result")))
+        merge_mode = json.dumps(str(node.config.get("mergeMode") or "auto"))
         return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
-    return _apply_merge_reducers(dict(state), [dict(state)], {reducers}, {result_field})
+    return _apply_merge_reducers(dict(state), [dict(state)], {reducers}, {result_field}, {merge_mode})
 '''
     if node.type == NodeType.ERROR_HANDLER:
         error_field = json.dumps(str(node.config.get("errorField", "last_error")))
@@ -3886,7 +3911,97 @@ def _first_target_codegen(edges: list[EdgeIR]) -> str:
 
 
 def _nodes_helpers() -> str:
-    return '''def _chat_model(provider: str, model: str, base_url: str = "", api_key_env: str = "", api_version: str = "", organization: str = ""):
+    return '''def _run_node_with_policy(state: AgentState, fn: Any, config: dict[str, Any], node_id: str, node_meta: dict[str, Any]) -> dict[str, Any]:
+    policy = _node_runtime_policy(config)
+    max_attempts = 1 + (policy["maxRetries"] if policy["retryEnabled"] else 0)
+    attempts: list[dict[str, Any]] = []
+    last_exc: Exception | None = None
+    for attempt_index in range(1, max_attempts + 1):
+        started = time.perf_counter()
+        try:
+            result = _call_node_with_timeout(lambda: fn(state), policy["timeoutSec"])
+            attempts.append({"attempt": attempt_index, "status": "ok", "durationMs": round((time.perf_counter() - started) * 1000, 2)})
+            return result if isinstance(result, dict) else {}
+        except Exception as exc:
+            last_exc = exc
+            error_type = _policy_error_type(exc)
+            attempts.append({"attempt": attempt_index, "status": "error", "durationMs": round((time.perf_counter() - started) * 1000, 2), "errorType": error_type, "message": str(exc)})
+            if attempt_index < max_attempts and _should_retry_error(policy, error_type, exc):
+                backoff_ms = min(max(policy["backoffMs"], 0) * attempt_index, 5000)
+                if backoff_ms:
+                    time.sleep(backoff_ms / 1000)
+                continue
+            break
+    assert last_exc is not None
+    payload = _runtime_error_payload(node_id, node_meta, last_exc)
+    payload["attempts"] = attempts
+    payload["errorPolicy"] = policy["errorPolicy"]
+    if policy["timeoutSec"]:
+        payload["timeoutSec"] = policy["timeoutSec"]
+    if policy["errorPolicy"] == "fallback":
+        delta = render_json_object(str(policy.get("fallbackOutputJson") or "{}"), state)
+        if policy.get("errorOutputField"):
+            delta[str(policy["errorOutputField"])] = payload
+        return delta
+    if policy["errorPolicy"] == "continue":
+        return {str(policy.get("errorOutputField") or "last_error"): payload}
+    raise RuntimeError(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+def _call_node_with_timeout(fn: Any, timeout_sec: float | None) -> dict[str, Any]:
+    if not timeout_sec:
+        return fn()
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn)
+    try:
+        return future.result(timeout=timeout_sec)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise RuntimeError(f"timeout: 节点执行超过 {timeout_sec}s。") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _node_runtime_policy(config: dict[str, Any]) -> dict[str, Any]:
+    retry = _parse_json_object(str(config.get("retryPolicyJson") or "{}"))
+    error_policy = str(config.get("errorPolicy") or "default").strip().lower() or "default"
+    if error_policy not in {"default", "fail_fast", "route_error", "continue", "fallback"}:
+        error_policy = "default"
+    max_retries = min(_positive_int(retry.get("maxRetries"), 0), 5)
+    retry_types = retry.get("retryOnErrorTypes")
+    return {
+        "retryEnabled": _truthy(retry.get("enabled")) and max_retries > 0,
+        "maxRetries": max_retries,
+        "backoffMs": min(_positive_int(retry.get("backoffMs"), 0), 30000),
+        "retryOnErrorTypes": [str(item).strip() for item in retry_types if str(item).strip()] if isinstance(retry_types, list) else [],
+        "timeoutSec": _positive_float(config.get("nodeTimeoutSec"), 0) or None,
+        "errorPolicy": error_policy,
+        "fallbackOutputJson": str(config.get("fallbackOutputJson") or "{}"),
+        "errorOutputField": str(config.get("errorOutputField") or "").strip(),
+    }
+
+
+def _should_retry_error(policy: dict[str, Any], error_type: str, exc: Exception) -> bool:
+    allowed = set(policy.get("retryOnErrorTypes") or [])
+    if not allowed:
+        return True
+    return error_type in allowed or exc.__class__.__name__ in allowed
+
+
+def _policy_error_type(exc: Exception) -> str:
+    text = str(exc).lower()
+    if "timeout" in text or "超时" in text:
+        return "timeout"
+    return exc.__class__.__name__
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _chat_model(provider: str, model: str, base_url: str = "", api_key_env: str = "", api_version: str = "", organization: str = ""):
     provider_key = provider.strip().lower().replace("-", "_") or "openai"
     api_key = env(api_key_env) if api_key_env else None
     if provider_key == "azure_openai":
@@ -4324,6 +4439,10 @@ def _run_for_each_node(
     merge_reducers: list[dict[str, Any]],
     merge_result_field: str,
     result_field: str = "",
+    execution_mode: str = "sequential",
+    max_concurrency: int = 3,
+    preserve_order: bool = True,
+    item_failure_policy: str = "fail_fast",
 ) -> dict[str, Any]:
     if not item_start or not merge_id:
         raise RuntimeError("ForEach 导出缺少循环体或 Merge 节点。")
@@ -4334,9 +4453,9 @@ def _run_for_each_node(
         items = items_value
     else:
         raise RuntimeError(f"ForEach 需要 state.{items_field} 是 array。")
-    item_states: list[dict[str, Any]] = []
-    iterations: list[dict[str, Any]] = []
-    for index, item in enumerate(list(items)[:max_items]):
+    selected_items = list(items)[:max_items]
+
+    def run_item(index: int, item: Any) -> dict[str, Any]:
         item_state = dict(state)
         item_state[item_field] = item
         item_state[index_field] = index
@@ -4374,17 +4493,59 @@ def _run_for_each_node(
             raise RuntimeError("ForEach 子链路超过 80 步，可能存在循环。")
         if not reached_merge:
             raise RuntimeError(f"ForEach 第 {index + 1} 项没有到达 Merge 节点。")
-        item_states.append(item_state)
-        iterations.append({"index": index, "item": _compact_value(item), "output": _compact_value(item_state)})
-    delta = _apply_merge_reducers(dict(state), item_states, merge_reducers, merge_result_field)
+        return {"index": index, "item": item, "itemState": item_state, "reachedMerge": reached_merge}
+
+    parallel = str(execution_mode or "sequential").strip().lower() == "parallel" and len(selected_items) > 1
+    results: list[dict[str, Any]] = []
+    if parallel:
+        with ThreadPoolExecutor(max_workers=min(max(1, int(max_concurrency or 3)), len(selected_items))) as executor:
+            futures = {executor.submit(run_item, index, item): (index, item) for index, item in enumerate(selected_items)}
+            for future in as_completed(futures):
+                index, item = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    if str(item_failure_policy or "fail_fast") != "collect_errors":
+                        raise
+                    error_payload = _runtime_error_payload("__for_each_item__", {"type": "for_each", "label": "ForEach item"}, exc)
+                    item_state = dict(state)
+                    item_state[item_field] = item
+                    item_state[index_field] = index
+                    item_state["last_error"] = error_payload
+                    item_state.setdefault("item_result", {"ok": False, "error": error_payload})
+                    results.append({"index": index, "item": item, "itemState": item_state, "error": error_payload})
+        if preserve_order:
+            results.sort(key=lambda row: int(row["index"]))
+    else:
+        for index, item in enumerate(selected_items):
+            try:
+                results.append(run_item(index, item))
+            except Exception as exc:
+                if str(item_failure_policy or "fail_fast") != "collect_errors":
+                    raise
+                error_payload = _runtime_error_payload("__for_each_item__", {"type": "for_each", "label": "ForEach item"}, exc)
+                item_state = dict(state)
+                item_state[item_field] = item
+                item_state[index_field] = index
+                item_state["last_error"] = error_payload
+                item_state.setdefault("item_result", {"ok": False, "error": error_payload})
+                results.append({"index": index, "item": item, "itemState": item_state, "error": error_payload})
+    item_states = [result["itemState"] for result in results]
+    iterations = []
+    for result in results:
+        iteration = {"index": result["index"], "item": _compact_value(result["item"]), "output": _compact_value(result["itemState"])}
+        if result.get("error"):
+            iteration["error"] = _compact_value(result["error"])
+        iterations.append(iteration)
+    delta = _apply_merge_reducers(dict(state), item_states, merge_reducers, merge_result_field, "for_each")
     if merge_result_field and isinstance(delta.get(merge_result_field), dict):
         delta[merge_result_field]["iterations"] = iterations
     if result_field:
-        delta[result_field] = {"ok": True, "itemsField": items_field, "count": len(item_states), "mergeNodeId": merge_id, "iterations": iterations}
+        delta[result_field] = {"ok": True, "itemsField": items_field, "count": len(item_states), "mergeNodeId": merge_id, "iterations": iterations, "parallel": parallel, "itemFailurePolicy": item_failure_policy}
     return delta
 
 
-def _apply_merge_reducers(state: dict[str, Any], item_states: list[dict[str, Any]], reducers: list[dict[str, Any]], result_field: str = "merge_result") -> dict[str, Any]:
+def _apply_merge_reducers(state: dict[str, Any], item_states: list[dict[str, Any]], reducers: list[dict[str, Any]], result_field: str = "merge_result", merge_mode: str = "auto") -> dict[str, Any]:
     if not reducers:
         reducers = [{"target": "merged_results", "source": "item_result", "reducer": "append"}]
     delta: dict[str, Any] = {}
@@ -4401,7 +4562,7 @@ def _apply_merge_reducers(state: dict[str, Any], item_states: list[dict[str, Any
         _set_path(delta, target, next_value, {**state, **delta})
         summaries.append({"target": target, "source": source, "reducer": operation, "count": len(values), "value": _compact_value(next_value)})
     if result_field:
-        delta[result_field] = {"ok": True, "itemCount": len(item_states), "reducers": summaries}
+        delta[result_field] = {"ok": True, "mergeMode": merge_mode, "itemCount": len(item_states), "reducers": summaries}
     return delta
 
 

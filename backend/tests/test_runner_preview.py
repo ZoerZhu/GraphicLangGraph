@@ -1454,6 +1454,239 @@ def test_top_level_error_edge_routes_to_error_handler():
     assert state["error_result"]["ok"] is False
 
 
+def test_runtime_policy_retries_node_until_success(monkeypatch):
+    project = create_default_project("Retry Policy")
+    project.state.fields.extend([StateField(name="http_response", type="dict"), StateField(name="final_answer", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="unstable_http",
+                type=NodeType.HTTP,
+                label="Unstable HTTP",
+                config={
+                    "method": "GET",
+                    "url": "https://example.com/retry",
+                    "mockResponseJson": "",
+                    "outputField": "http_response",
+                    "retryPolicyJson": json.dumps({"enabled": True, "maxRetries": 2, "backoffMs": 0}),
+                },
+            ),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.http_response }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend([EdgeIR(id="e1", source="start", target="unstable_http"), EdgeIR(id="e2", source="unstable_http", target="reply")])
+    calls = {"count": 0}
+
+    class FakeHttpResponse:
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True, "attempt": calls["count"]}
+
+    def fake_request(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("temporary failure")
+        return FakeHttpResponse()
+
+    monkeypatch.setattr(preview.httpx, "request", fake_request)
+
+    trace, state = preview.run_project_preview(project, {"messages": "run"}, "live")
+
+    assert calls["count"] == 2
+    assert trace[0]["attempts"][0]["status"] == "error"
+    assert trace[0]["attempts"][1]["status"] == "ok"
+    assert state["http_response"] == {"ok": True, "attempt": 2}
+
+
+def test_runtime_policy_timeout_fallback_continues(monkeypatch):
+    project = create_default_project("Timeout Fallback")
+    project.state.fields.extend([StateField(name="fallback_result", type="str"), StateField(name="node_error", type="dict"), StateField(name="final_answer", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="slow_http",
+                type=NodeType.HTTP,
+                label="Slow HTTP",
+                config={
+                    "method": "GET",
+                    "url": "https://example.com/slow",
+                    "mockResponseJson": "",
+                    "outputField": "http_response",
+                    "nodeTimeoutSec": 0.01,
+                    "errorPolicy": "fallback",
+                    "fallbackOutputJson": json.dumps({"fallback_result": "timeout fallback"}),
+                    "errorOutputField": "node_error",
+                },
+            ),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.fallback_result }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend([EdgeIR(id="e1", source="start", target="slow_http"), EdgeIR(id="e2", source="slow_http", target="reply")])
+
+    def fake_request(*_args, **_kwargs):
+        import time
+
+        time.sleep(0.05)
+        raise RuntimeError("should be ignored")
+
+    monkeypatch.setattr(preview.httpx, "request", fake_request)
+
+    trace, state = preview.run_project_preview(project, {"messages": "run"}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert trace[0]["errorPolicy"] == "fallback"
+    assert trace[0]["timeoutSec"] == 0.01
+    assert state["fallback_result"] == "timeout fallback"
+    assert state["node_error"]["errorType"] == "timeout"
+    assert state["final_answer"] == "timeout fallback"
+
+
+def test_runtime_policy_continue_writes_error_and_continues():
+    project = create_default_project("Continue Policy")
+    project.state.fields.extend([StateField(name="node_error", type="dict"), StateField(name="final_answer", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="bad_template",
+                type=NodeType.TEMPLATE,
+                label="Bad Template",
+                config={"template": "{bad json", "outputType": "json", "outputField": "broken", "errorPolicy": "continue", "errorOutputField": "node_error"},
+            ),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.node_error }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend([EdgeIR(id="e1", source="start", target="bad_template"), EdgeIR(id="e2", source="bad_template", target="reply")])
+
+    trace, state = preview.run_project_preview(project, {"messages": "run"}, "live")
+
+    assert trace[0]["status"] == "ok"
+    assert trace[0]["errorPolicy"] == "continue"
+    assert state["node_error"]["nodeId"] == "bad_template"
+    assert state["final_answer"]
+
+
+def test_parallel_for_each_collects_item_errors_and_preserves_order():
+    project = create_default_project("Parallel ForEach")
+    project.state.fields.extend(
+        [
+            StateField(name="items", type="list"),
+            StateField(name="merged_results", type="list"),
+            StateField(name="merge_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="each",
+                type=NodeType.FOR_EACH,
+                label="ForEach",
+                config={
+                    "itemsField": "items",
+                    "itemField": "current_item",
+                    "indexField": "current_index",
+                    "executionMode": "parallel",
+                    "maxConcurrency": 2,
+                    "preserveOrder": True,
+                    "itemFailurePolicy": "collect_errors",
+                    "resultField": "for_each_result",
+                },
+            ),
+            NodeIR(id="template", type=NodeType.TEMPLATE, label="Template", config={"template": '{"value":"{{ state.current_item }}"}', "outputType": "json", "outputField": "item_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_results }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="template", sourceHandle="item"),
+            EdgeIR(id="e3", source="template", target="merge"),
+            EdgeIR(id="e4", source="merge", target="reply"),
+        ]
+    )
+
+    trace, state = preview.run_project_preview(project, {"messages": "run", "items": ["a", 'bad " json', "c"]}, "live")
+
+    assert trace[0]["parallel"] is True
+    assert state["merged_results"][0] == {"value": "a"}
+    assert state["merged_results"][1]["ok"] is False
+    assert state["merged_results"][2] == {"value": "c"}
+    assert state["merge_result"]["iterations"][1]["error"]["nodeId"] == "template"
+    assert state["for_each_result"]["parallel"] is True
+
+
+def test_parallel_for_each_stream_preserves_child_trace():
+    project = create_default_project("Parallel ForEach Stream")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="merged_results", type="list"), StateField(name="merge_result", type="dict"), StateField(name="final_answer", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index", "executionMode": "parallel", "maxConcurrency": 2, "preserveOrder": True}),
+            NodeIR(id="template", type=NodeType.TEMPLATE, label="Template", config={"template": "{{ state.current_item }}", "outputType": "text", "outputField": "item_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_results }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="template", sourceHandle="item"),
+            EdgeIR(id="e3", source="template", target="merge"),
+            EdgeIR(id="e4", source="merge", target="reply"),
+        ]
+    )
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ["a", "b"]}, "live"))
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    child_trace = [item for item in run_end["trace"] if item["nodeId"] == "template"]
+
+    assert sorted(item["iterationIndex"] for item in child_trace) == [0, 1]
+    assert run_end["outputState"]["merged_results"] == ["a", "b"]
+    assert any(item["nodeId"] == "each" and item.get("parallel") is True for item in run_end["trace"])
+
+
+def test_branch_merge_merges_current_branch_state():
+    project = create_default_project("Branch Merge")
+    project.state.fields.extend(
+        [
+            StateField(name="route", type="str"),
+            StateField(name="branch_result", type="str"),
+            StateField(name="merged_branch", type="str"),
+            StateField(name="merge_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(id="condition", type=NodeType.CONDITION, label="Condition", config={"field": "route", "operator": "equals", "value": "a", "trueBranch": "true", "falseBranch": "false", "fallback": "false"}),
+            NodeIR(id="branch_a", type=NodeType.TEMPLATE, label="Branch A", config={"template": "A", "outputType": "text", "outputField": "branch_result"}),
+            NodeIR(id="branch_b", type=NodeType.TEMPLATE, label="Branch B", config={"template": "B", "outputType": "text", "outputField": "branch_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Branch Merge", config={"mergeMode": "branch", "reducersJson": json.dumps([{"target": "merged_branch", "source": "branch_result", "reducer": "overwrite"}]), "resultField": "merge_result"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_branch }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="condition"),
+            EdgeIR(id="e2", source="condition", target="branch_a", kind=EdgeKind.CONDITIONAL, sourceHandle="true"),
+            EdgeIR(id="e3", source="condition", target="branch_b", kind=EdgeKind.CONDITIONAL, sourceHandle="false"),
+            EdgeIR(id="e4", source="branch_a", target="merge"),
+            EdgeIR(id="e5", source="branch_b", target="merge"),
+            EdgeIR(id="e6", source="merge", target="reply"),
+        ]
+    )
+
+    _trace, state = preview.run_project_preview(project, {"messages": "run", "route": "b"}, "live")
+
+    assert state["merged_branch"] == "B"
+    assert state["merge_result"]["mergeMode"] == "branch"
+    assert state["final_answer"] == "B"
+
+
 def test_builtin_read_file_respects_runtime_allowed_roots(tmp_path: Path):
     allowed = tmp_path / "allowed"
     allowed.mkdir()
