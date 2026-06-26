@@ -479,6 +479,9 @@ export interface RunTraceItem {
   outputDelta: Record<string, unknown>;
   virtual?: boolean;
   parentNodeId?: string | null;
+  iterationIndex?: number | null;
+  iterationItem?: unknown;
+  sourceNodeId?: string | null;
   position?: Position | null;
 }
 
@@ -495,6 +498,9 @@ export interface NodeRuntimeState {
   updatedAt: string;
   virtual?: boolean;
   parentNodeId?: string | null;
+  iterationIndex?: number | null;
+  iterationItem?: unknown;
+  sourceNodeId?: string | null;
   nodeType?: NodeType;
   position?: Position | null;
 }
@@ -524,6 +530,10 @@ export type RunStreamEvent =
       type: NodeType;
       label: string;
       inputState: Record<string, unknown>;
+      parentNodeId?: string | null;
+      iterationIndex?: number | null;
+      iterationItem?: unknown;
+      sourceNodeId?: string | null;
     }
   | {
       event: "node_end";

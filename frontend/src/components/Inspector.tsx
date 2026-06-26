@@ -769,6 +769,8 @@ export function Inspector() {
         <>
           <ReducersEditor
             value={node.config.reducersJson}
+            paths={dataPaths}
+            onRefresh={() => void refreshDataShapingPaths()}
             onChange={(value) => updateNodeConfig(node.id, { reducersJson: value })}
           />
           <Field label="聚合摘要字段">
@@ -1575,24 +1577,63 @@ function AssignmentsEditor({ value, onChange, paths = [] }: { value: unknown; on
   );
 }
 
-function ReducersEditor({ value, onChange }: { value: unknown; onChange: (value: string) => void }) {
+const MERGE_REDUCER_PRESETS = [
+  { label: "append item_result", row: { target: "merged_results", source: "item_result", reducer: "append" } },
+  { label: "concat evidence", row: { target: "evidence", source: "evidence", reducer: "concat" } },
+  { label: "merge stats", row: { target: "stats", source: "stats", reducer: "merge" } },
+  { label: "first summary", row: { target: "first_summary", source: "summary", reducer: "first" } },
+  { label: "last summary", row: { target: "last_summary", source: "summary", reducer: "last" } },
+];
+
+function ReducersEditor({
+  value,
+  onChange,
+  paths = [],
+  onRefresh,
+}: {
+  value: unknown;
+  onChange: (value: string) => void;
+  paths?: DataShapingPath[];
+  onRefresh?: () => void;
+}) {
   const rows = parseObjectList(value);
   const updateRow = (index: number, patch: Record<string, unknown>) => onChange(stringifyObjectList(rows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row))));
   const addRow = () => onChange(stringifyObjectList([...rows, { target: "merged_results", source: "item_result", reducer: "append" }]));
+  const addPreset = (preset: (typeof MERGE_REDUCER_PRESETS)[number]) => onChange(stringifyObjectList([...rows, preset.row]));
   const removeRow = (index: number) => onChange(stringifyObjectList(rows.filter((_row, rowIndex) => rowIndex !== index)));
+  const sourceListId = "merge-reducer-source-paths";
+  const targetListId = "merge-reducer-target-paths";
   return (
     <div className="config-table">
       <div className="config-table__head">
         <span>Merge Reducers</span>
-        <button type="button" onClick={addRow}>
-          <Plus size={14} />
-          <span>添加</span>
-        </button>
+        <span className="history-record__actions">
+          {onRefresh ? (
+            <button type="button" onClick={onRefresh}>
+              <RefreshCw size={14} />
+              <span>刷新字段</span>
+            </button>
+          ) : null}
+          <button type="button" onClick={addRow}>
+            <Plus size={14} />
+            <span>添加</span>
+          </button>
+        </span>
       </div>
+      <div className="tool-usage-tags">
+        {MERGE_REDUCER_PRESETS.map((preset) => (
+          <button key={preset.label} type="button" onClick={() => addPreset(preset)}>
+            {preset.label}
+          </button>
+        ))}
+      </div>
+      <small className="model-config-note">
+        source 读取每轮 itemState，target 写回全局 state。append 收集为数组，concat 拼接数组，merge 合并 object，first/last 取首末非空值。
+      </small>
       {rows.map((row, index) => (
         <div className="config-table__row config-table__row--assignment" key={index}>
-          <input value={String(row.target ?? "")} onChange={(event) => updateRow(index, { target: event.target.value })} placeholder="target field" />
-          <input value={String(row.source ?? "")} onChange={(event) => updateRow(index, { source: event.target.value })} placeholder="itemState source" />
+          <input list={targetListId} value={String(row.target ?? "")} onChange={(event) => updateRow(index, { target: event.target.value })} placeholder="target field" />
+          <input list={sourceListId} value={String(row.source ?? "")} onChange={(event) => updateRow(index, { source: event.target.value })} placeholder="itemState source" />
           <select value={String(row.reducer ?? "append")} onChange={(event) => updateRow(index, { reducer: event.target.value })}>
             <option value="append">append</option>
             <option value="concat">concat</option>
@@ -1606,6 +1647,8 @@ function ReducersEditor({ value, onChange }: { value: unknown; onChange: (value:
           </button>
         </div>
       ))}
+      <PathDatalist id={sourceListId} paths={paths} />
+      <PathDatalist id={targetListId} paths={paths} />
       {rows.length === 0 ? <small className="model-config-note">至少添加一个 Reducer 才能把 itemState 聚合回全局 state。</small> : null}
     </div>
   );

@@ -342,9 +342,12 @@ def _walk_project_events(
         }
         started = time.perf_counter()
         handled_error_target: str | None = None
+        child_trace_items: list[dict[str, Any]] = []
         try:
             if mode == "live" and node.type == NodeType.PARALLEL_TOOLS:
                 delta, detail = yield from _execute_live_parallel_tools_events(project, node, state, model_config, runtime_environment, tools)
+            elif mode == "live" and node.type == NodeType.FOR_EACH:
+                delta, detail, child_trace_items = yield from _execute_for_each_node_events(project, node, state, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             else:
                 delta, detail = _execute_node(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             state.update(delta)
@@ -371,6 +374,7 @@ def _walk_project_events(
             "inputState": _compact_state(before),
             "outputDelta": _compact_state(delta),
         }
+        trace.extend(child_trace_items)
         trace.append(trace_item)
         yield {
             "event": "node_end",
@@ -1569,6 +1573,89 @@ def _execute_for_each_node(
     return delta, f"ForEach 顺序处理 {len(items)} 项；{detail}"
 
 
+def _execute_for_each_node_events(
+    project: ProjectIR,
+    node: NodeIR,
+    state: dict[str, Any],
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    skills: SkillRuntimeConfig,
+    tools: ToolRuntimeConfig,
+    mcp_servers: McpRuntimeConfig,
+    agents: AgentRuntimeConfig,
+    agent_depth: int,
+):
+    config = node.config
+    nodes = {item.id: item for item in project.nodes}
+    outgoing: dict[str, list] = {}
+    for edge in project.edges:
+        outgoing.setdefault(edge.source, []).append(edge)
+    item_start = _target_for_handle([edge for edge in outgoing.get(node.id, []) if edge.kind != EdgeKind.ERROR], "item")
+    if not item_start:
+        raise RuntimeError("ForEach 未连接 item 循环体。")
+    merge_node = _find_for_each_merge_node(item_start, nodes, outgoing)
+    if merge_node is None:
+        raise RuntimeError("ForEach 循环体必须连接到 Merge 节点。")
+
+    items_field = str(config.get("itemsField", "worker_tasks")).strip() or "worker_tasks"
+    item_field = str(config.get("itemField", "current_item")).strip() or "current_item"
+    index_field = str(config.get("indexField", "current_index")).strip() or "current_index"
+    max_items = min(_positive_int(config.get("maxItems"), 50), 100)
+    items_value = _get_path(state, items_field)
+    if isinstance(items_value, dict) and isinstance(items_value.get("tasks"), list):
+        items = items_value.get("tasks") or []
+    elif isinstance(items_value, list):
+        items = items_value
+    else:
+        raise RuntimeError(f"ForEach 需要 state.{items_field} 是 array。")
+    items = list(items)[:max_items]
+    item_states: list[dict[str, Any]] = []
+    iterations: list[dict[str, Any]] = []
+    child_trace_items: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
+        item_state = dict(state)
+        item_state[item_field] = item
+        item_state[index_field] = index
+        reached_merge = yield from _run_for_each_item_chain_events(
+            item_start,
+            merge_node.id,
+            item_state,
+            project,
+            nodes,
+            outgoing,
+            model_config,
+            runtime_environment,
+            skills,
+            tools,
+            mcp_servers,
+            agents,
+            agent_depth,
+            node,
+            index,
+            item,
+            child_trace_items,
+        )
+        if not reached_merge:
+            raise RuntimeError(f"ForEach 第 {index + 1} 项没有到达 Merge 节点。")
+        item_states.append(item_state)
+        iterations.append({"index": index, "item": _compact_value(item), "output": _compact_state(item_state)})
+
+    delta, detail = _execute_merge_node(merge_node, state, item_states)
+    merge_result_field = str(merge_node.config.get("resultField", "merge_result")).strip() or "merge_result"
+    if isinstance(delta.get(merge_result_field), dict):
+        delta[merge_result_field]["iterations"] = iterations
+    result_field = str(config.get("resultField") or "").strip()
+    if result_field:
+        delta[result_field] = {
+            "ok": True,
+            "itemsField": items_field,
+            "count": len(items),
+            "mergeNodeId": merge_node.id,
+            "iterations": iterations,
+        }
+    return delta, f"ForEach 顺序处理 {len(items)} 项；{detail}", child_trace_items
+
+
 def _run_for_each_item_chain(
     start_node_id: str,
     merge_node_id: str,
@@ -1607,6 +1694,88 @@ def _run_for_each_item_chain(
         if child.type == NodeType.DIRECT_REPLY:
             return False
         current = _next_execution_target(child, nodes, outgoing, item_state)
+    if visited >= MAX_STEPS:
+        raise RuntimeError(f"ForEach 子链路超过 {MAX_STEPS} 步，可能存在循环。")
+    return False
+
+
+def _run_for_each_item_chain_events(
+    start_node_id: str,
+    merge_node_id: str,
+    item_state: dict[str, Any],
+    project: ProjectIR,
+    nodes: dict[str, NodeIR],
+    outgoing: dict[str, list],
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    skills: SkillRuntimeConfig,
+    tools: ToolRuntimeConfig,
+    mcp_servers: McpRuntimeConfig,
+    agents: AgentRuntimeConfig,
+    agent_depth: int,
+    parent_node: NodeIR,
+    iteration_index: int,
+    iteration_item: Any,
+    child_trace_items: list[dict[str, Any]],
+) -> bool:
+    current = start_node_id
+    visited = 0
+    while current and current in nodes and visited < MAX_STEPS:
+        if current == merge_node_id:
+            return True
+        visited += 1
+        child = nodes[current]
+        if child.type in {NodeType.FOR_EACH, NodeType.MERGE}:
+            raise RuntimeError(f"ForEach v1 不支持嵌套或提前执行 {child.type} 节点。")
+        before = dict(item_state)
+        event_meta = {
+            "parentNodeId": parent_node.id,
+            "iterationIndex": iteration_index,
+            "iterationItem": _compact_value(iteration_item),
+            "sourceNodeId": child.id,
+        }
+        yield {
+            "event": "node_start",
+            "nodeId": child.id,
+            "type": str(child.type),
+            "label": child.label,
+            "inputState": _compact_state(before),
+            **event_meta,
+        }
+        started = time.perf_counter()
+        handled_error_target: str | None = None
+        try:
+            delta, detail = _execute_node(child, project, item_state, "live", model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+            item_state.update(delta)
+            status = "ok"
+        except Exception as exc:
+            handled_error_target = _error_execution_target(child, outgoing)
+            delta = {"last_error": _runtime_error_payload(child, exc)}
+            item_state.update(delta)
+            detail = f"{_format_error(exc)}；已转入 error 分支。" if handled_error_target else _format_error(exc)
+            status = "error"
+        trace_item = {
+            "nodeId": child.id,
+            "type": str(child.type),
+            "label": child.label,
+            "status": status,
+            "detail": detail,
+            "durationMs": round((time.perf_counter() - started) * 1000, 2),
+            "inputState": _compact_state(before),
+            "outputDelta": _compact_state(delta),
+            **event_meta,
+        }
+        child_trace_items.append(trace_item)
+        yield {
+            "event": "node_end",
+            "traceItem": trace_item,
+            "outputState": _compact_state(item_state),
+        }
+        if status == "error" and not handled_error_target:
+            raise RuntimeError(detail)
+        if child.type == NodeType.DIRECT_REPLY:
+            return False
+        current = handled_error_target or _next_execution_target(child, nodes, outgoing, item_state)
     if visited >= MAX_STEPS:
         raise RuntimeError(f"ForEach 子链路超过 {MAX_STEPS} 步，可能存在循环。")
     return False

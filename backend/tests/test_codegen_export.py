@@ -377,6 +377,49 @@ def test_codegen_exports_flow_control_nodes():
     compile(graph_py, "graph.py", "exec")
 
 
+def test_codegen_exports_top_level_error_edge_routing():
+    project = create_default_project("Top Level Error Export")
+    project.state.fields.extend(
+        [
+            StateField(name="error_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(id="bad_template", type=NodeType.TEMPLATE, label="Bad Template", config={"template": "{bad json", "outputType": "json", "outputField": "broken"}),
+            NodeIR(id="error_handler", type=NodeType.ERROR_HANDLER, label="Error Handler", config={"errorField": "last_error", "template": "handled", "outputField": "error_result"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.error_result }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="bad_template"),
+            EdgeIR(id="e2", source="bad_template", target="reply"),
+            EdgeIR(id="e3", source="bad_template", target="error_handler", kind=EdgeKind.ERROR, sourceHandle="error"),
+            EdgeIR(id="e4", source="error_handler", target="reply"),
+        ]
+    )
+
+    generated = generate_project_files(project)
+    nodes_py = next(value for path, value in generated.items() if path.endswith("/nodes.py"))
+    routers_py = next(value for path, value in generated.items() if path.endswith("/routers.py"))
+    graph_py = next(value for path, value in generated.items() if path.endswith("/graph.py"))
+
+    assert "def _glg_bad_template_body" in nodes_py
+    assert '"_glg_error_from": \'bad_template\'' in nodes_py
+    assert "def route_bad_template" in routers_py
+    assert 'return "error"' in routers_py
+    assert "builder.add_conditional_edges(" in graph_py
+    assert '"bad_template"' in graph_py
+    assert '"error": "error_handler"' in graph_py
+    assert '"__success__": "reply"' in graph_py
+    assert 'builder.add_edge("bad_template", "reply")' not in graph_py
+    compile(nodes_py, "nodes.py", "exec")
+    compile(routers_py, "routers.py", "exec")
+    compile(graph_py, "graph.py", "exec")
+
+
 def test_codegen_embeds_agent_ref_project(monkeypatch):
     child = create_default_project("Child Export Agent")
     child.project.id = "child_export_agent"

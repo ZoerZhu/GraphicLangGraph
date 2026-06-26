@@ -1298,6 +1298,57 @@ def test_for_each_runs_item_chain_and_merge_reducers_isolated():
     assert "current_item" not in state
 
 
+def test_for_each_stream_emits_iteration_child_node_events():
+    project = create_default_project("ForEach Stream")
+    project.state.fields.extend(
+        [
+            StateField(name="items", type="list"),
+            StateField(name="merged_results", type="list"),
+            StateField(name="merge_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index"}),
+            NodeIR(
+                id="assign_item",
+                type=NodeType.VARIABLE_ASSIGN,
+                label="Assign Item",
+                config={
+                    "assignmentsJson": json.dumps(
+                        [{"target": "item_result", "operation": "overwrite", "sourceType": "state", "source": "current_item", "valueType": "string"}]
+                    ),
+                    "resultField": "assignment_result",
+                },
+            ),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_results }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="assign_item", sourceHandle="item"),
+            EdgeIR(id="e3", source="assign_item", target="merge"),
+            EdgeIR(id="e4", source="merge", target="reply"),
+        ]
+    )
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ["a", "b"]}, "live"))
+
+    child_starts = [event for event in events if event.get("event") == "node_start" and event.get("nodeId") == "assign_item"]
+    child_ends = [event["traceItem"] for event in events if event.get("event") == "node_end" and event.get("traceItem", {}).get("nodeId") == "assign_item"]
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    history_child_trace = [item for item in run_end["trace"] if item["nodeId"] == "assign_item"]
+
+    assert [event["iterationIndex"] for event in child_starts] == [0, 1]
+    assert [item["iterationIndex"] for item in child_ends] == [0, 1]
+    assert all(item["parentNodeId"] == "each" for item in child_ends)
+    assert [item["outputDelta"]["item_result"] for item in history_child_trace] == ["a", "b"]
+    assert run_end["outputState"]["merged_results"] == ["a", "b"]
+
+
 def test_for_each_item_error_can_route_to_error_handler_before_merge():
     project = create_default_project("ForEach Error")
     project.state.fields.extend(
@@ -1333,6 +1384,48 @@ def test_for_each_item_error_can_route_to_error_handler_before_merge():
     assert state["merged_results"][0]["ok"] is False
     assert state["merged_results"][0]["error"]["nodeId"] == "bad_template"
     assert state["final_answer"]
+
+
+def test_for_each_stream_shows_child_error_handler_iterations():
+    project = create_default_project("ForEach Error Stream")
+    project.state.fields.extend(
+        [
+            StateField(name="items", type="list"),
+            StateField(name="merged_results", type="list"),
+            StateField(name="merge_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index"}),
+            NodeIR(id="bad_template", type=NodeType.TEMPLATE, label="Bad Template", config={"template": "{bad json", "outputType": "json", "outputField": "item_result"}),
+            NodeIR(id="error_handler", type=NodeType.ERROR_HANDLER, label="Error Handler", config={"errorField": "last_error", "template": "handled {{ state.last_error }}", "outputField": "item_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_results }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="bad_template", sourceHandle="item"),
+            EdgeIR(id="e3", source="bad_template", target="error_handler", kind=EdgeKind.ERROR, sourceHandle="error"),
+            EdgeIR(id="e4", source="error_handler", target="merge"),
+            EdgeIR(id="e5", source="merge", target="reply"),
+        ]
+    )
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ["a"]}, "live"))
+
+    child_ends = [event["traceItem"] for event in events if event.get("event") == "node_end" and event.get("traceItem", {}).get("parentNodeId") == "each"]
+    run_end = next(event for event in events if event.get("event") == "run_end")
+
+    assert [(item["nodeId"], item["status"], item["iterationIndex"]) for item in child_ends] == [
+        ("bad_template", "error", 0),
+        ("error_handler", "ok", 0),
+    ]
+    assert run_end["outputState"]["merged_results"][0]["ok"] is False
+    assert run_end["outputState"]["merge_result"]["iterations"][0]["index"] == 0
 
 
 def test_top_level_error_edge_routes_to_error_handler():

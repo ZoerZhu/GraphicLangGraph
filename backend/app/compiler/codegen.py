@@ -515,12 +515,16 @@ def _state_py(project: ProjectIR) -> str:
         "",
         "class AgentState(MessagesState):",
     ]
-    if not project.state.fields:
-        lines.append("    pass")
-    else:
-        for field in project.state.fields:
-            type_name = TYPE_MAP.get(field.type.lower(), "Any")
-            lines.append(f"    {py_name(field.name)}: NotRequired[{type_name}]")
+    emitted_fields: set[str] = set()
+    for field in project.state.fields:
+        field_name = py_name(field.name)
+        emitted_fields.add(field_name)
+        type_name = TYPE_MAP.get(field.type.lower(), "Any")
+        lines.append(f"    {field_name}: NotRequired[{type_name}]")
+    if "last_error" not in emitted_fields:
+        lines.append("    last_error: NotRequired[dict[str, Any]]")
+    if "_glg_error_from" not in emitted_fields:
+        lines.append("    _glg_error_from: NotRequired[str]")
     return "\n".join(lines) + "\n"
 
 
@@ -2991,14 +2995,49 @@ def _nodes_py(project: ProjectIR) -> str:
         "from .tools import TOOL_REGISTRY",
         "",
     ]
+    top_level_error_targets = _top_level_error_targets(project)
     for node in project.nodes:
         if node.type in {NodeType.START, NodeType.PARALLEL_WORKER}:
             continue
-        body.append(_node_function(node, project))
+        source = _node_function(node, project)
+        if node.id in top_level_error_targets:
+            source = _wrap_error_node_function(source, py_name(node.id), node)
+        body.append(source)
         body.append("")
     body.append(_nodes_helpers())
     body.append("")
     return "\n".join(body)
+
+
+def _top_level_error_targets(project: ProjectIR) -> dict[str, str]:
+    internal_ids = _for_each_internal_node_ids(project)
+    return {
+        edge.source: edge.target
+        for edge in project.edges
+        if edge.kind == EdgeKind.ERROR and edge.source not in internal_ids and edge.target not in internal_ids
+    }
+
+
+def _wrap_error_node_function(source: str, function_name: str, node: NodeIR) -> str:
+    impl_name = f"_glg_{function_name}_body"
+    wrapped_source = source.replace(f"def {function_name}(", f"def {impl_name}(", 1)
+    node_meta = json.dumps({"type": str(node.type), "label": node.label}, ensure_ascii=False)
+    return wrapped_source + f'''
+
+
+def {function_name}(state: AgentState) -> dict[str, Any]:
+    try:
+        result = {impl_name}(state)
+        if isinstance(result, dict):
+            result["_glg_error_from"] = ""
+            return result
+        return {{"_glg_error_from": ""}}
+    except Exception as exc:
+        return {{
+            "last_error": _runtime_error_payload({node.id!r}, {node_meta}, exc),
+            "_glg_error_from": {node.id!r},
+        }}
+'''
 
 
 def _for_each_codegen_maps(project: ProjectIR, node: NodeIR) -> dict[str, Any]:
@@ -3554,10 +3593,12 @@ def _{function_name}_impl(state: AgentState):
 
 
 def _routers_py(project: ProjectIR) -> str:
+    top_level_error_targets = _top_level_error_targets(project)
     condition_nodes = [
         node
         for node in project.nodes
         if node.type in {NodeType.CONDITION, NodeType.AI_ROUTER, NodeType.HUMAN_APPROVAL, NodeType.JSON_EXTRACTOR, NodeType.JSON_VALIDATOR}
+        or node.id in top_level_error_targets
     ]
     if not condition_nodes:
         return "from __future__ import annotations\n\n"
@@ -3571,17 +3612,18 @@ def _routers_py(project: ProjectIR) -> str:
         "",
     ]
     for node in condition_nodes:
-        body.append(_route_function(node))
+        body.append(_route_function(node, has_error_edge=node.id in top_level_error_targets))
         body.append("")
     return "\n".join(body)
 
 
-def _route_function(node: NodeIR) -> str:
+def _route_function(node: NodeIR, has_error_edge: bool = False) -> str:
     name = py_name(node.id)
+    error_check = f'    if state.get("_glg_error_from") == {node.id!r}:\n        return "error"\n' if has_error_edge else ""
     if node.type in {NodeType.JSON_EXTRACTOR, NodeType.JSON_VALIDATOR}:
         validation_field = str(node.config.get("validationField", "validation_result"))
         return f'''def route_{name}(state: AgentState) -> str:
-    validation = state.get({validation_field!r})
+{error_check}    validation = state.get({validation_field!r})
     if isinstance(validation, dict) and validation.get("valid") is True:
         return "valid"
     return "invalid"
@@ -3590,13 +3632,17 @@ def _route_function(node: NodeIR) -> str:
         route_field = py_name(str(node.config.get("routeField", "route_key")))
         fallback = str(node.config.get("fallback", "other"))
         return f'''def route_{name}(state: AgentState) -> str:
-    return str(state.get("{route_field}") or {fallback!r})
+{error_check}    return str(state.get("{route_field}") or {fallback!r})
 '''
     if node.type == NodeType.HUMAN_APPROVAL:
         action_field = py_name(str(node.config.get("actionField", "approval_action")))
         fallback = str(node.config.get("fallback", "rejected"))
         return f'''def route_{name}(state: AgentState) -> str:
-    return str(state.get("{action_field}") or {fallback!r})
+{error_check}    return str(state.get("{action_field}") or {fallback!r})
+'''
+    if node.type != NodeType.CONDITION:
+        return f'''def route_{name}(state: AgentState) -> str:
+{error_check}    return "__success__"
 '''
     field = py_name(str(node.config.get("field", "")))
     operator = str(node.config.get("operator", "equals"))
@@ -3605,7 +3651,7 @@ def _route_function(node: NodeIR) -> str:
     false_branch = str(node.config.get("falseBranch", "false"))
     fallback = str(node.config.get("fallback", "fallback"))
     return f'''def route_{name}(state: AgentState) -> str:
-    current = state.get("{field}")
+{error_check}    current = state.get("{field}")
     expected = {value!r}
     if _compare(current, expected, "{operator}"):
         return {true_branch!r}
@@ -3632,6 +3678,8 @@ def _compare(current: Any, expected: str, operator: str) -> bool:
 
 def _graph_py(project: ProjectIR) -> str:
     for_each_internal_ids = _for_each_internal_node_ids(project)
+    nodes_by_id = {node.id: node for node in project.nodes}
+    top_level_error_targets = _top_level_error_targets(project)
     normal_edges = [
         edge
         for edge in project.edges
@@ -3651,12 +3699,14 @@ def _graph_py(project: ProjectIR) -> str:
 
     worker_bridge_edges = _parallel_worker_bridge_edges(project)
     for_each_bridge_edges = _for_each_bridge_edges(project)
+    success_edges = [*normal_edges, *worker_bridge_edges, *for_each_bridge_edges]
     non_start_nodes = [node for node in project.nodes if node.type not in {NodeType.START, NodeType.PARALLEL_WORKER} and node.id not in for_each_internal_ids]
     condition_ids = {
         node.id
         for node in project.nodes
         if node.type in {NodeType.CONDITION, NodeType.AI_ROUTER, NodeType.HUMAN_APPROVAL, NodeType.JSON_EXTRACTOR, NodeType.JSON_VALIDATOR}
     }
+    condition_ids.update(top_level_error_targets)
     has_human_approval = any(node.type == NodeType.HUMAN_APPROVAL for node in project.nodes)
 
     imports = ["from .nodes import " + ", ".join(py_name(node.id) for node in non_start_nodes)]
@@ -3684,7 +3734,26 @@ def _graph_py(project: ProjectIR) -> str:
 
     start_ids = {node.id for node in project.nodes if node.type == NodeType.START}
     direct_reply_ids = {node.id for node in project.nodes if node.type == NodeType.DIRECT_REPLY}
-    for edge in [*normal_edges, *worker_bridge_edges, *for_each_bridge_edges]:
+    for source, target in top_level_error_targets.items():
+        condition_edge_map[source]["error"] = target
+        source_node = nodes_by_id.get(source)
+        source_has_condition_branches = source_node is not None and source_node.type in {
+            NodeType.CONDITION,
+            NodeType.AI_ROUTER,
+            NodeType.HUMAN_APPROVAL,
+            NodeType.JSON_EXTRACTOR,
+            NodeType.JSON_VALIDATOR,
+        }
+        if not source_has_condition_branches:
+            success_target = next((edge.target for edge in success_edges if edge.source == source), "")
+            if not success_target and source in direct_reply_ids:
+                success_target = "__end__"
+            if success_target:
+                condition_edge_map[source]["__success__"] = success_target
+
+    for edge in success_edges:
+        if edge.source in top_level_error_targets:
+            continue
         if edge.source in start_ids:
             lines.append(f'builder.add_edge(START, "{edge.target}")')
         elif edge.source not in direct_reply_ids:
@@ -3704,6 +3773,8 @@ def _graph_py(project: ProjectIR) -> str:
         )
 
     for reply_id in direct_reply_ids:
+        if reply_id in top_level_error_targets:
+            continue
         lines.append(f'builder.add_edge("{reply_id}", END)')
 
     if has_human_approval:

@@ -2798,6 +2798,10 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
           inputState: event.inputState,
           outputDelta: {},
           updatedAt: now,
+          parentNodeId: event.parentNodeId ?? null,
+          iterationIndex: event.iterationIndex ?? null,
+          iterationItem: event.iterationItem,
+          sourceNodeId: event.sourceNodeId ?? null,
         },
       },
       runResult: state.runResult
@@ -2817,6 +2821,10 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
       inputState: event.traceItem.inputState,
       outputDelta: event.traceItem.outputDelta,
       updatedAt: now,
+      parentNodeId: event.traceItem.parentNodeId ?? null,
+      iterationIndex: event.traceItem.iterationIndex ?? null,
+      iterationItem: event.traceItem.iterationItem,
+      sourceNodeId: event.traceItem.sourceNodeId ?? null,
     };
     return {
       runRunning: true,
@@ -2903,9 +2911,19 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
 }
 
 function upsertTraceItem(trace: RunTraceItem[], item: RunTraceItem): RunTraceItem[] {
-  const index = trace.findIndex((current) => current.nodeId === item.nodeId);
+  const identity = traceItemIdentity(item);
+  const index = trace.findIndex((current) => traceItemIdentity(current) === identity);
   if (index === -1) return [...trace, item];
   return trace.map((current, currentIndex) => (currentIndex === index ? item : current));
+}
+
+function traceItemIdentity(item: RunTraceItem): string {
+  return [
+    item.nodeId,
+    item.parentNodeId ?? "",
+    item.iterationIndex ?? "",
+    item.sourceNodeId ?? "",
+  ].join("::");
 }
 
 function createHistoryId() {
