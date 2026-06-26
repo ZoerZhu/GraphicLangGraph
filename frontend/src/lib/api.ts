@@ -13,6 +13,7 @@ import type {
   RagKnowledgeBaseConfig,
   ResourceGroupConfig,
   RuntimeEnvironmentConfig,
+  RunHistoryRecord,
   RunMode,
   RunPreviewResult,
   RunStreamEvent,
@@ -37,6 +38,8 @@ import {
   RagKnowledgeBaseListSchema,
   ResourceGroupConfigListSchema,
   RuntimeEnvironmentConfigListSchema,
+  RunHistoryRecordListSchema,
+  RunHistoryRecordSchema,
   RunPreviewResultSchema,
   SkillConfigListSchema,
   SkillImportResultSchema,
@@ -360,6 +363,33 @@ export async function runProjectPreview(
     body: JSON.stringify({ input, mode, modelConfig, runtimeEnvironment }),
   });
   return RunPreviewResultSchema.parse(data) as RunPreviewResult;
+}
+
+export async function listProjectRunHistory(projectId: string): Promise<RunHistoryRecord[]> {
+  const data = await request(`/api/projects/${projectId}/runs`);
+  return RunHistoryRecordListSchema.parse(data) as RunHistoryRecord[];
+}
+
+export async function saveProjectRunHistory(projectId: string, record: RunHistoryRecord): Promise<RunHistoryRecord> {
+  const data = await request(`/api/projects/${projectId}/runs`, {
+    method: "POST",
+    body: JSON.stringify(record),
+  });
+  return RunHistoryRecordSchema.parse(data) as RunHistoryRecord;
+}
+
+export async function deleteProjectRunHistory(projectId: string, runId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/runs/${runId}`, { method: "DELETE" });
+  if (!response.ok) {
+    throw new Error(await parseResponseError(response));
+  }
+}
+
+export async function clearProjectRunHistory(projectId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/runs`, { method: "DELETE" });
+  if (!response.ok) {
+    throw new Error(await parseResponseError(response));
+  }
 }
 
 export async function streamProjectPreview(

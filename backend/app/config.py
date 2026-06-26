@@ -15,6 +15,7 @@ WORKSPACE_SKILLS_FILE = WORKSPACE_DIR / "skills.json"
 WORKSPACE_RESOURCE_GROUPS_FILE = WORKSPACE_DIR / "resource_groups.json"
 WORKSPACE_RUNTIME_ENVIRONMENTS_FILE = WORKSPACE_DIR / "runtime_environments.json"
 EDIT_SESSIONS_DIR = ROOT_DIR / "storage" / "edit_sessions"
+RUNS_DIR = ROOT_DIR / "storage" / "runs"
 CONFIG_DIR = ROOT_DIR / "config"
 CONFIG_MCP_DIR = CONFIG_DIR / "mcp"
 CONFIG_TOOLS_DIR = CONFIG_DIR / "tools"
@@ -28,6 +29,7 @@ def ensure_runtime_dirs() -> None:
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     EDIT_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_MCP_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_SKILLS_DIR.mkdir(parents=True, exist_ok=True)

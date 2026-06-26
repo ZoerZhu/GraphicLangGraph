@@ -24,3 +24,5 @@ exports/*.png
 exports/builds/
 frontend/vite.config.js
 frontend/vite.config.d.ts
+test/
+docs/

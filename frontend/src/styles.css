@@ -2819,14 +2819,34 @@ button.icon-only {
   width: 100%;
   min-height: 54px;
   display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  align-items: center;
   justify-items: start;
-  gap: 2px;
+  gap: 7px;
   border: 1px solid var(--line);
   border-radius: 12px;
-  padding: 8px;
+  padding: 6px 7px 6px 8px;
   color: var(--ink);
   background: rgba(255, 255, 255, 0.68);
   text-align: left;
+}
+
+.run-history-record__main {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  justify-items: start;
+  gap: 2px;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+}
+
+.run-history-record__delete {
+  width: 28px;
+  height: 28px;
 }
 
 .run-history-record.is-selected {

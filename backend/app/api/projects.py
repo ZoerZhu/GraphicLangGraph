@@ -14,6 +14,7 @@ from app.ir.sanitization import sanitized_project
 from app.ir.schemas import ProjectIR, create_default_project
 from app.ir.validation import validate_project
 from app.project_store import project_path, read_project, write_project
+from app.run_store import clear_run_records, delete_run_record, list_run_records, save_run_record
 from app.runtime_environment import RuntimeEnvironmentConfig, resolve_runtime_environment
 from app.runner import iter_project_preview_events, run_project_preview as run_project_preview_engine
 
@@ -93,6 +94,13 @@ class RunPreviewResponse(BaseModel):
     outputState: dict[str, Any]
 
 
+class RunHistoryRecordPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    projectId: str = ""
+
+
 class ProjectListItem(BaseModel):
     id: str
     name: str
@@ -164,6 +172,7 @@ def delete_project(project_id: str) -> None:
     if not path.exists():
         raise HTTPException(status_code=404, detail="Project not found")
     path.unlink()
+    clear_run_records(project_id)
 
 
 @router.post("/projects/{project_id}/validate")
@@ -206,6 +215,30 @@ def run_project_preview(project_id: str, payload: RunPreviewRequest | None = Non
         trace=trace,
         outputState=output_state,
     )
+
+
+@router.get("/projects/{project_id}/runs")
+def list_project_runs(project_id: str) -> list[dict[str, Any]]:
+    read_project(project_id)
+    return list_run_records(project_id)
+
+
+@router.post("/projects/{project_id}/runs")
+def save_project_run(project_id: str, record: RunHistoryRecordPayload) -> dict[str, Any]:
+    read_project(project_id)
+    return save_run_record(project_id, record.model_dump(mode="json"))
+
+
+@router.delete("/projects/{project_id}/runs/{run_id}", status_code=204)
+def delete_project_run(project_id: str, run_id: str) -> None:
+    read_project(project_id)
+    delete_run_record(project_id, run_id)
+
+
+@router.delete("/projects/{project_id}/runs", status_code=204)
+def clear_project_runs(project_id: str) -> None:
+    read_project(project_id)
+    clear_run_records(project_id)
 
 
 @router.post("/projects/{project_id}/run/stream")

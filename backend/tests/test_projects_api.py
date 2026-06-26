@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 import app.config as app_config
 import app.api.workspace as workspace_api
+import app.run_store as run_store
 import app.runtime_environment as runtime_environment
 from app.main import app
 
@@ -183,6 +184,50 @@ def test_project_run_stream_emits_node_events():
 
     deleted = client.delete(f"/api/projects/{project_id}")
     assert deleted.status_code == 204
+
+
+def test_project_run_history_persists_to_runs_dir(tmp_path, monkeypatch):
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setattr(app_config, "RUNS_DIR", runs_dir)
+    monkeypatch.setattr(run_store, "RUNS_DIR", runs_dir)
+    client = TestClient(app)
+
+    created = client.post("/api/projects", json={"name": "运行历史落盘 Agent"})
+    assert created.status_code == 200
+    project_id = created.json()["project"]["id"]
+    record = {
+        "id": "history_test_run",
+        "projectId": project_id,
+        "projectName": "运行历史落盘 Agent",
+        "createdAt": "2026-06-26T00:00:00.000Z",
+        "modelConfigId": None,
+        "modelConfigName": "测试模型",
+        "inputState": {"messages": "hello"},
+        "result": {"mode": "live", "valid": True, "issues": [], "trace": [], "outputState": {"answer": "ok"}},
+        "runtimeNodes": {},
+    }
+
+    saved = client.post(f"/api/projects/{project_id}/runs", json=record)
+    assert saved.status_code == 200
+    run_file = runs_dir / project_id / "history_test_run.json"
+    assert run_file.exists()
+    assert json.loads(run_file.read_text(encoding="utf-8"))["result"]["outputState"]["answer"] == "ok"
+
+    listed = client.get(f"/api/projects/{project_id}/runs")
+    assert listed.status_code == 200
+    assert listed.json()[0]["id"] == "history_test_run"
+
+    deleted = client.delete(f"/api/projects/{project_id}/runs/history_test_run")
+    assert deleted.status_code == 204
+    assert not run_file.exists()
+
+    saved_again = client.post(f"/api/projects/{project_id}/runs", json=record)
+    assert saved_again.status_code == 200
+    cleared = client.delete(f"/api/projects/{project_id}/runs")
+    assert cleared.status_code == 204
+    assert not (runs_dir / project_id).exists()
+
+    assert client.delete(f"/api/projects/{project_id}").status_code == 204
 
 
 def test_project_save_and_read_preserves_skills():

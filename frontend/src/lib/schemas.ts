@@ -423,3 +423,19 @@ export const RunPreviewResultSchema = z.object({
   ),
   outputState: z.record(z.unknown()),
 });
+
+export const RunHistoryRecordSchema = z.object({
+  id: z.string(),
+  projectId: z.string(),
+  projectName: z.string(),
+  createdAt: z.string(),
+  modelConfigId: z.string().nullable(),
+  modelConfigName: z.string(),
+  inputState: z.record(z.unknown()),
+  graphFingerprint: z.string().optional(),
+  graphSnapshot: z.unknown().optional(),
+  result: RunPreviewResultSchema,
+  runtimeNodes: z.record(z.unknown()),
+});
+
+export const RunHistoryRecordListSchema = z.array(RunHistoryRecordSchema);

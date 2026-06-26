@@ -31,6 +31,7 @@ export function RunPreviewPanel() {
   const selectNode = useProjectStore((state) => state.selectNode);
   const selectRunHistoryRecord = useProjectStore((state) => state.selectRunHistoryRecord);
   const setRunHistoryReplayMode = useProjectStore((state) => state.setRunHistoryReplayMode);
+  const deleteRunHistoryRecord = useProjectStore((state) => state.deleteRunHistoryRecord);
   const clearRunHistory = useProjectStore((state) => state.clearRunHistory);
   const enabledModels = workspaceModelConfigs.filter((config) => config.enabled);
   const selectableNodeIds = runHistoryMismatch && runHistoryReplayMode === "details"
@@ -111,6 +112,7 @@ export function RunPreviewPanel() {
           records={runHistoryRecords}
           selectedId={selectedRunHistoryId}
           onClear={clearRunHistory}
+          onDelete={deleteRunHistoryRecord}
           onSelect={selectRunHistoryRecord}
         />
 
@@ -302,11 +304,13 @@ function RunHistoryList({
   records,
   selectedId,
   onSelect,
+  onDelete,
   onClear,
 }: {
   records: RunHistoryRecord[];
   selectedId: string | null;
   onSelect: (id: string) => void;
+  onDelete: (id: string) => void;
   onClear: () => void;
 }) {
   return (
@@ -320,18 +324,18 @@ function RunHistoryList({
       {records.length ? (
         <div className="run-history-list">
           {records.map((record) => (
-            <button
-              key={record.id}
-              className={`run-history-record ${record.id === selectedId ? "is-selected" : ""}`}
-              onClick={() => onSelect(record.id)}
-              type="button"
-            >
-              <strong>{formatTime(record.createdAt)}</strong>
-              <span>{record.modelConfigName}</span>
-              <small>
-                {record.result.trace.length} 节点 · {record.result.valid ? "校验通过" : `${record.result.issues.length} 个问题`}
-              </small>
-            </button>
+            <div key={record.id} className={`run-history-record ${record.id === selectedId ? "is-selected" : ""}`}>
+              <button className="run-history-record__main" onClick={() => onSelect(record.id)} type="button">
+                <strong>{formatTime(record.createdAt)}</strong>
+                <span>{record.modelConfigName}</span>
+                <small>
+                  {record.result.trace.length} 节点 · {record.result.valid ? "校验通过" : `${record.result.issues.length} 个问题`}
+                </small>
+              </button>
+              <button className="icon-only run-history-record__delete" onClick={() => onDelete(record.id)} title="删除该运行历史" type="button">
+                <Trash2 size={13} />
+              </button>
+            </div>
           ))}
         </div>
       ) : (

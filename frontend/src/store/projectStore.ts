@@ -14,8 +14,11 @@ import {
   autosaveProject,
   createProject,
   deleteProject,
+  clearProjectRunHistory,
+  deleteProjectRunHistory,
   exportProject,
   getProject,
+  listProjectRunHistory,
   listWorkspaceMcpServers,
   listWorkspaceRagKnowledgeBases,
   listWorkspaceResourceGroups,
@@ -32,6 +35,7 @@ import {
   saveWorkspaceSkills,
   saveWorkspaceTools,
   saveProject,
+  saveProjectRunHistory,
   streamProjectPreview,
   validateProject,
 } from "../lib/api";
@@ -177,7 +181,8 @@ interface ProjectStore {
   setSelectedRunModelConfigId: (id: string | null) => void;
   selectRunHistoryRecord: (recordId: string) => void;
   setRunHistoryReplayMode: (mode: RunHistoryReplayMode) => void;
-  clearRunHistory: () => void;
+  deleteRunHistoryRecord: (recordId: string) => Promise<void>;
+  clearRunHistory: () => Promise<void>;
   cancelRun: () => void;
   runPreview: () => Promise<void>;
   openSplitAgent: (projectId: string) => Promise<void>;
@@ -344,6 +349,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   async openProject(projectId) {
     set({ loading: true, status: "正在打开 Agent" });
     const project = ensureProjectRuntimeEnvironment(await getProject(projectId), get().workspaceRuntimeEnvironments);
+    const runHistoryRecords = await loadRunHistoryRecords(project.project.id);
     localStorage.setItem(PROJECT_KEY, project.project.id);
     set({
       mode: "editor",
@@ -365,7 +371,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       runCollapsed: false,
       runResult: null,
       runRunning: false,
-      runHistoryRecords: readRunHistory(project.project.id),
+      runHistoryRecords,
       selectedRunHistoryId: null,
       runHistoryReplayMode: "overlay",
       runHistoryMismatch: null,
@@ -1049,6 +1055,12 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       runHistoryRecords: readRunHistory(project.project.id),
       status: "已进入运行模式",
     });
+    void loadRunHistoryRecords(project.project.id).then((records) => {
+      const current = get().project;
+      if (current?.project.id === project.project.id && get().runActive) {
+        set({ runHistoryRecords: records });
+      }
+    });
   },
 
   closeRunPanel() {
@@ -1109,7 +1121,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   selectRunHistoryRecord(recordId) {
     const project = get().project;
     if (!project) return;
-    const records = readRunHistory(project.project.id);
+    const records = get().runHistoryRecords.length ? get().runHistoryRecords : readRunHistory(project.project.id);
     const record = records.find((item) => item.id === recordId);
     if (!record) {
       set({ status: "运行历史不存在" });
@@ -1140,7 +1152,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     const project = get().project;
     const selectedRunHistoryId = get().selectedRunHistoryId;
     if (!project || !selectedRunHistoryId) return;
-    const records = readRunHistory(project.project.id);
+    const records = get().runHistoryRecords.length ? get().runHistoryRecords : readRunHistory(project.project.id);
     const record = records.find((item) => item.id === selectedRunHistoryId);
     if (!record) {
       set({ status: "运行历史不存在" });
@@ -1159,9 +1171,32 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     });
   },
 
-  clearRunHistory() {
+  async deleteRunHistoryRecord(recordId) {
     const project = get().project;
     if (!project) return;
+    const previous = get().runHistoryRecords;
+    const next = previous.filter((record) => record.id !== recordId);
+    writeRunHistory(project.project.id, next);
+    set({
+      runHistoryRecords: next,
+      selectedRunHistoryId: get().selectedRunHistoryId === recordId ? null : get().selectedRunHistoryId,
+      runHistoryReplayMode: "overlay",
+      runHistoryMismatch: null,
+      runtimeNodes: get().selectedRunHistoryId === recordId ? {} : get().runtimeNodes,
+      status: "正在删除运行历史",
+    });
+    try {
+      await deleteProjectRunHistory(project.project.id, recordId);
+      set({ status: "已删除运行历史" });
+    } catch (error) {
+      set({ runHistoryRecords: previous, status: error instanceof Error ? error.message : "删除运行历史失败" });
+    }
+  },
+
+  async clearRunHistory() {
+    const project = get().project;
+    if (!project) return;
+    const previous = get().runHistoryRecords;
     writeRunHistory(project.project.id, []);
     set({
       runHistoryRecords: [],
@@ -1169,8 +1204,14 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       runHistoryReplayMode: "overlay",
       runHistoryMismatch: null,
       runtimeNodes: {},
-      status: "已清空运行历史",
+      status: "正在清空运行历史",
     });
+    try {
+      await clearProjectRunHistory(project.project.id);
+      set({ status: "已清空运行历史" });
+    } catch (error) {
+      set({ runHistoryRecords: previous, status: error instanceof Error ? error.message : "清空运行历史失败" });
+    }
   },
 
   cancelRun() {
@@ -1240,6 +1281,11 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
         if (activeRunToken !== runToken) return;
         set((state) => applyRunStreamEvent(state, event));
       }, abortController.signal);
+      if (activeRunToken === runToken) {
+        const current = get();
+        const record = current.runHistoryRecords.find((item) => item.id === current.selectedRunHistoryId) ?? current.runHistoryRecords[0];
+        if (record) await persistRunHistoryRecord(saved.project.id, record);
+      }
     } catch (error) {
       if (activeRunToken !== runToken) return;
       if (isAbortError(error)) {
@@ -1265,6 +1311,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
           runHistoryReplayMode: "overlay",
           runHistoryMismatch: null,
         });
+        if (runHistoryRecords[0]) await persistRunHistoryRecord(failedState.project.project.id, runHistoryRecords[0]);
       }
       set({
         runRunning: false,
@@ -2074,6 +2121,34 @@ function readRunHistory(projectId: string): RunHistoryRecord[] {
 function writeRunHistory(projectId: string, records: RunHistoryRecord[]) {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(runHistoryKey(projectId), JSON.stringify(records.slice(0, RUN_HISTORY_LIMIT)));
+}
+
+async function loadRunHistoryRecords(projectId: string): Promise<RunHistoryRecord[]> {
+  const localRecords = readRunHistory(projectId);
+  try {
+    const remoteRecords = await listProjectRunHistory(projectId);
+    if (remoteRecords.length > 0) {
+      writeRunHistory(projectId, remoteRecords);
+      return remoteRecords;
+    }
+    if (localRecords.length > 0) {
+      void Promise.all(localRecords.map((record) => saveProjectRunHistory(projectId, record))).catch(() => undefined);
+    }
+  } catch {
+    return localRecords;
+  }
+  return localRecords;
+}
+
+async function persistRunHistoryRecord(projectId: string, record: RunHistoryRecord): Promise<void> {
+  try {
+    const saved = await saveProjectRunHistory(projectId, record);
+    const records = readRunHistory(projectId);
+    const next = [saved, ...records.filter((item) => item.id !== saved.id)].slice(0, RUN_HISTORY_LIMIT);
+    writeRunHistory(projectId, next);
+  } catch {
+    // The UI already has the run result. Keep the local fallback if backend persistence fails.
+  }
 }
 
 function recordProjectHistory(project: ProjectIR, description: string): ProjectHistoryRecord[] {
