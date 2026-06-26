@@ -153,14 +153,22 @@ def _walk_project(
         node = nodes[current]
         before = dict(state)
         started = time.perf_counter()
+        handled_error_target: str | None = None
         try:
             delta, detail = _execute_node(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             state.update(delta)
             status = "ok"
         except Exception as exc:  # Keep the preview response structured instead of surfacing a 500.
-            delta = {}
-            detail = _format_error(exc)
-            status = "error"
+            handled_error_target = _error_execution_target(node, outgoing)
+            if handled_error_target:
+                delta = {"last_error": _runtime_error_payload(node, exc)}
+                state.update(delta)
+                detail = f"{_format_error(exc)}；已转入 error 分支。"
+                status = "ok"
+            else:
+                delta = {}
+                detail = _format_error(exc)
+                status = "error"
 
         trace.append(
             {
@@ -177,7 +185,7 @@ def _walk_project(
         if status == "error" or node.type == NodeType.DIRECT_REPLY:
             break
 
-        current = _next_execution_target(node, nodes, outgoing, state)
+        current = handled_error_target or _next_execution_target(node, nodes, outgoing, state)
 
     if visited >= MAX_STEPS:
         trace.append(
@@ -237,6 +245,7 @@ def _walk_project_events(
             "inputState": _compact_state(before),
         }
         started = time.perf_counter()
+        handled_error_target: str | None = None
         try:
             if mode == "live" and node.type == NodeType.PARALLEL_TOOLS:
                 delta, detail = yield from _execute_live_parallel_tools_events(project, node, state, model_config, runtime_environment, tools)
@@ -245,9 +254,16 @@ def _walk_project_events(
             state.update(delta)
             status = "ok"
         except Exception as exc:  # Keep streamed events structured instead of surfacing a 500.
-            delta = {}
-            detail = _format_error(exc)
-            status = "error"
+            handled_error_target = _error_execution_target(node, outgoing)
+            if handled_error_target:
+                delta = {"last_error": _runtime_error_payload(node, exc)}
+                state.update(delta)
+                detail = f"{_format_error(exc)}；已转入 error 分支。"
+                status = "ok"
+            else:
+                delta = {}
+                detail = _format_error(exc)
+                status = "error"
 
         trace_item = {
             "nodeId": node.id,
@@ -268,7 +284,7 @@ def _walk_project_events(
         if status == "error" or node.type == NodeType.DIRECT_REPLY:
             break
 
-        current = _next_execution_target(node, nodes, outgoing, state)
+        current = handled_error_target or _next_execution_target(node, nodes, outgoing, state)
 
     if visited >= MAX_STEPS:
         trace_item = {
@@ -381,6 +397,13 @@ def _execute_dry_node(node: NodeIR, state: dict[str, Any], skills: SkillRuntimeC
     if node.type == NodeType.JSON_VALIDATOR:
         delta, detail = _execute_json_validator(node, state)
         return delta, f"[dry-run] {detail}"
+    if node.type == NodeType.FOR_EACH:
+        return _execute_for_each_node(node, project, state, "dry", model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+    if node.type == NodeType.MERGE:
+        return _execute_merge_node(node, state, [state])
+    if node.type == NodeType.ERROR_HANDLER:
+        delta, detail = _execute_error_handler(node, state)
+        return delta, f"[dry-run] {detail}"
     if node.type == NodeType.RETRIEVER:
         field = str(config.get("outputField", "retrieved_context"))
         return {
@@ -453,6 +476,12 @@ def _execute_live_node(
         return _execute_live_json_extractor(node, state, model_config)
     if node.type == NodeType.JSON_VALIDATOR:
         return _execute_json_validator(node, state)
+    if node.type == NodeType.FOR_EACH:
+        return _execute_for_each_node(node, project, state, "live", model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+    if node.type == NodeType.MERGE:
+        return _execute_merge_node(node, state, [state])
+    if node.type == NodeType.ERROR_HANDLER:
+        return _execute_error_handler(node, state)
     if node.type == NodeType.RETRIEVER:
         return _execute_live_retriever(node, state)
     if node.type == NodeType.CONDITION:
@@ -1306,6 +1335,214 @@ def _execute_json_validator(node: NodeIR, state: dict[str, Any]) -> tuple[dict[s
         output_field: value,
         validation_field: validation,
     }, f"JSON Validator 校验 state.{input_field}，结果 {'valid' if validation['valid'] else 'invalid'}"
+
+
+def _execute_for_each_node(
+    node: NodeIR,
+    project: ProjectIR,
+    state: dict[str, Any],
+    mode: RunMode,
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    skills: SkillRuntimeConfig,
+    tools: ToolRuntimeConfig,
+    mcp_servers: McpRuntimeConfig,
+    agents: AgentRuntimeConfig,
+    agent_depth: int,
+) -> tuple[dict[str, Any], str]:
+    config = node.config
+    nodes = {item.id: item for item in project.nodes}
+    outgoing: dict[str, list] = {}
+    for edge in project.edges:
+        outgoing.setdefault(edge.source, []).append(edge)
+    item_start = _target_for_handle([edge for edge in outgoing.get(node.id, []) if edge.kind != EdgeKind.ERROR], "item")
+    if not item_start:
+        raise RuntimeError("ForEach 未连接 item 循环体。")
+    merge_node = _find_for_each_merge_node(item_start, nodes, outgoing)
+    if merge_node is None:
+        raise RuntimeError("ForEach 循环体必须连接到 Merge 节点。")
+
+    items_field = str(config.get("itemsField", "worker_tasks")).strip() or "worker_tasks"
+    item_field = str(config.get("itemField", "current_item")).strip() or "current_item"
+    index_field = str(config.get("indexField", "current_index")).strip() or "current_index"
+    max_items = min(_positive_int(config.get("maxItems"), 50), 100)
+    items_value = _get_path(state, items_field)
+    if isinstance(items_value, dict) and isinstance(items_value.get("tasks"), list):
+        items = items_value.get("tasks") or []
+    elif isinstance(items_value, list):
+        items = items_value
+    else:
+        raise RuntimeError(f"ForEach 需要 state.{items_field} 是 array。")
+    items = list(items)[:max_items]
+    item_states: list[dict[str, Any]] = []
+    iterations: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
+        item_state = dict(state)
+        item_state[item_field] = item
+        item_state[index_field] = index
+        reached_merge = _run_for_each_item_chain(
+            item_start,
+            merge_node.id,
+            item_state,
+            project,
+            nodes,
+            outgoing,
+            mode,
+            model_config,
+            runtime_environment,
+            skills,
+            tools,
+            mcp_servers,
+            agents,
+            agent_depth,
+        )
+        if not reached_merge:
+            raise RuntimeError(f"ForEach 第 {index + 1} 项没有到达 Merge 节点。")
+        item_states.append(item_state)
+        iterations.append({"index": index, "item": _compact_value(item), "output": _compact_state(item_state)})
+
+    delta, detail = _execute_merge_node(merge_node, state, item_states)
+    merge_result_field = str(merge_node.config.get("resultField", "merge_result")).strip() or "merge_result"
+    if isinstance(delta.get(merge_result_field), dict):
+        delta[merge_result_field]["iterations"] = iterations
+    result_field = str(config.get("resultField") or "").strip()
+    if result_field:
+        delta[result_field] = {
+            "ok": True,
+            "itemsField": items_field,
+            "count": len(items),
+            "mergeNodeId": merge_node.id,
+            "iterations": iterations,
+        }
+    return delta, f"ForEach 顺序处理 {len(items)} 项；{detail}"
+
+
+def _run_for_each_item_chain(
+    start_node_id: str,
+    merge_node_id: str,
+    item_state: dict[str, Any],
+    project: ProjectIR,
+    nodes: dict[str, NodeIR],
+    outgoing: dict[str, list],
+    mode: RunMode,
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    skills: SkillRuntimeConfig,
+    tools: ToolRuntimeConfig,
+    mcp_servers: McpRuntimeConfig,
+    agents: AgentRuntimeConfig,
+    agent_depth: int,
+) -> bool:
+    current = start_node_id
+    visited = 0
+    while current and current in nodes and visited < MAX_STEPS:
+        if current == merge_node_id:
+            return True
+        visited += 1
+        child = nodes[current]
+        if child.type in {NodeType.FOR_EACH, NodeType.MERGE}:
+            raise RuntimeError(f"ForEach v1 不支持嵌套或提前执行 {child.type} 节点。")
+        try:
+            delta, _detail = _execute_node(child, project, item_state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+            item_state.update(delta)
+        except Exception as exc:
+            error_target = _error_execution_target(child, outgoing)
+            if not error_target:
+                raise
+            item_state["last_error"] = _runtime_error_payload(child, exc)
+            current = error_target
+            continue
+        if child.type == NodeType.DIRECT_REPLY:
+            return False
+        current = _next_execution_target(child, nodes, outgoing, item_state)
+    if visited >= MAX_STEPS:
+        raise RuntimeError(f"ForEach 子链路超过 {MAX_STEPS} 步，可能存在循环。")
+    return False
+
+
+def _execute_merge_node(node: NodeIR, state: dict[str, Any], item_states: list[dict[str, Any]]) -> tuple[dict[str, Any], str]:
+    config = node.config
+    reducers = _json_object_list(config.get("reducersJson"))
+    if not reducers:
+        reducers = [{"target": "merged_results", "source": "item_result", "reducer": "append"}]
+    delta: dict[str, Any] = {}
+    summaries: list[dict[str, Any]] = []
+    for reducer in reducers:
+        target = str(reducer.get("target") or reducer.get("field") or reducer.get("name") or "").strip()
+        source = str(reducer.get("source") or reducer.get("sourceField") or "").strip()
+        operation = str(reducer.get("reducer") or reducer.get("operation") or "append").strip().lower()
+        if not target or not source:
+            continue
+        values = [_get_path(item_state, source) for item_state in item_states]
+        previous = _get_path({**state, **delta}, target)
+        next_value = _reduce_values(operation, values, previous, target)
+        _set_path(delta, target, next_value, {**state, **delta})
+        summaries.append(
+            {
+                "target": target,
+                "source": source,
+                "reducer": operation,
+                "count": len(values),
+                "value": _compact_value(next_value),
+            }
+        )
+    result_field = str(config.get("resultField", "merge_result")).strip() or "merge_result"
+    if result_field:
+        delta[result_field] = {
+            "ok": True,
+            "itemCount": len(item_states),
+            "reducers": summaries,
+        }
+    return delta, f"Merge 聚合 {len(item_states)} 项，写入 {len(summaries)} 个字段"
+
+
+def _reduce_values(operation: str, values: list[Any], previous: Any, target: str) -> Any:
+    if operation == "concat":
+        result: list[Any] = []
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, list):
+                result.extend(value)
+            else:
+                result.append(value)
+        return result
+    if operation == "merge":
+        result = dict(previous) if isinstance(previous, dict) else {}
+        for value in values:
+            if value is None:
+                continue
+            if not isinstance(value, dict):
+                raise RuntimeError(f"Merge reducer merge 需要 object 值：{target}")
+            result.update(value)
+        return result
+    if operation == "overwrite" or operation == "last":
+        return values[-1] if values else previous
+    if operation == "first":
+        for value in values:
+            if value is not None:
+                return value
+        return previous
+    if operation != "append":
+        operation = "append"
+    return list(values)
+
+
+def _execute_error_handler(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    config = node.config
+    error_field = str(config.get("errorField", "last_error")).strip() or "last_error"
+    output_field = str(config.get("outputField", "error_result")).strip() or "error_result"
+    error_value = _get_path(state, error_field, {})
+    render_state = {**state, "error": error_value}
+    template = str(config.get("template") or "流程执行失败：{{ state.last_error }}")
+    message = render_template(template, render_state)
+    return {
+        output_field: {
+            "ok": False,
+            "error": error_value,
+            "message": message,
+        }
+    }, f"Error Handler 读取 state.{error_field}，输出到 state.{output_field}"
 
 
 def _execute_live_parallel_tools(
@@ -4849,7 +5086,7 @@ def _first_target(edges: list) -> str | None:
 
 
 def _first_execution_target(edges: list) -> str | None:
-    executable = [edge for edge in edges if edge.kind != EdgeKind.WORKER]
+    executable = [edge for edge in edges if edge.kind not in {EdgeKind.WORKER, EdgeKind.ERROR}]
     return _first_target(executable)
 
 
@@ -4863,9 +5100,58 @@ def _next_execution_target(node: NodeIR, nodes: dict[str, NodeIR], outgoing: dic
         return _target_for_handle(conditional_edges, handle) or _first_target(conditional_edges)
     normal_edges = [edge for edge in edges if edge.kind == EdgeKind.NORMAL]
     if normal_edges:
+        if node.type == NodeType.FOR_EACH:
+            return _for_each_exit_target(node.id, nodes, outgoing)
         return _first_target(normal_edges)
     if node.type == NodeType.PARALLEL_TOOLS:
         return _parallel_worker_output_target(node.id, nodes, outgoing)
+    return None
+
+
+def _error_execution_target(node: NodeIR, outgoing: dict[str, list]) -> str | None:
+    error_edges = [edge for edge in outgoing.get(node.id, []) if edge.kind == EdgeKind.ERROR or edge.sourceHandle == "error"]
+    return _target_for_handle(error_edges, "error") or _first_target(error_edges)
+
+
+def _runtime_error_payload(node: NodeIR, exc: Exception) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "nodeId": node.id,
+        "nodeType": str(node.type),
+        "nodeLabel": node.label,
+        "errorType": exc.__class__.__name__,
+        "message": str(exc),
+    }
+
+
+def _for_each_exit_target(parent_node_id: str, nodes: dict[str, NodeIR], outgoing: dict[str, list]) -> str | None:
+    item_target = _target_for_handle([edge for edge in outgoing.get(parent_node_id, []) if edge.kind != EdgeKind.ERROR], "item")
+    if not item_target:
+        return None
+    merge_node = _find_for_each_merge_node(item_target, nodes, outgoing)
+    if not merge_node:
+        return None
+    normal_edges = [edge for edge in outgoing.get(merge_node.id, []) if edge.kind == EdgeKind.NORMAL]
+    return _first_target(normal_edges)
+
+
+def _find_for_each_merge_node(start_node_id: str, nodes: dict[str, NodeIR], outgoing: dict[str, list]) -> NodeIR | None:
+    seen: set[str] = set()
+    queue: list[str] = [start_node_id]
+    while queue:
+        node_id = queue.pop(0)
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        node = nodes.get(node_id)
+        if not node:
+            continue
+        if node.type == NodeType.MERGE:
+            return node
+        for edge in outgoing.get(node_id, []):
+            if edge.kind == EdgeKind.WORKER:
+                continue
+            queue.append(edge.target)
     return None
 
 

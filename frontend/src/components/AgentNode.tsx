@@ -8,14 +8,17 @@ import {
   ChevronUp,
   Database,
   GitBranch,
+  GitMerge,
   Globe,
   LoaderCircle,
   MessageSquareReply,
   Play,
   Plug,
+  Repeat,
   Route,
   Server,
   Sparkles,
+  TriangleAlert,
   UserCheck,
   Wrench
 } from "lucide-react";
@@ -46,6 +49,9 @@ const ICONS = {
   template: Braces,
   json_extractor: Braces,
   json_validator: GitBranch,
+  for_each: Repeat,
+  merge: GitMerge,
+  error_handler: TriangleAlert,
   retriever: Database,
   condition: GitBranch,
   ai_router: Route,
@@ -337,6 +343,22 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
         { label: "Schema", value: `${parseObjectList(config.schemaFieldsJson).length} 字段` },
         { label: "结果", value: text(config.validationField, "validation_result") },
       ];
+    case "for_each":
+      return [
+        { label: "数组", value: text(config.itemsField, "worker_tasks") },
+        { label: "Item", value: text(config.itemField, "current_item") },
+        { label: "上限", value: text(config.maxItems, "50") },
+      ];
+    case "merge":
+      return [
+        { label: "Reducer", value: `${parseObjectList(config.reducersJson).length} 个` },
+        { label: "结果", value: text(config.resultField, "merge_result") },
+      ];
+    case "error_handler":
+      return [
+        { label: "错误", value: text(config.errorField, "last_error") },
+        { label: "输出", value: text(config.outputField, "error_result") },
+      ];
     case "retriever":
       return [
         { label: "来源", value: text(config.path, "./knowledge") },
@@ -488,6 +510,12 @@ function nodeTypeLabel(type: NodeType): string {
       return "EXTRACT";
     case "json_validator":
       return "VALIDATE";
+    case "for_each":
+      return "FOREACH";
+    case "merge":
+      return "MERGE";
+    case "error_handler":
+      return "ERROR";
     case "retriever":
       return "RAG";
     case "condition":

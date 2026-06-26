@@ -4,13 +4,16 @@ import {
   BrainCircuit,
   Database,
   GitBranch,
+  GitMerge,
   Globe,
   type LucideIcon,
   MessageSquareReply,
   Plug,
   Play,
+  Repeat,
   Route,
   Sparkles,
+  TriangleAlert,
   UserCheck,
   Wrench
 } from "lucide-react";
@@ -34,6 +37,9 @@ export const NODE_CATALOG: NodeCatalogItem[] = [
   { type: "template", title: "Template", description: "渲染文本或 JSON 到 state", icon: Braces },
   { type: "json_extractor", title: "JSON Extractor", description: "按 Schema 抽取结构化 JSON", icon: Braces },
   { type: "json_validator", title: "JSON Validator", description: "校验 JSON 并输出分支", icon: GitBranch },
+  { type: "for_each", title: "ForEach", description: "顺序迭代数组并执行子链路", icon: Repeat },
+  { type: "merge", title: "Merge", description: "按 Reducer 聚合迭代结果", icon: GitMerge },
+  { type: "error_handler", title: "Error Handler", description: "处理 error 分支并格式化错误", icon: TriangleAlert },
   { type: "retriever", title: "Retriever", description: "检索知识库上下文", icon: Database },
   { type: "condition", title: "Condition", description: "规则分支路由", icon: GitBranch },
   { type: "ai_router", title: "AI Router", description: "按意图进行智能路由", icon: Route },
@@ -178,6 +184,31 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         outputField: "validated_json",
         validationField: "validation_result",
       };
+    case "for_each":
+      return {
+        itemsField: "worker_tasks",
+        itemField: "current_item",
+        indexField: "current_index",
+        maxItems: 50,
+        resultField: "",
+      };
+    case "merge":
+      return {
+        reducersJson: JSON.stringify(
+          [
+            { target: "merged_results", source: "item_result", reducer: "append" },
+          ],
+          null,
+          2,
+        ),
+        resultField: "merge_result",
+      };
+    case "error_handler":
+      return {
+        errorField: "last_error",
+        template: "流程执行失败：{{ state.last_error }}",
+        outputField: "error_result",
+      };
     case "retriever":
       return {
         source: "local",
@@ -308,6 +339,15 @@ export function defaultOutputs(type: NodeType): Port[] {
       { id: "valid", type: "condition", label: "valid" },
       { id: "invalid", type: "condition", label: "invalid" },
     ];
+  }
+  if (type === "for_each") {
+    return [
+      { id: "item", type: "control", label: "item" },
+      { id: "error", type: "error", label: "error" },
+    ];
+  }
+  if (type === "error_handler") {
+    return [{ id: "out", type: "control", label: "恢复" }];
   }
   if (type === "parallel_tools") {
     return [{ id: "out", type: "control", label: "汇总" }];

@@ -2944,14 +2944,69 @@ def _nodes_py(project: ProjectIR) -> str:
     for node in project.nodes:
         if node.type in {NodeType.START, NodeType.PARALLEL_WORKER}:
             continue
-        body.append(_node_function(node))
+        body.append(_node_function(node, project))
         body.append("")
     body.append(_nodes_helpers())
     body.append("")
     return "\n".join(body)
 
 
-def _node_function(node: NodeIR) -> str:
+def _for_each_codegen_maps(project: ProjectIR, node: NodeIR) -> dict[str, Any]:
+    nodes_by_id = {item.id: item for item in project.nodes}
+    outgoing: dict[str, list[EdgeIR]] = defaultdict(list)
+    for edge in project.edges:
+        outgoing[edge.source].append(edge)
+    item_start = _target_for_handle_codegen([edge for edge in outgoing[node.id] if edge.kind != EdgeKind.ERROR], "item")
+    merge_id = _find_for_each_merge_id_codegen(item_start, nodes_by_id, outgoing) if item_start else ""
+    internal_ids: set[str] = set()
+    if item_start and merge_id:
+        queue = [item_start]
+        while queue:
+            node_id = queue.pop(0)
+            if node_id in internal_ids:
+                continue
+            internal_ids.add(node_id)
+            if node_id == merge_id:
+                continue
+            for edge in outgoing[node_id]:
+                if edge.kind != EdgeKind.WORKER:
+                    queue.append(edge.target)
+    normal_map: dict[str, str] = {}
+    conditional_map: dict[str, dict[str, str]] = defaultdict(dict)
+    error_map: dict[str, str] = {}
+    for internal_id in internal_ids:
+        for edge in outgoing[internal_id]:
+            if edge.kind == EdgeKind.NORMAL:
+                normal_map[internal_id] = edge.target
+            elif edge.kind == EdgeKind.CONDITIONAL:
+                conditional_map[internal_id][edge.sourceHandle or edge.label or "default"] = edge.target
+            elif edge.kind == EdgeKind.ERROR:
+                error_map[internal_id] = edge.target
+    node_meta = {
+        internal_id: {
+            "type": str(nodes_by_id[internal_id].type),
+            "config": nodes_by_id[internal_id].config,
+            "label": nodes_by_id[internal_id].label,
+        }
+        for internal_id in internal_ids
+        if internal_id in nodes_by_id
+    }
+    function_names = {internal_id: py_name(internal_id) for internal_id in internal_ids if internal_id != merge_id}
+    merge_node = nodes_by_id.get(merge_id)
+    return {
+        "itemStart": item_start,
+        "mergeId": merge_id,
+        "nodeMeta": node_meta,
+        "functionNames": function_names,
+        "normalMap": normal_map,
+        "conditionalMap": dict(conditional_map),
+        "errorMap": error_map,
+        "mergeReducers": _json_object_list((merge_node.config if merge_node else {}).get("reducersJson")),
+        "mergeResultField": str((merge_node.config if merge_node else {}).get("resultField", "merge_result")),
+    }
+
+
+def _node_function(node: NodeIR, project: ProjectIR) -> str:
     function_name = py_name(node.id)
     if node.type == NodeType.LLM:
         provider = json.dumps(str(node.config.get("provider", "openai")))
@@ -3164,6 +3219,49 @@ def _node_function(node: NodeIR) -> str:
     value = _get_path(state, {input_field})
     validation = _validation_result(value, schema)
     return {{{output_field}: value, {validation_field}: validation}}
+'''
+    if node.type == NodeType.FOR_EACH:
+        maps = _for_each_codegen_maps(project, node)
+        items_field = json.dumps(str(node.config.get("itemsField", "worker_tasks")))
+        item_field = json.dumps(str(node.config.get("itemField", "current_item")))
+        index_field = json.dumps(str(node.config.get("indexField", "current_index")))
+        max_items = min(_positive_int(node.config.get("maxItems"), 50), 100)
+        result_field = json.dumps(str(node.config.get("resultField") or ""))
+        function_entries = ", ".join(f"{key!r}: {value}" for key, value in maps["functionNames"].items())
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    node_functions = {{{function_entries}}}
+    return _run_for_each_node(
+        state,
+        {items_field},
+        {item_field},
+        {index_field},
+        {max_items},
+        {json.dumps(maps["itemStart"])},
+        {json.dumps(maps["mergeId"])},
+        node_functions,
+        {json.dumps(maps["nodeMeta"], ensure_ascii=False)},
+        {json.dumps(maps["normalMap"], ensure_ascii=False)},
+        {json.dumps(maps["conditionalMap"], ensure_ascii=False)},
+        {json.dumps(maps["errorMap"], ensure_ascii=False)},
+        {json.dumps(maps["mergeReducers"], ensure_ascii=False)},
+        {json.dumps(maps["mergeResultField"])},
+        {result_field},
+    )
+'''
+    if node.type == NodeType.MERGE:
+        reducers = json.dumps(_json_object_list(node.config.get("reducersJson")), ensure_ascii=False)
+        result_field = json.dumps(str(node.config.get("resultField", "merge_result")))
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    return _apply_merge_reducers(dict(state), [dict(state)], {reducers}, {result_field})
+'''
+    if node.type == NodeType.ERROR_HANDLER:
+        error_field = json.dumps(str(node.config.get("errorField", "last_error")))
+        output_field = json.dumps(str(node.config.get("outputField", "error_result")))
+        template = json.dumps(str(node.config.get("template", "流程执行失败：{{ state.last_error }}")))
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    error_value = _get_path(state, {error_field}, {{}})
+    message = render_template({template}, {{**dict(state), "error": error_value}})
+    return {{{output_field}: {{"ok": False, "error": error_value, "message": message}}}}
 '''
     if node.type == NodeType.RETRIEVER:
         path = json.dumps(str(node.config.get("path", "./knowledge")))
@@ -3443,14 +3541,27 @@ def _compare(current: Any, expected: str, operator: str) -> bool:
 
 
 def _graph_py(project: ProjectIR) -> str:
-    normal_edges = [edge for edge in project.edges if edge.kind not in {EdgeKind.CONDITIONAL, EdgeKind.WORKER}]
-    conditional_edges = [edge for edge in project.edges if edge.kind == EdgeKind.CONDITIONAL]
+    for_each_internal_ids = _for_each_internal_node_ids(project)
+    normal_edges = [
+        edge
+        for edge in project.edges
+        if edge.kind not in {EdgeKind.CONDITIONAL, EdgeKind.WORKER, EdgeKind.ERROR}
+        and edge.source not in for_each_internal_ids
+        and edge.target not in for_each_internal_ids
+        and edge.sourceHandle != "item"
+    ]
+    conditional_edges = [
+        edge
+        for edge in project.edges
+        if edge.kind == EdgeKind.CONDITIONAL and edge.source not in for_each_internal_ids and edge.target not in for_each_internal_ids
+    ]
     condition_edge_map: dict[str, dict[str, str]] = defaultdict(dict)
     for edge in conditional_edges:
         condition_edge_map[edge.source][edge.sourceHandle or edge.label or "default"] = edge.target
 
     worker_bridge_edges = _parallel_worker_bridge_edges(project)
-    non_start_nodes = [node for node in project.nodes if node.type not in {NodeType.START, NodeType.PARALLEL_WORKER}]
+    for_each_bridge_edges = _for_each_bridge_edges(project)
+    non_start_nodes = [node for node in project.nodes if node.type not in {NodeType.START, NodeType.PARALLEL_WORKER} and node.id not in for_each_internal_ids]
     condition_ids = {
         node.id
         for node in project.nodes
@@ -3483,7 +3594,7 @@ def _graph_py(project: ProjectIR) -> str:
 
     start_ids = {node.id for node in project.nodes if node.type == NodeType.START}
     direct_reply_ids = {node.id for node in project.nodes if node.type == NodeType.DIRECT_REPLY}
-    for edge in [*normal_edges, *worker_bridge_edges]:
+    for edge in [*normal_edges, *worker_bridge_edges, *for_each_bridge_edges]:
         if edge.source in start_ids:
             lines.append(f'builder.add_edge(START, "{edge.target}")')
         elif edge.source not in direct_reply_ids:
@@ -3533,6 +3644,84 @@ def _parallel_worker_bridge_edges(project: ProjectIR) -> list[EdgeIR]:
         if target:
             result.append(EdgeIR(id=f"bridge_{parent_id}_{target}", source=parent_id, target=target, kind=EdgeKind.NORMAL))
     return result
+
+
+def _for_each_internal_node_ids(project: ProjectIR) -> set[str]:
+    nodes_by_id = {node.id: node for node in project.nodes}
+    outgoing: dict[str, list[EdgeIR]] = defaultdict(list)
+    for edge in project.edges:
+        outgoing[edge.source].append(edge)
+    internal: set[str] = set()
+    for node in project.nodes:
+        if node.type != NodeType.FOR_EACH:
+            continue
+        item_target = _target_for_handle_codegen([edge for edge in outgoing[node.id] if edge.kind != EdgeKind.ERROR], "item")
+        merge_id = _find_for_each_merge_id_codegen(item_target, nodes_by_id, outgoing) if item_target else ""
+        if not item_target or not merge_id:
+            continue
+        queue: list[str] = [item_target]
+        seen: set[str] = set()
+        while queue:
+            node_id = queue.pop(0)
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            internal.add(node_id)
+            if node_id == merge_id:
+                continue
+            for edge in outgoing[node_id]:
+                if edge.kind != EdgeKind.WORKER:
+                    queue.append(edge.target)
+    return internal
+
+
+def _for_each_bridge_edges(project: ProjectIR) -> list[EdgeIR]:
+    nodes_by_id = {node.id: node for node in project.nodes}
+    outgoing: dict[str, list[EdgeIR]] = defaultdict(list)
+    for edge in project.edges:
+        outgoing[edge.source].append(edge)
+    result: list[EdgeIR] = []
+    for node in project.nodes:
+        if node.type != NodeType.FOR_EACH:
+            continue
+        item_target = _target_for_handle_codegen([edge for edge in outgoing[node.id] if edge.kind != EdgeKind.ERROR], "item")
+        merge_id = _find_for_each_merge_id_codegen(item_target, nodes_by_id, outgoing) if item_target else ""
+        if not merge_id:
+            continue
+        exit_target = _first_target_codegen([edge for edge in outgoing[merge_id] if edge.kind == EdgeKind.NORMAL])
+        if exit_target:
+            result.append(EdgeIR(id=f"bridge_{node.id}_{exit_target}", source=node.id, target=exit_target, kind=EdgeKind.NORMAL))
+    return result
+
+
+def _find_for_each_merge_id_codegen(start_id: str, nodes_by_id: dict[str, NodeIR], outgoing: dict[str, list[EdgeIR]]) -> str:
+    seen: set[str] = set()
+    queue: list[str] = [start_id]
+    while queue:
+        node_id = queue.pop(0)
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        node = nodes_by_id.get(node_id)
+        if not node:
+            continue
+        if node.type == NodeType.MERGE:
+            return node_id
+        for edge in outgoing[node_id]:
+            if edge.kind != EdgeKind.WORKER:
+                queue.append(edge.target)
+    return ""
+
+
+def _target_for_handle_codegen(edges: list[EdgeIR], handle: str) -> str:
+    for edge in edges:
+        if edge.sourceHandle == handle:
+            return edge.target
+    return _first_target_codegen(edges)
+
+
+def _first_target_codegen(edges: list[EdgeIR]) -> str:
+    return edges[0].target if edges else ""
 
 
 def _nodes_helpers() -> str:
@@ -3807,6 +3996,160 @@ def _set_path(target: dict[str, Any], path: str, value: Any, base: dict[str, Any
             current[part] = child
         current = child
     current[parts[-1]] = value
+
+
+def _run_for_each_node(
+    state: AgentState,
+    items_field: str,
+    item_field: str,
+    index_field: str,
+    max_items: int,
+    item_start: str,
+    merge_id: str,
+    node_functions: dict[str, Any],
+    node_meta: dict[str, dict[str, Any]],
+    normal_map: dict[str, str],
+    conditional_map: dict[str, dict[str, str]],
+    error_map: dict[str, str],
+    merge_reducers: list[dict[str, Any]],
+    merge_result_field: str,
+    result_field: str = "",
+) -> dict[str, Any]:
+    if not item_start or not merge_id:
+        raise RuntimeError("ForEach 导出缺少循环体或 Merge 节点。")
+    items_value = _get_path(state, items_field)
+    if isinstance(items_value, dict) and isinstance(items_value.get("tasks"), list):
+        items = items_value.get("tasks") or []
+    elif isinstance(items_value, list):
+        items = items_value
+    else:
+        raise RuntimeError(f"ForEach 需要 state.{items_field} 是 array。")
+    item_states: list[dict[str, Any]] = []
+    iterations: list[dict[str, Any]] = []
+    for index, item in enumerate(list(items)[:max_items]):
+        item_state = dict(state)
+        item_state[item_field] = item
+        item_state[index_field] = index
+        current = item_start
+        visited = 0
+        reached_merge = False
+        while current and visited < 80:
+            if current == merge_id:
+                reached_merge = True
+                break
+            visited += 1
+            meta = node_meta.get(current, {})
+            node_type = str(meta.get("type") or "")
+            if node_type in {"for_each", "merge"}:
+                raise RuntimeError(f"ForEach v1 不支持嵌套或提前执行 {node_type} 节点。")
+            fn = node_functions.get(current)
+            if fn is None:
+                raise RuntimeError(f"ForEach 子链路缺少节点函数：{current}")
+            try:
+                item_state.update(fn(item_state))
+            except Exception as exc:
+                error_target = error_map.get(current)
+                if not error_target:
+                    raise
+                item_state["last_error"] = _runtime_error_payload(current, meta, exc)
+                current = error_target
+                continue
+            branch_map = conditional_map.get(current) or {}
+            if branch_map:
+                handle = _choose_for_each_handle(meta, item_state)
+                current = branch_map.get(handle) or next(iter(branch_map.values()), "")
+            else:
+                current = normal_map.get(current, "")
+        if visited >= 80:
+            raise RuntimeError("ForEach 子链路超过 80 步，可能存在循环。")
+        if not reached_merge:
+            raise RuntimeError(f"ForEach 第 {index + 1} 项没有到达 Merge 节点。")
+        item_states.append(item_state)
+        iterations.append({"index": index, "item": _compact_value(item), "output": _compact_value(item_state)})
+    delta = _apply_merge_reducers(dict(state), item_states, merge_reducers, merge_result_field)
+    if merge_result_field and isinstance(delta.get(merge_result_field), dict):
+        delta[merge_result_field]["iterations"] = iterations
+    if result_field:
+        delta[result_field] = {"ok": True, "itemsField": items_field, "count": len(item_states), "mergeNodeId": merge_id, "iterations": iterations}
+    return delta
+
+
+def _apply_merge_reducers(state: dict[str, Any], item_states: list[dict[str, Any]], reducers: list[dict[str, Any]], result_field: str = "merge_result") -> dict[str, Any]:
+    if not reducers:
+        reducers = [{"target": "merged_results", "source": "item_result", "reducer": "append"}]
+    delta: dict[str, Any] = {}
+    summaries: list[dict[str, Any]] = []
+    for reducer in reducers:
+        target = str(reducer.get("target") or reducer.get("field") or reducer.get("name") or "").strip()
+        source = str(reducer.get("source") or reducer.get("sourceField") or "").strip()
+        operation = str(reducer.get("reducer") or reducer.get("operation") or "append").strip().lower()
+        if not target or not source:
+            continue
+        values = [_get_path(item_state, source) for item_state in item_states]
+        previous = _get_path({**state, **delta}, target)
+        next_value = _reduce_values(operation, values, previous, target)
+        _set_path(delta, target, next_value, {**state, **delta})
+        summaries.append({"target": target, "source": source, "reducer": operation, "count": len(values), "value": _compact_value(next_value)})
+    if result_field:
+        delta[result_field] = {"ok": True, "itemCount": len(item_states), "reducers": summaries}
+    return delta
+
+
+def _reduce_values(operation: str, values: list[Any], previous: Any, target: str) -> Any:
+    if operation == "concat":
+        result: list[Any] = []
+        for value in values:
+            if value is None:
+                continue
+            result.extend(value if isinstance(value, list) else [value])
+        return result
+    if operation == "merge":
+        result = dict(previous) if isinstance(previous, dict) else {}
+        for value in values:
+            if value is None:
+                continue
+            if not isinstance(value, dict):
+                raise RuntimeError(f"Merge reducer merge 需要 object 值：{target}")
+            result.update(value)
+        return result
+    if operation in {"overwrite", "last"}:
+        return values[-1] if values else previous
+    if operation == "first":
+        for value in values:
+            if value is not None:
+                return value
+        return previous
+    return list(values)
+
+
+def _choose_for_each_handle(meta: dict[str, Any], state: dict[str, Any]) -> str:
+    node_type = str(meta.get("type") or "")
+    config = meta.get("config") if isinstance(meta.get("config"), dict) else {}
+    if node_type == "condition":
+        field = str(config.get("field", ""))
+        current = state.get(field)
+        expected = str(config.get("value", ""))
+        matched = _compare(current, expected, str(config.get("operator", "equals")))
+        return str(config.get("trueBranch" if matched else "falseBranch", config.get("fallback", "fallback")))
+    if node_type == "ai_router":
+        return str(state.get(str(config.get("routeField", "route_key"))) or config.get("fallback", "other"))
+    if node_type == "human_approval":
+        return str(state.get(str(config.get("actionField", "approval_action"))) or config.get("fallback", "rejected"))
+    if node_type in {"json_extractor", "json_validator"}:
+        validation = state.get(str(config.get("validationField", "validation_result")))
+        return "valid" if isinstance(validation, dict) and validation.get("valid") is True else "invalid"
+    return str(config.get("fallback", "fallback"))
+
+
+def _runtime_error_payload(node_id: str, meta: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "nodeId": node_id,
+        "nodeType": str(meta.get("type") or ""),
+        "nodeLabel": str(meta.get("label") or node_id),
+        "errorType": exc.__class__.__name__,
+        "message": str(exc),
+    }
 
 
 def _run_variable_assign(assignments: list[dict[str, Any]], inputs: dict[str, Any], state: AgentState, result_field: str = "assignment_result") -> dict[str, Any]:
@@ -4189,6 +4532,21 @@ def _fallback_reply_content(state: AgentState) -> str:
             if text:
                 return text
     return ""
+
+
+def _compare(current: Any, expected: str, operator: str) -> bool:
+    current_text = "" if current is None else str(current)
+    if operator == "not_equals":
+        return current_text != expected
+    if operator == "contains":
+        return expected in current_text
+    if operator == "not_contains":
+        return expected not in current_text
+    if operator == "is_empty":
+        return not current_text
+    if operator == "is_not_empty":
+        return bool(current_text)
+    return current_text == expected
 
 
 def _keyword_route(text: str, scenarios: list[dict[str, Any]], fallback: str) -> tuple[str, str]:

@@ -154,6 +154,57 @@ def test_rejects_invalid_tool_params_json():
     assert any(issue.code == "TOOL_PARAMS_JSON" for issue in result.issues)
 
 
+def test_validates_for_each_requires_merge_and_rejects_nested_flow():
+    project = create_default_project("Bad ForEach")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="final_answer", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "item", "indexField": "index"}),
+            NodeIR(id="nested_each", type=NodeType.FOR_EACH, label="Nested", config={"itemsField": "items", "itemField": "item2", "indexField": "index2"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "done", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="nested_each", sourceHandle="item"),
+            EdgeIR(id="e3", source="nested_each", target="reply", sourceHandle="item"),
+        ]
+    )
+
+    result = validate_project(project)
+
+    assert not result.valid
+    assert any(issue.code == "FOR_EACH_MERGE_REQUIRED" for issue in result.issues)
+    assert any(issue.code == "FOR_EACH_NESTED_UNSUPPORTED" for issue in result.issues)
+
+
+def test_validates_merge_reducers():
+    project = create_default_project("Bad Merge")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="final_answer", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "item", "indexField": "index"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": '[{"target":"","source":"","reducer":"sum"}]'}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "done", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="merge", sourceHandle="item"),
+            EdgeIR(id="e3", source="merge", target="reply"),
+        ]
+    )
+
+    result = validate_project(project)
+
+    assert not result.valid
+    assert any(issue.code == "MERGE_REDUCER_TARGET" for issue in result.issues)
+    assert any(issue.code == "MERGE_REDUCER_SOURCE" for issue in result.issues)
+    assert any(issue.code == "MERGE_REDUCER_OPERATION" for issue in result.issues)
+
+
 def test_rejects_undeclared_state_write():
     project = create_default_project()
     project.nodes.extend(

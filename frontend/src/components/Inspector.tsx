@@ -628,6 +628,88 @@ export function Inspector() {
           </div>
         </>
       )}
+      {node.type === "for_each" && (
+        <>
+          <Field label="迭代数组字段">
+            <input
+              value={String(node.config.itemsField ?? "worker_tasks")}
+              onChange={(event) => updateNodeConfig(node.id, { itemsField: event.target.value })}
+            />
+            <small className="model-config-note">读取 state 中的数组字段；也支持形如 {"{ tasks: [] }"} 的任务规划对象。</small>
+          </Field>
+          <div className="inline-grid">
+            <Field label="Item 字段">
+              <input
+                value={String(node.config.itemField ?? "current_item")}
+                onChange={(event) => updateNodeConfig(node.id, { itemField: event.target.value })}
+              />
+            </Field>
+            <Field label="Index 字段">
+              <input
+                value={String(node.config.indexField ?? "current_index")}
+                onChange={(event) => updateNodeConfig(node.id, { indexField: event.target.value })}
+              />
+            </Field>
+          </div>
+          <div className="inline-grid">
+            <Field label="最大迭代项">
+              <input
+                type="number"
+                min={1}
+                max={100}
+                value={String(node.config.maxItems ?? 50)}
+                onChange={(event) => updateNodeConfig(node.id, { maxItems: Number(event.target.value) })}
+              />
+            </Field>
+            <Field label="迭代摘要字段">
+              <input
+                value={String(node.config.resultField ?? "")}
+                onChange={(event) => updateNodeConfig(node.id, { resultField: event.target.value })}
+                placeholder="留空则不写入"
+              />
+            </Field>
+          </div>
+          <small className="model-config-note">从 item 端口连接循环体首节点，循环体末尾连接 Merge；error 端口用于整体异常兜底。</small>
+        </>
+      )}
+      {node.type === "merge" && (
+        <>
+          <ReducersEditor
+            value={node.config.reducersJson}
+            onChange={(value) => updateNodeConfig(node.id, { reducersJson: value })}
+          />
+          <Field label="聚合摘要字段">
+            <input
+              value={String(node.config.resultField ?? "merge_result")}
+              onChange={(event) => updateNodeConfig(node.id, { resultField: event.target.value })}
+            />
+          </Field>
+        </>
+      )}
+      {node.type === "error_handler" && (
+        <>
+          <Field label="错误字段">
+            <input
+              value={String(node.config.errorField ?? "last_error")}
+              onChange={(event) => updateNodeConfig(node.id, { errorField: event.target.value })}
+            />
+          </Field>
+          <Field label="错误模板">
+            <textarea
+              rows={5}
+              value={String(node.config.template ?? "")}
+              onChange={(event) => updateNodeConfig(node.id, { template: event.target.value })}
+              placeholder="流程执行失败：{{ state.last_error }}"
+            />
+          </Field>
+          <Field label="输出字段">
+            <input
+              value={String(node.config.outputField ?? "error_result")}
+              onChange={(event) => updateNodeConfig(node.id, { outputField: event.target.value })}
+            />
+          </Field>
+        </>
+      )}
       {node.type === "retriever" && (
         <>
           <Field label="绑定 RAG 知识库">
@@ -1287,6 +1369,42 @@ function AssignmentsEditor({ value, onChange }: { value: unknown; onChange: (val
   );
 }
 
+function ReducersEditor({ value, onChange }: { value: unknown; onChange: (value: string) => void }) {
+  const rows = parseObjectList(value);
+  const updateRow = (index: number, patch: Record<string, unknown>) => onChange(stringifyObjectList(rows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row))));
+  const addRow = () => onChange(stringifyObjectList([...rows, { target: "merged_results", source: "item_result", reducer: "append" }]));
+  const removeRow = (index: number) => onChange(stringifyObjectList(rows.filter((_row, rowIndex) => rowIndex !== index)));
+  return (
+    <div className="config-table">
+      <div className="config-table__head">
+        <span>Merge Reducers</span>
+        <button type="button" onClick={addRow}>
+          <Plus size={14} />
+          <span>添加</span>
+        </button>
+      </div>
+      {rows.map((row, index) => (
+        <div className="config-table__row config-table__row--assignment" key={index}>
+          <input value={String(row.target ?? "")} onChange={(event) => updateRow(index, { target: event.target.value })} placeholder="target field" />
+          <input value={String(row.source ?? "")} onChange={(event) => updateRow(index, { source: event.target.value })} placeholder="itemState source" />
+          <select value={String(row.reducer ?? "append")} onChange={(event) => updateRow(index, { reducer: event.target.value })}>
+            <option value="append">append</option>
+            <option value="concat">concat</option>
+            <option value="merge">merge</option>
+            <option value="overwrite">overwrite</option>
+            <option value="first">first</option>
+            <option value="last">last</option>
+          </select>
+          <button className="icon-only" type="button" onClick={() => removeRow(index)} title="删除 Reducer">
+            <Trash2 size={14} />
+          </button>
+        </div>
+      ))}
+      {rows.length === 0 ? <small className="model-config-note">至少添加一个 Reducer 才能把 itemState 聚合回全局 state。</small> : null}
+    </div>
+  );
+}
+
 function SchemaFieldsEditor({ value, onChange }: { value: unknown; onChange: (value: string) => void }) {
   const rows = parseObjectList(value);
   const updateRow = (index: number, patch: Record<string, unknown>) => onChange(stringifyObjectList(rows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row))));
@@ -1895,6 +2013,21 @@ function detectStateFieldsFromNodes(nodes: NodeIR[]): DetectedStateField[] {
       case "json_validator":
         fields.push(detectedFieldFromConfig(node, "outputField", "validated_json", "dict", "JSON 校验输出"));
         fields.push(detectedFieldFromConfig(node, "validationField", "validation_result", "dict", "JSON 校验结果"));
+        break;
+      case "for_each":
+        if (normalizeStateFieldName(node.config.resultField)) {
+          fields.push(detectedFieldFromConfig(node, "resultField", "for_each_result", "dict", "ForEach 迭代摘要"));
+        }
+        break;
+      case "merge":
+        fields.push(detectedFieldFromConfig(node, "resultField", "merge_result", "dict", "Merge 聚合摘要"));
+        for (const reducer of parseObjectList(node.config.reducersJson)) {
+          const target = normalizeStateFieldName(reducer.target ?? reducer.field ?? reducer.name);
+          if (target) fields.push(detectedField(node, target.split(".")[0], "Any", "Merge 聚合字段"));
+        }
+        break;
+      case "error_handler":
+        fields.push(detectedFieldFromConfig(node, "outputField", "error_result", "dict", "错误处理输出"));
         break;
       case "task_splitter":
         fields.push(detectedFieldFromConfig(node, "outputField", "worker_tasks", "list", "任务列表"));

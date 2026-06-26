@@ -274,6 +274,60 @@ def test_codegen_exports_json_extractor_model_call():
     compile(nodes_py, "nodes.py", "exec")
 
 
+def test_codegen_exports_flow_control_nodes():
+    project = create_default_project("Flow Control Export")
+    project.state.fields.extend(
+        [
+            StateField(name="items", type="list"),
+            StateField(name="merged_results", type="list"),
+            StateField(name="merge_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(id="each_1", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index"}),
+            NodeIR(
+                id="template_1",
+                type=NodeType.TEMPLATE,
+                label="Template",
+                config={"template": "{{ state.current_item }}", "outputType": "text", "outputField": "item_result"},
+            ),
+            NodeIR(
+                id="merge_1",
+                type=NodeType.MERGE,
+                label="Merge",
+                config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"},
+            ),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_results }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each_1"),
+            EdgeIR(id="e2", source="each_1", target="template_1", sourceHandle="item"),
+            EdgeIR(id="e3", source="template_1", target="merge_1"),
+            EdgeIR(id="e4", source="merge_1", target="reply_1"),
+        ]
+    )
+
+    export_id, zip_path, files, smoke_test = export_project_zip(project)
+    generated = generate_project_files(project)
+    nodes_py = next(value for path, value in generated.items() if path.endswith("/nodes.py"))
+    graph_py = next(value for path, value in generated.items() if path.endswith("/graph.py"))
+
+    assert export_id
+    assert zip_path.exists()
+    assert smoke_test.passed
+    assert "_run_for_each_node" in nodes_py
+    assert "_apply_merge_reducers" in nodes_py
+    assert "'template_1': template_1" in nodes_py
+    assert 'builder.add_node("template_1"' not in graph_py
+    assert 'builder.add_edge("each_1", "reply_1")' in graph_py
+    compile(nodes_py, "nodes.py", "exec")
+    compile(graph_py, "graph.py", "exec")
+
+
 def test_codegen_embeds_agent_ref_project(monkeypatch):
     child = create_default_project("Child Export Agent")
     child.project.id = "child_export_agent"

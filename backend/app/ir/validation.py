@@ -44,7 +44,8 @@ def validate_project(project: ProjectIR) -> ValidationResult:
             issues.append(_issue("START_HAS_INCOMING", "Start 节点不允许有入边。", nodeId=node.id))
 
     for node_id, edges in outgoing.items():
-        kinds = {edge.kind for edge in edges}
+        non_error_edges = [edge for edge in edges if edge.kind != EdgeKind.ERROR]
+        kinds = {edge.kind for edge in non_error_edges}
         if EdgeKind.CONDITIONAL in kinds and any(kind != EdgeKind.CONDITIONAL for kind in kinds):
             issues.append(
                 _issue(
@@ -108,6 +109,12 @@ def validate_project(project: ProjectIR) -> ValidationResult:
             _validate_json_branch_node(node.id, node.config, outgoing[node.id], issues, "JSON Extractor")
         if node.type == NodeType.JSON_VALIDATOR:
             _validate_json_branch_node(node.id, node.config, outgoing[node.id], issues, "JSON Validator")
+        if node.type == NodeType.FOR_EACH:
+            _validate_for_each(node.id, node.config, outgoing, nodes_by_id, issues)
+        if node.type == NodeType.MERGE:
+            _validate_merge(node.id, node.config, issues)
+        if node.type == NodeType.ERROR_HANDLER:
+            _validate_error_handler(node.id, node.config, issues)
         if node.type == NodeType.HTTP:
             _validate_http(node.id, node.config, issues)
         if node.type == NodeType.CUSTOM_FUNCTION:
@@ -444,6 +451,134 @@ def _validate_json_branch_node(node_id: str, config: dict, outgoing_edges: list,
         )
 
 
+def _validate_for_each(
+    node_id: str,
+    config: dict,
+    outgoing: dict,
+    nodes_by_id: dict[str, Any],
+    issues: list[ValidationIssue],
+) -> None:
+    if not _clean_field(config.get("itemsField")):
+        issues.append(_issue("FOR_EACH_ITEMS_FIELD", "ForEach 必须配置 itemsField。", nodeId=node_id, field="itemsField"))
+    if not _clean_field(config.get("itemField")):
+        issues.append(_issue("FOR_EACH_ITEM_FIELD", "ForEach 必须配置 itemField。", nodeId=node_id, field="itemField"))
+    if not _clean_field(config.get("indexField")):
+        issues.append(_issue("FOR_EACH_INDEX_FIELD", "ForEach 必须配置 indexField。", nodeId=node_id, field="indexField"))
+    try:
+        max_items = int(config.get("maxItems", 50))
+    except (TypeError, ValueError):
+        max_items = 0
+    if max_items < 1 or max_items > 100:
+        issues.append(_issue("FOR_EACH_MAX_ITEMS", "ForEach 最大迭代项数必须在 1-100 之间。", nodeId=node_id, field="maxItems"))
+
+    item_edges = [edge for edge in outgoing[node_id] if edge.kind != EdgeKind.ERROR and edge.sourceHandle == "item"]
+    if not item_edges:
+        issues.append(
+            _issue(
+                "FOR_EACH_ITEM_EDGE",
+                "ForEach 必须从 item 输出端口连接到循环体首节点。",
+                nodeId=node_id,
+                field="outputs",
+                suggestion="从 ForEach 的 item 端口连接到要逐项执行的节点。",
+            )
+        )
+        return
+
+    merge_ids = _reachable_merge_ids(item_edges[0].target, outgoing, nodes_by_id)
+    if not merge_ids:
+        issues.append(
+            _issue(
+                "FOR_EACH_MERGE_REQUIRED",
+                "ForEach 循环体必须到达一个 Merge 节点作为聚合终点。",
+                nodeId=node_id,
+                field="outputs",
+                suggestion="在循环体末尾连接 Merge 节点，并从 Merge 继续连接后续节点。",
+            )
+        )
+    if len(merge_ids) > 1:
+        issues.append(_issue("FOR_EACH_SINGLE_MERGE", "ForEach v1 只支持一个 Merge 聚合终点。", nodeId=node_id, field="outputs"))
+
+    nested = _reachable_flow_control_ids(item_edges[0].target, outgoing, nodes_by_id, stop_ids=set(merge_ids))
+    if nested:
+        issues.append(
+            _issue(
+                "FOR_EACH_NESTED_UNSUPPORTED",
+                f"ForEach v1 暂不支持嵌套 ForEach/Merge：{', '.join(sorted(nested))}。",
+                nodeId=node_id,
+                field="outputs",
+            )
+        )
+
+
+def _reachable_merge_ids(start_id: str, outgoing: dict, nodes_by_id: dict[str, Any]) -> set[str]:
+    seen: set[str] = set()
+    queue: deque[str] = deque([start_id])
+    merge_ids: set[str] = set()
+    while queue:
+        node_id = queue.popleft()
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        node = nodes_by_id.get(node_id)
+        if not node:
+            continue
+        if node.type == NodeType.MERGE:
+            merge_ids.add(node_id)
+            continue
+        for edge in outgoing[node_id]:
+            if edge.kind == EdgeKind.WORKER:
+                continue
+            queue.append(edge.target)
+    return merge_ids
+
+
+def _reachable_flow_control_ids(start_id: str, outgoing: dict, nodes_by_id: dict[str, Any], stop_ids: set[str]) -> set[str]:
+    seen: set[str] = set()
+    queue: deque[str] = deque([start_id])
+    nested: set[str] = set()
+    while queue:
+        node_id = queue.popleft()
+        if node_id in seen or node_id in stop_ids:
+            continue
+        seen.add(node_id)
+        node = nodes_by_id.get(node_id)
+        if not node:
+            continue
+        if node.type in {NodeType.FOR_EACH, NodeType.MERGE}:
+            nested.add(node_id)
+            continue
+        for edge in outgoing[node_id]:
+            if edge.kind == EdgeKind.WORKER:
+                continue
+            queue.append(edge.target)
+    return nested
+
+
+def _validate_merge(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
+    reducers = _json_object_list(config.get("reducersJson"))
+    if not reducers:
+        issues.append(_issue("MERGE_REDUCERS_REQUIRED", "Merge 至少需要一个 Reducer。", nodeId=node_id, field="reducersJson"))
+        return
+    allowed = {"append", "concat", "merge", "overwrite", "first", "last"}
+    for index, reducer in enumerate(reducers):
+        target = _clean_field(reducer.get("target") or reducer.get("field") or reducer.get("name"))
+        source = _clean_field(reducer.get("source") or reducer.get("sourceField"))
+        operation = str(reducer.get("reducer") or reducer.get("operation") or "append").strip().lower()
+        if not target:
+            issues.append(_issue("MERGE_REDUCER_TARGET", f"第 {index + 1} 个 Reducer 缺少 target。", nodeId=node_id, field="reducersJson"))
+        if not source:
+            issues.append(_issue("MERGE_REDUCER_SOURCE", f"第 {index + 1} 个 Reducer 缺少 source。", nodeId=node_id, field="reducersJson"))
+        if operation not in allowed:
+            issues.append(_issue("MERGE_REDUCER_OPERATION", f"不支持的 Merge Reducer：{operation}。", nodeId=node_id, field="reducersJson"))
+
+
+def _validate_error_handler(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
+    if not _clean_field(config.get("outputField")):
+        issues.append(_issue("ERROR_HANDLER_OUTPUT_FIELD", "Error Handler 必须配置输出字段。", nodeId=node_id, field="outputField"))
+    if not _clean_field(config.get("errorField")):
+        issues.append(_issue("ERROR_HANDLER_ERROR_FIELD", "Error Handler 必须配置 errorField。", nodeId=node_id, field="errorField"))
+
+
 def _validate_custom_function(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
     code = str(config.get("code", "return {}"))
     try:
@@ -461,7 +596,7 @@ def _validate_custom_function(node_id: str, config: dict, issues: list[Validatio
 
 
 def _validate_state_writes(project: ProjectIR, issues: list[ValidationIssue]) -> None:
-    declared = {"messages"}
+    declared = {"messages", "last_error"}
     declared.update(str(field.name).strip() for field in project.state.fields if str(field.name).strip())
     for node in project.nodes:
         for field in sorted(_state_writes_for_node(node.type, node.config)):
@@ -499,6 +634,15 @@ def _state_writes_for_node(node_type: NodeType, config: dict[str, Any]) -> set[s
         return {_clean_field(config.get("outputField", ""))}
     if node_type in {NodeType.JSON_EXTRACTOR, NodeType.JSON_VALIDATOR}:
         return {_clean_field(config.get("outputField", "")), _clean_field(config.get("validationField", ""))}
+    if node_type == NodeType.MERGE:
+        fields = {_clean_field(config.get("resultField", "merge_result"))}
+        for reducer in _json_object_list(config.get("reducersJson")):
+            target = _clean_field(reducer.get("target") or reducer.get("field") or reducer.get("name"))
+            if target:
+                fields.add(target.split(".", 1)[0])
+        return fields
+    if node_type == NodeType.ERROR_HANDLER:
+        return {_clean_field(config.get("outputField", ""))}
     if node_type == NodeType.RETRIEVER:
         return {_clean_field(config.get("outputField", ""))}
     if node_type == NodeType.HTTP:

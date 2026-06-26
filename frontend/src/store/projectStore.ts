@@ -1467,7 +1467,9 @@ function buildReactFlowEdge(
   const kind =
     sourceNode?.type === "parallel_worker" || targetNode?.type === "parallel_worker"
       ? "worker"
-      : sourceNode && ["condition", "ai_router", "human_approval"].includes(sourceNode.type)
+      : sourceHandle === "error"
+        ? "error"
+      : sourceNode && ["condition", "ai_router", "human_approval", "json_extractor", "json_validator"].includes(sourceNode.type)
         ? "conditional"
         : "normal";
   return {
@@ -1477,7 +1479,7 @@ function buildReactFlowEdge(
     target,
     targetHandle,
     type: "smoothstep",
-    label: kind === "conditional" ? sourceHandle ?? "branch" : undefined,
+    label: kind === "conditional" || kind === "error" ? sourceHandle ?? kind : undefined,
     data: { kind },
   };
 }
@@ -2054,12 +2056,17 @@ function stateWriteKeysForNodeType(type: NodeType): string[] {
     case "custom_function":
     case "skill_node":
     case "mcp_node":
+    case "error_handler":
       return ["outputField"];
     case "variable_assign":
       return ["resultField"];
     case "json_extractor":
     case "json_validator":
       return ["outputField", "validationField"];
+    case "for_each":
+      return ["resultField"];
+    case "merge":
+      return ["resultField"];
     default:
       return [];
   }
@@ -2090,6 +2097,12 @@ function defaultWriteFieldName(type: NodeType, key: string): string {
       return key === "validationField" ? "validation_result" : "extracted_json";
     case "json_validator":
       return key === "validationField" ? "validation_result" : "validated_json";
+    case "for_each":
+      return "for_each_result";
+    case "merge":
+      return "merge_result";
+    case "error_handler":
+      return "error_result";
     case "retriever":
       return "retrieved_context";
     case "http":
@@ -2191,6 +2204,18 @@ function stateFieldsForNode(node: NodeIR): StateField[] {
         stateFieldFromConfig(config, "outputField", "validated_json", "dict", `${node.label} 校验输出`),
         stateFieldFromConfig(config, "validationField", "validation_result", "dict", `${node.label} 校验结果`),
       ];
+    case "for_each":
+      return normalizeFieldName(config.resultField)
+        ? [stateFieldFromConfig(config, "resultField", "for_each_result", "dict", `${node.label} 迭代摘要`)]
+        : [];
+    case "merge": {
+      const fields = [stateFieldFromConfig(config, "resultField", "merge_result", "dict", `${node.label} 聚合摘要`)];
+      for (const reducer of parseJsonObjectList(config.reducersJson)) {
+        const target = normalizeFieldName(reducer.target ?? reducer.field ?? reducer.name);
+        if (target) fields.push({ name: target.split(".")[0], type: "Any", description: `${node.label} 聚合字段` });
+      }
+      return fields;
+    }
     case "retriever":
       return [stateFieldFromConfig(config, "outputField", "retrieved_context", "str", `${node.label} 检索结果`)];
     case "ai_router":
@@ -2213,6 +2238,8 @@ function stateFieldsForNode(node: NodeIR): StateField[] {
       return [stateFieldFromConfig(config, "outputField", "skill_result", "str", `${node.label} 输出`)];
     case "mcp_node":
       return [stateFieldFromConfig(config, "outputField", "mcp_result", "dict", `${node.label} 输出`)];
+    case "error_handler":
+      return [stateFieldFromConfig(config, "outputField", "error_result", "dict", `${node.label} 输出`)];
     default:
       return [];
   }

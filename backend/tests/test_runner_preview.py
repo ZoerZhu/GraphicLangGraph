@@ -1077,6 +1077,143 @@ def test_json_validator_invalid_branch_is_business_route():
     assert state["final_answer"] == "invalid"
 
 
+def test_for_each_runs_item_chain_and_merge_reducers_isolated():
+    project = create_default_project("ForEach Merge")
+    project.state.fields.extend(
+        [
+            StateField(name="items", type="list"),
+            StateField(name="merged_results", type="list"),
+            StateField(name="concat_results", type="list"),
+            StateField(name="merged_object", type="dict"),
+            StateField(name="first_item", type="str"),
+            StateField(name="last_item", type="str"),
+            StateField(name="merge_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index", "maxItems": 10}),
+            NodeIR(
+                id="assign_item",
+                type=NodeType.VARIABLE_ASSIGN,
+                label="Assign Item",
+                config={
+                    "assignmentsJson": json.dumps(
+                        [
+                            {"target": "item_result", "operation": "overwrite", "sourceType": "state", "source": "current_item", "valueType": "string"},
+                            {"target": "list_part", "operation": "overwrite", "sourceType": "json", "source": '["{{ state.current_item }}"]', "valueType": "json"},
+                            {"target": "object_part", "operation": "overwrite", "sourceType": "json", "source": '{"value":"{{ state.current_item }}"}', "valueType": "json"},
+                        ]
+                    ),
+                    "resultField": "assignment_result",
+                },
+            ),
+            NodeIR(
+                id="merge",
+                type=NodeType.MERGE,
+                label="Merge",
+                config={
+                    "reducersJson": json.dumps(
+                        [
+                            {"target": "merged_results", "source": "item_result", "reducer": "append"},
+                            {"target": "concat_results", "source": "list_part", "reducer": "concat"},
+                            {"target": "merged_object", "source": "object_part", "reducer": "merge"},
+                            {"target": "first_item", "source": "item_result", "reducer": "first"},
+                            {"target": "last_item", "source": "item_result", "reducer": "last"},
+                        ]
+                    ),
+                    "resultField": "merge_result",
+                },
+            ),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_results }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="assign_item", sourceHandle="item"),
+            EdgeIR(id="e3", source="assign_item", target="merge"),
+            EdgeIR(id="e4", source="merge", target="reply"),
+        ]
+    )
+
+    trace, state = preview.run_project_preview(project, {"messages": "run", "items": ["a", "b"]}, "live")
+
+    assert [item["nodeId"] for item in trace] == ["each", "reply"]
+    assert state["merged_results"] == ["a", "b"]
+    assert state["concat_results"] == ["a", "b"]
+    assert state["merged_object"] == {"value": "b"}
+    assert state["first_item"] == "a"
+    assert state["last_item"] == "b"
+    assert state["merge_result"]["itemCount"] == 2
+    assert [item["index"] for item in state["merge_result"]["iterations"]] == [0, 1]
+    assert "current_item" not in state
+
+
+def test_for_each_item_error_can_route_to_error_handler_before_merge():
+    project = create_default_project("ForEach Error")
+    project.state.fields.extend(
+        [
+            StateField(name="items", type="list"),
+            StateField(name="merged_results", type="list"),
+            StateField(name="merge_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index"}),
+            NodeIR(id="bad_template", type=NodeType.TEMPLATE, label="Bad Template", config={"template": "{bad json", "outputType": "json", "outputField": "item_result"}),
+            NodeIR(id="error_handler", type=NodeType.ERROR_HANDLER, label="Error Handler", config={"errorField": "last_error", "template": "handled {{ state.last_error }}", "outputField": "item_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_results }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="bad_template", sourceHandle="item"),
+            EdgeIR(id="e3", source="bad_template", target="error_handler", kind=EdgeKind.ERROR, sourceHandle="error"),
+            EdgeIR(id="e4", source="error_handler", target="merge"),
+            EdgeIR(id="e5", source="merge", target="reply"),
+        ]
+    )
+
+    trace, state = preview.run_project_preview(project, {"messages": "run", "items": ["a"]}, "live")
+
+    assert [item["status"] for item in trace] == ["ok", "ok"]
+    assert state["merged_results"][0]["ok"] is False
+    assert state["merged_results"][0]["error"]["nodeId"] == "bad_template"
+    assert state["final_answer"]
+
+
+def test_top_level_error_edge_routes_to_error_handler():
+    project = create_default_project("Top Error")
+    project.state.fields.extend([StateField(name="error_result", type="dict"), StateField(name="final_answer", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(id="bad_template", type=NodeType.TEMPLATE, label="Bad Template", config={"template": "{bad json", "outputType": "json", "outputField": "broken"}),
+            NodeIR(id="error_handler", type=NodeType.ERROR_HANDLER, label="Error Handler", config={"errorField": "last_error", "template": "handled", "outputField": "error_result"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.error_result }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="bad_template"),
+            EdgeIR(id="e2", source="bad_template", target="error_handler", kind=EdgeKind.ERROR, sourceHandle="error"),
+            EdgeIR(id="e3", source="error_handler", target="reply"),
+        ]
+    )
+
+    trace, state = preview.run_project_preview(project, {"messages": "run"}, "live")
+
+    assert [item["nodeId"] for item in trace] == ["bad_template", "error_handler", "reply"]
+    assert trace[0]["status"] == "ok"
+    assert state["last_error"]["nodeId"] == "bad_template"
+    assert state["error_result"]["ok"] is False
+
+
 def test_builtin_read_file_respects_runtime_allowed_roots(tmp_path: Path):
     allowed = tmp_path / "allowed"
     allowed.mkdir()
