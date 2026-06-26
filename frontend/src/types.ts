@@ -487,6 +487,7 @@ export interface RunTraceItem {
   timeoutSec?: number | null;
   parallel?: boolean | null;
   itemFailurePolicy?: string | null;
+  dataShaping?: Record<string, unknown> | null;
   position?: Position | null;
 }
 

@@ -2757,6 +2757,27 @@ button.icon-only {
   margin: 0;
 }
 
+.run-trace-meta {
+  display: grid;
+  gap: 4px;
+  border: 1px solid rgba(35, 134, 84, 0.18);
+  border-radius: 10px;
+  padding: 7px 8px;
+  background: rgba(244, 255, 248, 0.72);
+}
+
+.run-trace-meta__title {
+  color: #17663b;
+  font-size: 10px;
+  font-weight: 760;
+}
+
+.run-trace-meta__body {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
 .run-trace-section,
 .run-output-state,
 .run-history-section {

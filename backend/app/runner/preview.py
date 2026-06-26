@@ -490,7 +490,9 @@ def _execute_node_with_policy(
             )
             if attempt_index > 1:
                 detail = f"{detail}；重试第 {attempt_index} 次后成功。"
-            return delta, detail, _successful_policy_trace_meta(node, attempts)
+            trace_meta = _successful_policy_trace_meta(node, attempts)
+            trace_meta.update(_data_shaping_trace_meta(node, state, delta))
+            return delta, detail, trace_meta
         except Exception as exc:
             last_exc = exc
             error_type = _policy_error_type(exc)
@@ -6209,6 +6211,129 @@ def _successful_policy_trace_meta(node: NodeIR, attempts: list[dict[str, Any]]) 
         meta["parallel"] = str(node.config.get("executionMode") or "sequential").strip().lower() == "parallel"
         meta["itemFailurePolicy"] = str(node.config.get("itemFailurePolicy") or "fail_fast").strip().lower()
     return meta
+
+
+def _data_shaping_trace_meta(node: NodeIR, state: dict[str, Any], delta: dict[str, Any]) -> dict[str, Any]:
+    if node.type not in {NodeType.VARIABLE_ASSIGN, NodeType.TEMPLATE, NodeType.JSON_EXTRACTOR, NodeType.JSON_VALIDATOR}:
+        return {}
+    config = node.config
+    kind = {
+        NodeType.VARIABLE_ASSIGN: "variable_assign",
+        NodeType.TEMPLATE: "template",
+        NodeType.JSON_EXTRACTOR: "json_extractor",
+        NodeType.JSON_VALIDATOR: "json_validator",
+    }[node.type]
+    meta: dict[str, Any] = {
+        "kind": kind,
+        "inputMappings": _trace_input_mappings(config.get("inputMappingsJson")),
+    }
+    resolved_inputs = _trace_resolved_inputs(config, state)
+    if resolved_inputs:
+        meta["resolvedInputs"] = resolved_inputs
+
+    if node.type == NodeType.VARIABLE_ASSIGN:
+        result_field = str(config.get("resultField", "assignment_result")).strip() or "assignment_result"
+        result = delta.get(result_field)
+        meta.update(
+            {
+                "resultField": result_field,
+                "assignments": _trace_assignments(config.get("assignmentsJson")),
+                "changedFields": result.get("changedFields", []) if isinstance(result, dict) else [],
+            }
+        )
+    elif node.type == NodeType.TEMPLATE:
+        output_field = str(config.get("outputField", "template_result")).strip() or "template_result"
+        meta.update(
+            {
+                "outputField": output_field,
+                "outputType": str(config.get("outputType", "text")).strip().lower() or "text",
+            }
+        )
+        if output_field in delta:
+            meta["outputPreview"] = _compact_value(delta.get(output_field), string_limit=500, list_limit=5)
+    else:
+        output_field = str(config.get("outputField") or ("extracted_json" if node.type == NodeType.JSON_EXTRACTOR else "validated_json")).strip()
+        validation_field = str(config.get("validationField", "validation_result")).strip() or "validation_result"
+        repair_field = str(config.get("repairResultField", "repair_result")).strip() or "repair_result"
+        validation = _trace_validation(delta.get(validation_field))
+        meta.update(
+            {
+                "outputField": output_field,
+                "validationField": validation_field,
+                "repairResultField": repair_field,
+                "schemaPreset": str(config.get("schemaPreset") or ""),
+                "schemaFieldCount": len(_json_object_list(config.get("schemaFieldsJson"))),
+                "repairEnabled": _truthy(config.get("repairEnabled")),
+                "validation": validation,
+            }
+        )
+        if validation:
+            meta["branch"] = "valid" if validation.get("valid") else "invalid"
+        if repair_field in delta:
+            meta["repair"] = _trace_repair(delta.get(repair_field))
+    return {"dataShaping": meta}
+
+
+def _trace_input_mappings(value: Any) -> list[dict[str, Any]]:
+    mappings = []
+    for item in _json_object_list(value):
+        mappings.append(
+            {
+                "name": str(item.get("name") or ""),
+                "sourceType": str(item.get("sourceType") or item.get("source_type") or "state"),
+                "source": str(item.get("source") or ""),
+                "valueType": str(item.get("valueType") or item.get("value_type") or "auto"),
+                "transform": str(item.get("transform") or "none"),
+            }
+        )
+    return mappings
+
+
+def _trace_assignments(value: Any) -> list[dict[str, Any]]:
+    assignments = []
+    for item in _json_object_list(value):
+        assignments.append(
+            {
+                "target": str(item.get("target") or item.get("field") or item.get("name") or ""),
+                "operation": str(item.get("operation") or "overwrite"),
+                "sourceType": str(item.get("sourceType") or item.get("source_type") or "template"),
+                "source": str(item.get("source") if item.get("source") is not None else item.get("value") or ""),
+                "valueType": str(item.get("valueType") or item.get("value_type") or "auto"),
+                "transform": str(item.get("transform") or "none"),
+            }
+        )
+    return assignments
+
+
+def _trace_resolved_inputs(config: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    if not _json_object_list(config.get("inputMappingsJson")):
+        return {}
+    try:
+        return _compact_value(_resolve_input_mappings(config, state), string_limit=500, list_limit=5)
+    except Exception:
+        return {}
+
+
+def _trace_validation(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        "valid": bool(value.get("valid")),
+        "errors": _compact_value(value.get("errors") or [], string_limit=500, list_limit=5),
+    }
+
+
+def _trace_repair(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result = {
+        "ok": bool(value.get("ok")),
+        "errors": _compact_value(value.get("errors") or [], string_limit=500, list_limit=5),
+    }
+    validation = value.get("validation")
+    if isinstance(validation, dict):
+        result["validation"] = _trace_validation(validation)
+    return result
 
 
 def _failed_policy_trace_meta(node: NodeIR, attempts: list[dict[str, Any]], policy: dict[str, Any]) -> dict[str, Any]:

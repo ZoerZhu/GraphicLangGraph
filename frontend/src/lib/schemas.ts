@@ -427,7 +427,7 @@ export const RunPreviewResultSchema = z.object({
       virtual: z.boolean().optional().default(false),
       parentNodeId: z.string().nullable().optional(),
       position: z.object({ x: z.number(), y: z.number() }).nullable().optional(),
-    }),
+    }).passthrough(),
   ),
   outputState: z.record(z.unknown()),
 });

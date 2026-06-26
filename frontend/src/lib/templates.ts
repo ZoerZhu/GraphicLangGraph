@@ -116,6 +116,9 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     name: "结构化任务并行 Worker",
     description: "把用户目标抽取为 Task Plan JSON，校验后拆分并交给并行 Worker 处理。",
     kind: "agent",
+    sampleInput: {
+      messages: "请把这次代码审查拆成三个并行任务：检查后端运行逻辑、检查前端配置体验、汇总风险和验证建议。",
+    },
     fields: [
       { name: "task_plan", type: "dict", description: "结构化任务规划" },
       { name: "task_plan_validation", type: "dict", description: "任务规划校验结果" },
@@ -290,6 +293,79 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
       edge("edge_fc_worker_error_handler", "worker_placeholder_fc", "error", "item_error_handler_fc", "error", "error"),
       edge("edge_fc_error_handler_merge", "item_error_handler_fc", "out", "merge_results_fc"),
       edge("edge_fc_merge_reply", "merge_results_fc", "out", "reply_flow_control_fc"),
+    ],
+  },
+  {
+    id: "api_json_cleanup",
+    name: "API JSON 清洗与校验",
+    description: "读取订单 API 返回，用 Template 统一字段结构，再用 JSON Validator 校验并回复。",
+    kind: "agent",
+    sampleInput: {
+      messages: "查询订单 O-10086 的配送状态",
+      order_id: "O-10086",
+    },
+    fields: [
+      { name: "order_id", type: "str", description: "订单号" },
+      { name: "order_info", type: "dict", description: "原始订单 API 返回" },
+      { name: "clean_order", type: "dict", description: "清洗后的订单结构" },
+      { name: "order_validation", type: "dict", description: "订单结构校验结果" },
+      { name: "final_answer", type: "str", description: "最终回复" },
+    ],
+    nodes: [
+      node("start", "start", "开始", 100, 260, { inputMode: "chat" }, [], [{ id: "out", type: "control", label: "输出" }]),
+      node("fetch_order", "http", "查询订单 API", 370, 220, {
+        method: "GET",
+        url: "https://api.example.com/orders/{{ state.order_id }}",
+        body: "",
+        authSecret: "ORDER_API_TOKEN",
+        mockEnabled: true,
+        mockResponseJson: "{\n  \"order_id\": \"{{ state.order_id }}\",\n  \"status\": \"已发货\",\n  \"shipping_company\": \"顺丰速运\",\n  \"tracking_no\": \"SF1234567890\",\n  \"estimated_delivery\": \"明天 18:00 前\",\n  \"refundable\": true\n}",
+        outputField: "order_info",
+      }),
+      node("shape_order", "template", "统一订单结构", 640, 220, {
+        inputMappingsJson: JSON.stringify([{ name: "order", sourceType: "state", source: "order_info", valueType: "json" }], null, 2),
+        template: "{\n  \"orderId\": \"{{ state.order_info.order_id }}\",\n  \"status\": \"{{ state.order_info.status }}\",\n  \"shippingCompany\": \"{{ state.order_info.shipping_company }}\",\n  \"trackingNo\": \"{{ state.order_info.tracking_no }}\",\n  \"estimatedDelivery\": \"{{ state.order_info.estimated_delivery }}\",\n  \"refundPolicy\": \"{{ state.order_info.refundable }}\"\n}",
+        outputType: "json",
+        outputField: "clean_order",
+      }),
+      node("validate_order", "json_validator", "校验订单结构", 910, 220, {
+        inputField: "clean_order",
+        outputField: "clean_order",
+        validationField: "order_validation",
+        schemaFieldsJson: JSON.stringify(
+          [
+            { name: "orderId", type: "string", required: true, description: "订单号" },
+            { name: "status", type: "string", required: true, description: "订单状态" },
+            { name: "shippingCompany", type: "string", required: true, description: "物流公司" },
+            { name: "trackingNo", type: "string", required: true, description: "物流单号" },
+            { name: "estimatedDelivery", type: "string", required: false, description: "预计送达" },
+            { name: "refundPolicy", type: "string", required: false, description: "退款可用性" },
+          ],
+          null,
+          2,
+        ),
+        repairEnabled: false,
+      }, [{ id: "in", type: "control", label: "输入" }], [
+        { id: "valid", type: "condition", label: "valid" },
+        { id: "invalid", type: "condition", label: "invalid" },
+      ]),
+      node("reply_order_valid", "direct_reply", "订单回复", 1180, 180, {
+        template: "订单 {{ state.clean_order.orderId }} 当前状态：{{ state.clean_order.status }}。\n物流：{{ state.clean_order.shippingCompany }} {{ state.clean_order.trackingNo }}。\n预计送达：{{ state.clean_order.estimatedDelivery }}。",
+        outputField: "final_answer",
+        format: "chat",
+      }, [{ id: "in", type: "control", label: "输入" }], []),
+      node("reply_order_invalid", "direct_reply", "数据异常回复", 1180, 360, {
+        template: "订单数据校验失败：{{ state.order_validation }}",
+        outputField: "final_answer",
+        format: "chat",
+      }, [{ id: "in", type: "control", label: "输入" }], []),
+    ],
+    edges: [
+      edge("edge_api_start_fetch", "start", "out", "fetch_order"),
+      edge("edge_api_fetch_shape", "fetch_order", "out", "shape_order"),
+      edge("edge_api_shape_validate", "shape_order", "out", "validate_order"),
+      edge("edge_api_valid_reply", "validate_order", "valid", "reply_order_valid", "conditional", "valid"),
+      edge("edge_api_invalid_reply", "validate_order", "invalid", "reply_order_invalid", "conditional", "invalid"),
     ],
   },
   {

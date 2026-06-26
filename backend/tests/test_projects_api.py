@@ -124,6 +124,41 @@ def test_project_run_preview():
     assert deleted.status_code == 204
 
 
+def test_project_run_preview_preserves_data_shaping_trace_metadata():
+    client = TestClient(app)
+
+    created = client.post("/api/projects", json={"name": "Trace 元数据测试 Agent"})
+    assert created.status_code == 200
+    project = created.json()
+    project_id = project["project"]["id"]
+    project["nodes"].append(
+        {
+            "id": "assign_1",
+            "type": "variable_assign",
+            "label": "Variable Assign",
+            "position": {"x": 320, "y": 220},
+            "config": {
+                "assignmentsJson": json.dumps(
+                    [{"target": "assigned_value", "operation": "overwrite", "sourceType": "state", "source": "messages", "valueType": "string"}]
+                ),
+                "resultField": "assignment_result",
+            },
+            "inputs": [{"id": "in", "type": "control", "label": "输入"}],
+            "outputs": [{"id": "out", "type": "control", "label": "输出"}],
+        }
+    )
+    project["edges"].append({"id": "e1", "source": "start", "sourceHandle": "out", "target": "assign_1", "kind": "normal"})
+    assert client.put(f"/api/projects/{project_id}", json=project).status_code == 200
+
+    preview = client.post(f"/api/projects/{project_id}/run", json={"input": {"messages": "hello"}})
+    assert preview.status_code == 200
+    trace_item = preview.json()["trace"][0]
+    assert trace_item["dataShaping"]["kind"] == "variable_assign"
+    assert trace_item["dataShaping"]["changedFields"] == ["assigned_value"]
+
+    assert client.delete(f"/api/projects/{project_id}").status_code == 204
+
+
 def test_project_run_stream_emits_node_events():
     client = TestClient(app)
 

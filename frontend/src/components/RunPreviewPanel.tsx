@@ -464,6 +464,7 @@ function RunTraceCard({
   onSelectNode: (nodeId: string | null) => void;
 }) {
   const outputs = Object.entries(item.outputDelta);
+  const dataShaping = traceRecord(item.dataShaping);
   return (
     <article className={`run-trace-item is-${item.status}`}>
       <button
@@ -477,6 +478,7 @@ function RunTraceCard({
         <span>{item.type} · {statusLabel(item.status)} · {item.durationMs}ms</span>
       </button>
       {item.detail ? <p>{item.detail}</p> : null}
+      {dataShaping ? <DataShapingTraceSummary data={dataShaping} /> : null}
       {outputs.length ? (
         <div className="run-output-vars">
           {outputs.map(([name, value]) => (
@@ -489,6 +491,60 @@ function RunTraceCard({
       ) : null}
     </article>
   );
+}
+
+function DataShapingTraceSummary({ data }: { data: Record<string, unknown> }) {
+  const validation = traceRecord(data.validation);
+  const repair = traceRecord(data.repair);
+  const changedFields = traceList(data.changedFields);
+  const details = [
+    traceText(data.outputField) ? `输出 ${traceText(data.outputField)}` : "",
+    traceText(data.resultField) ? `结果 ${traceText(data.resultField)}` : "",
+    changedFields ? `变更 ${changedFields}` : "",
+    validation ? `校验 ${traceBool(validation.valid) ? "valid" : "invalid"}` : "",
+    traceText(data.branch) ? `分支 ${traceText(data.branch)}` : "",
+    repair ? `修复 ${traceBool(repair.ok) ? "ok" : "failed"}` : "",
+  ].filter(Boolean);
+  return (
+    <div className="run-trace-meta">
+      <div className="run-trace-meta__title">Data Shaping · {dataShapingKindLabel(traceText(data.kind))}</div>
+      {details.length ? <div className="run-trace-meta__body">{details.join(" · ")}</div> : null}
+    </div>
+  );
+}
+
+function dataShapingKindLabel(kind: string) {
+  switch (kind) {
+    case "variable_assign":
+      return "Variable Assign";
+    case "template":
+      return "Template";
+    case "json_extractor":
+      return "JSON Extractor";
+    case "json_validator":
+      return "JSON Validator";
+    default:
+      return kind || "Unknown";
+  }
+}
+
+function traceRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function traceText(value: unknown) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function traceBool(value: unknown) {
+  return value === true || value === "true";
+}
+
+function traceList(value: unknown) {
+  if (!Array.isArray(value)) return "";
+  return value.map(traceText).filter(Boolean).join(", ");
 }
 
 function formatIssue(issue: ValidationIssue) {

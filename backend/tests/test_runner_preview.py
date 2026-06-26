@@ -975,6 +975,65 @@ def test_workflow_core_variable_assign_and_template_live_run():
     assert state["template_result"] == {"message": "hello", "ok": True}
 
 
+def test_workflow_core_trace_includes_data_shaping_metadata():
+    project = create_default_project("Workflow Core Trace")
+    schema_fields = json.dumps(
+        [
+            {"name": "orderId", "type": "string", "required": True},
+            {"name": "status", "type": "string", "required": True},
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="assign",
+                type=NodeType.VARIABLE_ASSIGN,
+                label="Variable Assign",
+                config={
+                    "inputMappingsJson": json.dumps([{"name": "order", "sourceType": "state", "source": "order", "valueType": "json"}]),
+                    "assignmentsJson": json.dumps(
+                        [
+                            {
+                                "target": "clean_order",
+                                "operation": "overwrite",
+                                "sourceType": "input",
+                                "source": "order",
+                                "transform": "pick",
+                                "transformArgsJson": '{"paths":["orderId","status"]}',
+                                "valueType": "json",
+                            }
+                        ]
+                    ),
+                    "resultField": "assignment_result",
+                },
+            ),
+            NodeIR(
+                id="validator",
+                type=NodeType.JSON_VALIDATOR,
+                label="JSON Validator",
+                config={
+                    "inputField": "clean_order",
+                    "schemaFieldsJson": schema_fields,
+                    "outputField": "clean_order",
+                    "validationField": "order_validation",
+                },
+                outputs=[{"id": "valid", "type": "condition", "label": "valid"}, {"id": "invalid", "type": "condition", "label": "invalid"}],
+            ),
+        ]
+    )
+    project.edges.extend([EdgeIR(id="e1", source="start", target="assign"), EdgeIR(id="e2", source="assign", target="validator")])
+
+    trace, state = preview.run_project_preview(project, {"order": {"orderId": "O-1", "status": "已发货", "secret": "hidden"}}, "live")
+
+    assert state["clean_order"] == {"orderId": "O-1", "status": "已发货"}
+    assert trace[0]["dataShaping"]["kind"] == "variable_assign"
+    assert trace[0]["dataShaping"]["changedFields"] == ["clean_order"]
+    assert trace[0]["dataShaping"]["assignments"][0]["transform"] == "pick"
+    assert trace[1]["dataShaping"]["kind"] == "json_validator"
+    assert trace[1]["dataShaping"]["validation"]["valid"] is True
+    assert trace[1]["dataShaping"]["branch"] == "valid"
+
+
 def test_json_extractor_valid_branch_feeds_task_splitter(monkeypatch):
     def fake_call_chat_model(provider, model, messages, runtime_config=None):
         return FakeResponse(json.dumps({"tasks": [{"title": "分析入口", "goal": "阅读入口文件"}]}, ensure_ascii=False))

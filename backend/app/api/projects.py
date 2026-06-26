@@ -90,6 +90,8 @@ class DataShapingPreviewRequest(BaseModel):
 
 
 class RunTraceItem(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     nodeId: str
     type: str
     label: str
