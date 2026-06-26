@@ -493,6 +493,7 @@ def test_builtin_tool_presets_can_be_installed(tmp_path, monkeypatch):
     preset_ids = {item["id"] for item in presets.json()}
     assert {
         "builtin_web_search",
+        "builtin_task_plan",
         "builtin_read_file",
         "builtin_list_directory",
         "builtin_read_file_chunk",

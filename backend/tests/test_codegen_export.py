@@ -432,6 +432,7 @@ def test_codegen_http_node_preserves_mock_response():
 def test_codegen_exports_phase1_code_reading_tools():
     project = create_default_project("Code Tools Agent")
     for builtin_id, name in [
+        ("task_plan", "task_plan"),
         ("read_file_chunk", "read_file_chunk"),
         ("search_code", "search_code"),
         ("list_code_symbols", "list_code_symbols"),
@@ -449,6 +450,8 @@ def test_codegen_exports_phase1_code_reading_tools():
     files = generate_project_files(project)
     tools_py = next(value for path, value in files.items() if path.endswith("/tools.py"))
 
+    assert "def task_plan" in tools_py
+    assert "task_splitter_v1" in tools_py
     assert "def read_file_chunk" in tools_py
     assert "def search_code" in tools_py
     assert "def list_code_symbols" in tools_py
@@ -587,6 +590,8 @@ def test_codegen_exports_task_splitter_and_parallel_tools():
                     "maxIterationsPerTask": 4,
                 },
             ),
+            NodeIR(id="worker_1", type=NodeType.PARALLEL_WORKER, label="Worker 1", config={"parentNodeId": "parallel_1", "workerIndex": 1}),
+            NodeIR(id="worker_2", type=NodeType.PARALLEL_WORKER, label="Worker 2", config={"parentNodeId": "parallel_1", "workerIndex": 2}),
             NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复", config={"template": "{{ state.worker_results }}", "outputField": "final_answer"}),
         ]
     )
@@ -594,7 +599,10 @@ def test_codegen_exports_task_splitter_and_parallel_tools():
         [
             EdgeIR(id="e1", source="start", target="splitter_1"),
             EdgeIR(id="e2", source="splitter_1", target="parallel_1"),
-            EdgeIR(id="e3", source="parallel_1", target="reply_1"),
+            EdgeIR(id="ew1", source="parallel_1", target="worker_1", kind=EdgeKind.WORKER),
+            EdgeIR(id="ew2", source="parallel_1", target="worker_2", kind=EdgeKind.WORKER),
+            EdgeIR(id="ewo1", source="worker_1", target="reply_1", kind=EdgeKind.WORKER),
+            EdgeIR(id="ewo2", source="worker_2", target="reply_1", kind=EdgeKind.WORKER),
         ]
     )
 
@@ -603,6 +611,8 @@ def test_codegen_exports_task_splitter_and_parallel_tools():
 
     assert "def splitter_1" in nodes_py
     assert "def parallel_1" in nodes_py
+    assert "def worker_1" not in nodes_py
+    assert 'builder.add_edge("parallel_1", "reply_1")' in next(value for path, value in files.items() if path.endswith("/graph.py"))
     assert "ThreadPoolExecutor" in nodes_py
     assert "_run_export_worker_task" in nodes_py
     assert "_normalize_worker_tasks" in nodes_py

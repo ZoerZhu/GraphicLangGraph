@@ -233,6 +233,8 @@ function nodeTypeLabel(type: string) {
       return "TASKS";
     case "parallel_tools":
       return "PARALLEL";
+    case "parallel_worker":
+      return "WORKER";
     case "condition":
       return "CONDITION";
     case "http":

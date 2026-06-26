@@ -14,6 +14,7 @@ class NodeType(StrEnum):
     TOOL = "tool"
     TASK_SPLITTER = "task_splitter"
     PARALLEL_TOOLS = "parallel_tools"
+    PARALLEL_WORKER = "parallel_worker"
     RETRIEVER = "retriever"
     CONDITION = "condition"
     AI_ROUTER = "ai_router"
@@ -30,6 +31,7 @@ class EdgeKind(StrEnum):
     NORMAL = "normal"
     CONDITIONAL = "conditional"
     ERROR = "error"
+    WORKER = "worker"
 
 
 class Position(BaseModel):

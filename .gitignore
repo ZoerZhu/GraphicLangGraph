@@ -13,6 +13,7 @@ __pycache__/
 !/.env.example
 storage/projects/*.json
 storage/workspace/*.json
+storage/runs/
 config/mcp/*
 !config/mcp/.gitkeep
 config/tools/*

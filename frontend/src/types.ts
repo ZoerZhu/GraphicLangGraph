@@ -5,6 +5,7 @@ export type NodeType =
   | "tool"
   | "task_splitter"
   | "parallel_tools"
+  | "parallel_worker"
   | "retriever"
   | "condition"
   | "ai_router"
@@ -16,7 +17,7 @@ export type NodeType =
   | "mcp_node"
   | "agent_ref";
 
-export type EdgeKind = "normal" | "conditional" | "error";
+export type EdgeKind = "normal" | "conditional" | "error" | "worker";
 export type RunMode = "dry" | "live";
 export type ModelProvider =
   | "openai"

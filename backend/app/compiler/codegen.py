@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from app.builtin_tools import builtin_tool_config_by_id
 from app import code_intelligence
 from app.ir.sanitization import sanitize_project_payload
-from app.ir.schemas import EdgeKind, NodeIR, NodeType, ProjectIR
+from app.ir.schemas import EdgeIR, EdgeKind, NodeIR, NodeType, ProjectIR
 from app.project_store import read_project
 
 
@@ -512,7 +512,7 @@ def _tools_py(project: ProjectIR) -> str:
         metadata = schema.get("x-graphic") if isinstance(schema.get("x-graphic"), dict) else {}
         builtin_id = str(metadata.get("builtinId") or "").strip()
         source = str(config.get("source") or "").strip().lower()
-        if source == "builtin" and builtin_id in {"web_search", "read_file", "list_directory", "read_file_chunk", "search_code", "list_code_symbols", "extract_html", "extract_css_rules", "extract_html_by_text", "extract_css_for_html", "summarize_page_structure", "resolve_asset_references", "extract_code_symbol", "chunk_code_semantic", "fetch_url", "propose_patch", "apply_patch_set", "rollback_patch_set", "replace_in_file", "write_file", "run_whitelisted_command"}:
+        if source == "builtin" and builtin_id in {"web_search", "read_file", "list_directory", "task_plan", "read_file_chunk", "search_code", "list_code_symbols", "extract_html", "extract_css_rules", "extract_html_by_text", "extract_css_for_html", "summarize_page_structure", "resolve_asset_references", "extract_code_symbol", "chunk_code_semantic", "fetch_url", "propose_patch", "apply_patch_set", "rollback_patch_set", "replace_in_file", "write_file", "run_whitelisted_command"}:
             for dependency_id in _builtin_export_dependencies(builtin_id):
                 if dependency_id not in emitted_builtins:
                     lines.extend(_builtin_tool_function_lines(dependency_id))
@@ -876,6 +876,48 @@ def _builtin_tool_function_lines(builtin_id: str) -> list[str]:
             '    return {"path": str(directory), "pattern": pattern or "*", "recursive": recursive, "entries": entries, "truncated": len(entries) >= max(1, min(int(max_entries or 100), 500))}',
             "",
         ]
+    if builtin_id == "task_plan":
+        return textwrap.dedent(
+            '''
+            @tool
+            def task_plan(tasks: list[dict[str, Any]], sourceGoal: str = "", maxTasks: int = 6) -> dict[str, Any]:
+                """提交 Task Splitter 可解析的结构化任务计划。"""
+                if not isinstance(tasks, list):
+                    raise RuntimeError("task_plan 需要 tasks 数组。")
+                limit = max(1, min(int(maxTasks or 6), 10))
+                normalized: list[dict[str, Any]] = []
+                for index, item in enumerate(tasks[:limit], start=1):
+                    if isinstance(item, str):
+                        task = {"goal": item}
+                    elif isinstance(item, dict):
+                        task = dict(item)
+                    else:
+                        continue
+                    goal = str(task.get("goal") or task.get("description") or task.get("task") or sourceGoal or "").strip()
+                    title = str(task.get("title") or task.get("name") or goal or f"任务 {index}").strip()
+                    target_files = task.get("targetFiles") if "targetFiles" in task else task.get("target_files")
+                    suggested_tools = task.get("suggestedTools") if "suggestedTools" in task else task.get("suggested_tools")
+                    if isinstance(target_files, str):
+                        target_files = [part.strip() for part in re.split(r"[,，\\n]+", target_files) if part.strip()]
+                    elif isinstance(target_files, list):
+                        target_files = [str(part).strip() for part in target_files if str(part).strip()]
+                    else:
+                        target_files = []
+                    if isinstance(suggested_tools, str):
+                        suggested_tools = [part.strip() for part in re.split(r"[,，\\n]+", suggested_tools) if part.strip()]
+                    elif isinstance(suggested_tools, list):
+                        suggested_tools = [str(part).strip() for part in suggested_tools if str(part).strip()]
+                    else:
+                        suggested_tools = []
+                    if not goal and not title:
+                        continue
+                    normalized.append({"id": str(task.get("id") or f"task_{index}"), "title": title[:160] or f"任务 {index}", "goal": goal or title, "targetFiles": target_files, "suggestedTools": suggested_tools, "status": "pending"})
+                if not normalized:
+                    raise RuntimeError("task_plan 至少需要一个包含 goal 或 title 的任务。")
+                return {"format": "task_splitter_v1", "taskCount": len(normalized), "tasks": normalized}
+
+            '''
+        ).strip("\n").splitlines() + [""]
     if builtin_id == "read_file_chunk":
         return textwrap.dedent(
             '''
@@ -2900,7 +2942,7 @@ def _nodes_py(project: ProjectIR) -> str:
         "",
     ]
     for node in project.nodes:
-        if node.type == NodeType.START:
+        if node.type in {NodeType.START, NodeType.PARALLEL_WORKER}:
             continue
         body.append(_node_function(node))
         body.append("")
@@ -3329,13 +3371,14 @@ def _compare(current: Any, expected: str, operator: str) -> bool:
 
 
 def _graph_py(project: ProjectIR) -> str:
-    normal_edges = [edge for edge in project.edges if edge.kind != EdgeKind.CONDITIONAL]
+    normal_edges = [edge for edge in project.edges if edge.kind not in {EdgeKind.CONDITIONAL, EdgeKind.WORKER}]
     conditional_edges = [edge for edge in project.edges if edge.kind == EdgeKind.CONDITIONAL]
     condition_edge_map: dict[str, dict[str, str]] = defaultdict(dict)
     for edge in conditional_edges:
         condition_edge_map[edge.source][edge.sourceHandle or edge.label or "default"] = edge.target
 
-    non_start_nodes = [node for node in project.nodes if node.type != NodeType.START]
+    worker_bridge_edges = _parallel_worker_bridge_edges(project)
+    non_start_nodes = [node for node in project.nodes if node.type not in {NodeType.START, NodeType.PARALLEL_WORKER}]
     condition_ids = {
         node.id
         for node in project.nodes
@@ -3368,7 +3411,7 @@ def _graph_py(project: ProjectIR) -> str:
 
     start_ids = {node.id for node in project.nodes if node.type == NodeType.START}
     direct_reply_ids = {node.id for node in project.nodes if node.type == NodeType.DIRECT_REPLY}
-    for edge in normal_edges:
+    for edge in [*normal_edges, *worker_bridge_edges]:
         if edge.source in start_ids:
             lines.append(f'builder.add_edge(START, "{edge.target}")')
         elif edge.source not in direct_reply_ids:
@@ -3395,6 +3438,29 @@ def _graph_py(project: ProjectIR) -> str:
     else:
         lines.extend(["", "graph = builder.compile()", ""])
     return "\n".join(lines)
+
+
+def _parallel_worker_bridge_edges(project: ProjectIR) -> list[EdgeIR]:
+    nodes_by_id = {node.id: node for node in project.nodes}
+    workers_by_parent: dict[str, list[str]] = defaultdict(list)
+    for node in project.nodes:
+        if node.type == NodeType.PARALLEL_WORKER:
+            parent_id = str(node.config.get("parentNodeId") or "").strip()
+            if parent_id:
+                workers_by_parent[parent_id].append(node.id)
+    result: list[EdgeIR] = []
+    for parent_id, worker_ids in workers_by_parent.items():
+        if parent_id not in nodes_by_id:
+            continue
+        worker_id_set = set(worker_ids)
+        target = ""
+        for edge in project.edges:
+            if edge.kind == EdgeKind.WORKER and edge.source in worker_id_set and edge.target not in worker_id_set:
+                target = edge.target
+                break
+        if target:
+            result.append(EdgeIR(id=f"bridge_{parent_id}_{target}", source=parent_id, target=target, kind=EdgeKind.NORMAL))
+    return result
 
 
 def _nodes_helpers() -> str:

@@ -65,6 +65,7 @@ type EnvCheckState = {
 };
 
 const CODE_READING_TOOL_SUITE_IDS = [
+  "builtin_task_plan",
   "builtin_read_file",
   "builtin_list_directory",
   "builtin_read_file_chunk",
@@ -1538,7 +1539,7 @@ function ToolManagerContent({
                 <div className="preset-suite-card">
                   <span>
                     <strong>代码读取套装</strong>
-                    <small>一次安装文件读取、代码搜索、语义分片、HTML/CSS 抽取和页面分析工具。</small>
+                    <small>一次安装任务规划、文件读取、代码搜索、语义分片、HTML/CSS 抽取和页面分析工具。</small>
                   </span>
                   <button
                     disabled={Boolean(installingPreset) || CODE_READING_TOOL_SUITE_IDS.every((id) => items.some((item) => item.id === id))}

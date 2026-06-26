@@ -117,6 +117,7 @@ interface ProjectStore {
   runHistoryReplayMode: RunHistoryReplayMode;
   runHistoryMismatch: RunHistoryGraphMismatch | null;
   runtimeNodes: Record<string, NodeRuntimeState>;
+  canvasCenter: Position | null;
   status: string;
   loading: boolean;
   initialize: () => Promise<void>;
@@ -142,6 +143,7 @@ interface ProjectStore {
   updateMcpServers: (servers: MCPServerConfig[]) => void;
   updateImportedAgents: (agents: ImportedAgentConfig[]) => void;
   updateAgentLinks: (links: AgentLinkConfig[]) => void;
+  setCanvasCenter: (position: Position) => void;
   addNode: (
     type: NodeType,
     position?: { x: number; y: number },
@@ -243,6 +245,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   runHistoryReplayMode: "overlay",
   runHistoryMismatch: null,
   runtimeNodes: {},
+  canvasCenter: null,
   status: "未连接后端",
   loading: false,
 
@@ -348,7 +351,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
 
   async openProject(projectId) {
     set({ loading: true, status: "正在打开 Agent" });
-    const project = ensureProjectRuntimeEnvironment(await getProject(projectId), get().workspaceRuntimeEnvironments);
+    const project = syncAllParallelWorkers(ensureProjectRuntimeEnvironment(await getProject(projectId), get().workspaceRuntimeEnvironments));
     const runHistoryRecords = await loadRunHistoryRecords(project.project.id);
     localStorage.setItem(PROJECT_KEY, project.project.id);
     set({
@@ -652,6 +655,12 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     set({ project: { ...project, agentLinks }, status: "已更新 Agent 通信配置" });
   },
 
+  setCanvasCenter(position) {
+    const current = get().canvasCenter;
+    if (current && Math.abs(current.x - position.x) < 1 && Math.abs(current.y - position.y) < 1) return;
+    set({ canvasCenter: position });
+  },
+
   addNode(type, position, configPatch, label) {
     const project = get().project;
     if (!project) return;
@@ -664,10 +673,11 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       typeof window !== "undefined" && window.innerWidth <= 900
         ? { x: 282, y: 170 + count * 210 }
         : { x: 340 + (count % 2) * 300, y: 150 + Math.floor(count / 2) * 230 };
+    const basePosition = position ?? get().canvasCenter ?? defaultPosition;
     const node = createNode(
       type,
       count,
-      position ?? defaultPosition,
+      findAvailableNodePosition(project, basePosition),
     );
     if (configPatch) {
       node.config = { ...node.config, ...configPatch };
@@ -684,8 +694,12 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     const suggestedConfig = uniqueNodeOutputConfig(type, node.config, existingNames, reservedNodeFields);
     node.config = { ...node.config, ...suggestedConfig };
     const nextFields = mergeStateFields(project.state.fields, stateFieldsForNode(node));
+    let nextProject: ProjectIR = { ...project, nodes: [...project.nodes, node], state: { ...project.state, fields: nextFields } };
+    if (type === "parallel_tools") {
+      nextProject = syncParallelWorkers(nextProject, node.id);
+    }
     set({
-      project: { ...project, nodes: [...project.nodes, node], state: { ...project.state, fields: nextFields } },
+      project: nextProject,
       selectedNodeId: node.id,
       status: `已添加 ${node.label}`,
     });
@@ -736,13 +750,16 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       beforeNode && updatedNode
         ? syncStateFieldsForNodeUpdate(project.state.fields, beforeNode, updatedNode, nodes)
         : project.state.fields;
-    set({
-      project: {
-        ...project,
-        nodes,
-        state: { ...project.state, fields: nextFields },
-      },
-    });
+    let nextProject: ProjectIR = {
+      ...project,
+      nodes,
+      state: { ...project.state, fields: nextFields },
+    };
+    const changedNode = nodes.find((node) => node.id === nodeId);
+    if (changedNode?.type === "parallel_tools") {
+      nextProject = syncParallelWorkers(nextProject, changedNode.id);
+    }
+    set({ project: nextProject });
   },
 
   setStateFields(fields) {
@@ -763,18 +780,17 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     const changed = applyNodeChanges(changes, rfNodes);
     const changedById = new Map(changed.map((node) => [node.id, node]));
     const removedIds = new Set(changes.filter((change) => change.type === "remove").map((change) => change.id));
-    set({
-      project: {
-        ...project,
-        nodes: project.nodes
-          .filter((node) => !removedIds.has(node.id))
-          .map((node) => {
-            const changedNode = changedById.get(node.id);
-            return changedNode ? { ...node, position: changedNode.position } : node;
-          }),
-        edges: project.edges.filter((edge) => !removedIds.has(edge.source) && !removedIds.has(edge.target)),
-      },
+    const nextProject = syncAllParallelWorkers({
+      ...project,
+      nodes: project.nodes
+        .filter((node) => !removedIds.has(node.id))
+        .map((node) => {
+          const changedNode = changedById.get(node.id);
+          return changedNode ? { ...node, position: changedNode.position } : node;
+        }),
+      edges: project.edges.filter((edge) => !removedIds.has(edge.source) && !removedIds.has(edge.target)),
     });
+    set({ project: nextProject });
   },
 
   onEdgesChange(changes) {
@@ -782,7 +798,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     if (!project) return;
     if (get().runActive) return;
     const changed = applyEdgeChanges(changes, toReactFlowEdges(project));
-    set({ project: { ...project, edges: changed.map(fromReactFlowEdge) } });
+    set({ project: syncAllParallelWorkers({ ...project, edges: changed.map(fromReactFlowEdge) }) });
   },
 
   onConnect(connection) {
@@ -790,6 +806,17 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     if (!project || !connection.source || !connection.target) return;
     if (get().runActive) {
       set({ status: "运行模式下不能连线" });
+      return;
+    }
+    const sourceNode = project.nodes.find((node) => node.id === connection.source);
+    const targetNode = project.nodes.find((node) => node.id === connection.target);
+    if (targetNode?.type === "parallel_worker") {
+      set({ status: "Worker 节点只能由所属 Parallel Tools 自动连接" });
+      return;
+    }
+    if (sourceNode?.type === "parallel_tools" || sourceNode?.type === "parallel_worker") {
+      const connectedProject = connectParallelWorkerOutput(project, sourceNode, connection.target, connection.targetHandle ?? null);
+      set({ project: connectedProject, pendingConnection: null, status: "已连接 Parallel Workers 输出" });
       return;
     }
     const edge = buildReactFlowEdge(project, connection.source, connection.sourceHandle, connection.target, connection.targetHandle);
@@ -825,6 +852,21 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     }
     if (pending.source === nodeId) {
       set({ pendingConnection: null, status: "不能连接到同一个节点" });
+      return;
+    }
+    const sourceNode = project.nodes.find((node) => node.id === pending.source);
+    const targetNode = project.nodes.find((node) => node.id === nodeId);
+    if (targetNode?.type === "parallel_worker") {
+      set({ pendingConnection: null, status: "Worker 节点只能由所属 Parallel Tools 自动连接" });
+      return;
+    }
+    if (sourceNode?.type === "parallel_tools" || sourceNode?.type === "parallel_worker") {
+      const connectedProject = connectParallelWorkerOutput(project, sourceNode, nodeId, handleId);
+      set({
+        project: connectedProject,
+        pendingConnection: null,
+        status: "已连接 Parallel Workers 输出",
+      });
       return;
     }
 
@@ -903,7 +945,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       return;
     }
     set({ status: "正在回退到历史记录" });
-    const snapshot = cloneProject(record.snapshot);
+    const snapshot = syncAllParallelWorkers(cloneProject(record.snapshot));
     const saved = await saveProject(snapshot);
     set({
       project: saved,
@@ -928,7 +970,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     }
     set({ status: "正在从历史记录导出新项目" });
     const created = await createProject(`${record.snapshot.project.name} 历史副本`, record.snapshot.project.kind);
-    const snapshot = cloneProject(record.snapshot);
+    const snapshot = syncAllParallelWorkers(cloneProject(record.snapshot));
     const clone: ProjectIR = {
       ...snapshot,
       project: {
@@ -991,7 +1033,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       set({ status: "模板不存在" });
       return;
     }
-    const nextProject = applyTemplateToProject(project, template);
+    const nextProject = syncAllParallelWorkers(applyTemplateToProject(project, template));
     const saved = await saveProject(nextProject);
     const historyRecords = recordProjectHistory(saved, `应用模板：${template.name}`);
     set({
@@ -1421,7 +1463,13 @@ function buildReactFlowEdge(
   targetHandle: string | null | undefined,
 ): Edge {
   const sourceNode = project.nodes.find((node) => node.id === source);
-  const kind = sourceNode && ["condition", "ai_router", "human_approval"].includes(sourceNode.type) ? "conditional" : "normal";
+  const targetNode = project.nodes.find((node) => node.id === target);
+  const kind =
+    sourceNode?.type === "parallel_worker" || targetNode?.type === "parallel_worker"
+      ? "worker"
+      : sourceNode && ["condition", "ai_router", "human_approval"].includes(sourceNode.type)
+        ? "conditional"
+        : "normal";
   return {
     id: nanoid(),
     source,
@@ -1432,6 +1480,221 @@ function buildReactFlowEdge(
     label: kind === "conditional" ? sourceHandle ?? "branch" : undefined,
     data: { kind },
   };
+}
+
+function syncAllParallelWorkers(project: ProjectIR): ProjectIR {
+  const parentIds = new Set(project.nodes.filter((node) => node.type === "parallel_tools").map((node) => node.id));
+  let next: ProjectIR = {
+    ...project,
+    nodes: project.nodes.filter((node) => node.type !== "parallel_worker" || parentIds.has(String(node.config.parentNodeId ?? ""))),
+  };
+  for (const parentId of parentIds) {
+    next = syncParallelWorkers(next, parentId);
+  }
+  return next;
+}
+
+function syncParallelWorkers(project: ProjectIR, parentNodeId: string): ProjectIR {
+  const parent = project.nodes.find((node) => node.id === parentNodeId && node.type === "parallel_tools");
+  if (!parent) return project;
+  const desiredCount = clampParallelWorkerCount(parent.config.maxConcurrentWorkers);
+  const existingWorkers = parallelWorkersFor(project, parentNodeId);
+  const outputTarget = findParallelWorkerOutputTarget(project, parentNodeId, existingWorkers);
+  const kept = existingWorkers.slice(0, desiredCount);
+  const removedIds = new Set(existingWorkers.slice(desiredCount).map((node) => node.id));
+  const nodes = project.nodes
+    .filter((node) => !removedIds.has(node.id))
+    .map((node) => {
+      if (node.type !== "parallel_worker" || String(node.config.parentNodeId ?? "") !== parentNodeId) return node;
+      const index = kept.findIndex((worker) => worker.id === node.id);
+      if (index < 0) return node;
+      return normalizeParallelWorkerNode(node, parent, index);
+    });
+  const currentWorkers = nodes.filter((node) => node.type === "parallel_worker" && String(node.config.parentNodeId ?? "") === parentNodeId);
+  const nextWorkers = [...currentWorkers];
+  const usedNodeIds = new Set(nextNodesIds(project.nodes));
+  for (let index = currentWorkers.length; index < desiredCount; index += 1) {
+    const worker = createParallelWorkerNode(parent, index, usedNodeIds);
+    usedNodeIds.add(worker.id);
+    nextWorkers.push(worker);
+  }
+  const nextWorkerIds = new Set(nextWorkers.map((worker) => worker.id));
+  const nextNodes = [...nodes.filter((node) => node.type !== "parallel_worker" || String(node.config.parentNodeId ?? "") !== parentNodeId), ...nextWorkers];
+  let edges = project.edges.filter((edge) => !removedIds.has(edge.source) && !removedIds.has(edge.target));
+  edges = edges.filter((edge) => {
+    if (edge.source === parentNodeId && edge.kind === "normal") return false;
+    if (edge.kind !== "worker") return true;
+    if (edge.source === parentNodeId) return false;
+    if (nextWorkerIds.has(edge.source) || nextWorkerIds.has(edge.target)) return false;
+    return true;
+  });
+  const workerEdges: EdgeIR[] = [];
+  for (const worker of nextWorkers) {
+    workerEdges.push(makeWorkerEdge(parentNodeId, worker.id, "parent"));
+  }
+  if (outputTarget && outputTarget.target !== parentNodeId && !nextWorkerIds.has(outputTarget.target)) {
+    for (const worker of nextWorkers) {
+      workerEdges.push(makeWorkerEdge(worker.id, outputTarget.target, "output", outputTarget.targetHandle));
+    }
+  }
+  return { ...project, nodes: nextNodes, edges: [...edges, ...workerEdges] };
+}
+
+function connectParallelWorkerOutput(project: ProjectIR, sourceNode: NodeIR, target: string, targetHandle: string | null): ProjectIR {
+  const parentNodeId = sourceNode.type === "parallel_tools" ? sourceNode.id : String(sourceNode.config.parentNodeId ?? "");
+  if (!parentNodeId) return project;
+  let next = syncParallelWorkers(project, parentNodeId);
+  const workers = parallelWorkersFor(next, parentNodeId);
+  const workerIds = new Set(workers.map((worker) => worker.id));
+  if (workerIds.has(target)) return next;
+  next = {
+    ...next,
+    edges: next.edges.filter((edge) => !(edge.kind === "worker" && workerIds.has(edge.source) && edge.target !== parentNodeId)),
+  };
+  return {
+    ...next,
+    edges: [
+      ...next.edges,
+      ...workers.map((worker) => makeWorkerEdge(worker.id, target, "output", targetHandle)),
+    ],
+  };
+}
+
+function parallelWorkersFor(project: ProjectIR, parentNodeId: string): NodeIR[] {
+  return project.nodes
+    .filter((node) => node.type === "parallel_worker" && String(node.config.parentNodeId ?? "") === parentNodeId)
+    .sort((a, b) => Number(a.config.workerIndex ?? 0) - Number(b.config.workerIndex ?? 0) || a.id.localeCompare(b.id));
+}
+
+function createParallelWorkerNode(parent: NodeIR, index: number, usedNodeIds: Set<string>): NodeIR {
+  const baseId = `${parent.id}_worker_${index + 1}`;
+  let id = baseId;
+  let suffix = 2;
+  while (usedNodeIds.has(id)) {
+    id = `${baseId}_${suffix}`;
+    suffix += 1;
+  }
+  return {
+    ...createNode("parallel_worker", index, {
+      x: parent.position.x + 330,
+      y: parent.position.y + index * 210,
+    }),
+    id,
+    label: `Worker ${index + 1}`,
+    config: {
+      parentNodeId: parent.id,
+      workerIndex: index + 1,
+    },
+  };
+}
+
+function nextNodesIds(nodes: NodeIR[]): string[] {
+  return nodes.map((node) => node.id);
+}
+
+function normalizeParallelWorkerNode(worker: NodeIR, parent: NodeIR, index: number): NodeIR {
+  const defaultLabel = /^Worker\s+\d+$/i.test(worker.label) || worker.label === "parallel_worker";
+  return {
+    ...worker,
+    label: defaultLabel ? `Worker ${index + 1}` : worker.label,
+    config: {
+      ...worker.config,
+      parentNodeId: parent.id,
+      workerIndex: index + 1,
+    },
+  };
+}
+
+function makeWorkerEdge(source: string, target: string, role: "parent" | "output", targetHandle?: string | null): EdgeIR {
+  return {
+    id: `worker_${role}_${source}_${target}`,
+    source,
+    sourceHandle: "out",
+    target,
+    targetHandle: targetHandle ?? "in",
+    kind: "worker",
+    label: role === "parent" ? "worker" : null,
+  };
+}
+
+function findParallelWorkerOutputTarget(project: ProjectIR, parentNodeId: string, workers: NodeIR[]): { target: string; targetHandle: string | null } | null {
+  const workerIds = new Set(workers.map((worker) => worker.id));
+  const workerOutput = project.edges.find((edge) => edge.kind === "worker" && workerIds.has(edge.source) && !workerIds.has(edge.target));
+  if (workerOutput) return { target: workerOutput.target, targetHandle: workerOutput.targetHandle ?? null };
+  const legacyOutput = project.edges.find((edge) => edge.source === parentNodeId && edge.kind === "normal");
+  if (legacyOutput) return { target: legacyOutput.target, targetHandle: legacyOutput.targetHandle ?? null };
+  return null;
+}
+
+function clampParallelWorkerCount(value: unknown): number {
+  const parsed = Number(value ?? 3);
+  if (!Number.isFinite(parsed)) return 3;
+  return Math.max(1, Math.min(Math.round(parsed), 6));
+}
+
+const NODE_PLACEMENT_WIDTH = 270;
+const NODE_PLACEMENT_HEIGHT = 190;
+const NODE_PLACEMENT_STEP_X = 310;
+const NODE_PLACEMENT_STEP_Y = 230;
+
+function findAvailableNodePosition(project: ProjectIR, basePosition: Position): Position {
+  const candidates = placementCandidates(basePosition);
+  for (const candidate of candidates) {
+    if (!hasLargeNodeOverlap(project, candidate)) {
+      return roundPosition(candidate);
+    }
+  }
+  return roundPosition(candidates[candidates.length - 1] ?? basePosition);
+}
+
+function placementCandidates(basePosition: Position): Position[] {
+  const origin = {
+    x: basePosition.x - NODE_PLACEMENT_WIDTH / 2,
+    y: basePosition.y - NODE_PLACEMENT_HEIGHT / 2,
+  };
+  const candidates: Position[] = [origin];
+  for (let radius = 1; radius <= 8; radius += 1) {
+    const points: Position[] = [
+      { x: origin.x + radius * NODE_PLACEMENT_STEP_X, y: origin.y },
+      { x: origin.x, y: origin.y + radius * NODE_PLACEMENT_STEP_Y },
+      { x: origin.x - radius * NODE_PLACEMENT_STEP_X, y: origin.y },
+      { x: origin.x, y: origin.y - radius * NODE_PLACEMENT_STEP_Y },
+      { x: origin.x + radius * NODE_PLACEMENT_STEP_X, y: origin.y + radius * NODE_PLACEMENT_STEP_Y },
+      { x: origin.x - radius * NODE_PLACEMENT_STEP_X, y: origin.y + radius * NODE_PLACEMENT_STEP_Y },
+      { x: origin.x + radius * NODE_PLACEMENT_STEP_X, y: origin.y - radius * NODE_PLACEMENT_STEP_Y },
+      { x: origin.x - radius * NODE_PLACEMENT_STEP_X, y: origin.y - radius * NODE_PLACEMENT_STEP_Y },
+    ];
+    candidates.push(...points);
+  }
+  return candidates;
+}
+
+function hasLargeNodeOverlap(project: ProjectIR, position: Position): boolean {
+  const rect = nodePlacementRect(position);
+  const maxAllowedOverlap = NODE_PLACEMENT_WIDTH * NODE_PLACEMENT_HEIGHT * 0.18;
+  return project.nodes.some((node) => rectOverlapArea(rect, nodePlacementRect(node.position)) > maxAllowedOverlap);
+}
+
+function nodePlacementRect(position: Position) {
+  return {
+    left: position.x,
+    top: position.y,
+    right: position.x + NODE_PLACEMENT_WIDTH,
+    bottom: position.y + NODE_PLACEMENT_HEIGHT,
+  };
+}
+
+function rectOverlapArea(
+  a: { left: number; top: number; right: number; bottom: number },
+  b: { left: number; top: number; right: number; bottom: number },
+) {
+  const width = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+  const height = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+  return width * height;
+}
+
+function roundPosition(position: Position): Position {
+  return { x: Math.round(position.x), y: Math.round(position.y) };
 }
 
 function readLocalArray<T>(key: string): T[] {
@@ -2623,6 +2886,7 @@ export function toReactFlowEdges(project: ProjectIR, runtimeNodes: Record<string
     targetHandle: edge.targetHandle ?? undefined,
     type: "smoothstep",
     label: edge.label ?? undefined,
+    style: edge.kind === "worker" ? { stroke: "#0a0a0a", strokeDasharray: "5 5", strokeWidth: 1.4 } : undefined,
     data: {
       kind: edge.kind,
       sourceHandle: edge.sourceHandle ?? null,

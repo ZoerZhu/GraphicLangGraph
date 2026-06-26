@@ -841,6 +841,86 @@ def echo(query: str, suffix: str = "") -> str:
     assert "工具执行结果" in seen_messages[1][-1][1]
 
 
+def test_tools_agent_task_plan_tool_outputs_splitter_tasks(monkeypatch):
+    seen_messages = []
+
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        seen_messages.append(messages)
+        if len(seen_messages) == 1:
+            return FakeResponse(
+                json.dumps(
+                    {
+                        "tool_calls": [
+                            {
+                                "tool": "task_plan",
+                                "args": {
+                                    "tasks": [
+                                        {
+                                            "title": "分析入口",
+                                            "goal": "阅读入口文件和路由",
+                                            "targetFiles": ["backend/app/main.py"],
+                                            "suggestedTools": ["read_file_chunk"],
+                                        },
+                                        {"title": "分析前端", "goal": "阅读前端工作区组件"},
+                                    ]
+                                },
+                            }
+                        ],
+                        "final_answer": "",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "任务计划已生成"}, ensure_ascii=False))
+
+    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+
+    project = create_default_project("Task Plan Tool")
+    project.state.fields.extend(
+        [
+            StateField(name="task_plan", type="str"),
+            StateField(name="task_plan_tool_calls", type="list"),
+            StateField(name="worker_tasks", type="list"),
+        ]
+    )
+    project.tools.append(
+        ToolConfig(
+            id="builtin_task_plan",
+            name="task_plan",
+            description="规划任务",
+            source="builtin",
+            schemaJson=json.dumps({"type": "object", "x-graphic": {"kind": "builtin_tool", "builtinId": "task_plan"}}),
+        )
+    )
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="tools_agent",
+                type=NodeType.TOOL,
+                label="Tools",
+                config={"toolIdsJson": '["builtin_task_plan"]', "outputField": "task_plan", "maxIterations": 2},
+            ),
+            NodeIR(
+                id="splitter",
+                type=NodeType.TASK_SPLITTER,
+                label="Task Splitter",
+                config={"inputField": "task_plan", "outputField": "worker_tasks", "maxTasks": 5, "fallbackToSingleTask": False},
+            ),
+        ]
+    )
+    project.edges.extend([EdgeIR(id="e1", source="start", target="tools_agent"), EdgeIR(id="e2", source="tools_agent", target="splitter")])
+
+    trace, state = preview.run_project_preview(project, {"messages": "分析项目"}, "live")
+
+    assert [item["status"] for item in trace] == ["ok", "ok"]
+    assert "Task Splitter 任务规划" in seen_messages[0][0][1]
+    parsed_plan = json.loads(state["task_plan"])
+    assert len(parsed_plan["tasks"]) == 2
+    assert state["worker_tasks"][0]["title"] == "分析入口"
+    assert state["worker_tasks"][0]["targetFiles"] == ["backend/app/main.py"]
+    assert state["task_plan_tool_calls"][0]["tool"] == "task_plan"
+
+
 def test_builtin_read_file_respects_runtime_allowed_roots(tmp_path: Path):
     allowed = tmp_path / "allowed"
     allowed.mkdir()
@@ -1612,7 +1692,7 @@ def test_task_splitter_parses_markdown_json_and_fallback():
     assert fallback_delta["worker_tasks"][0]["goal"] == "兜底问题"
 
 
-def test_parallel_tools_stream_emits_virtual_workers(monkeypatch, tmp_path: Path):
+def test_parallel_tools_stream_runs_explicit_worker_nodes(monkeypatch, tmp_path: Path):
     root = tmp_path / "repo"
     root.mkdir()
     (root / "app.py").write_text("def app():\n    return 'ok'\n", encoding="utf-8")
@@ -1656,10 +1736,20 @@ def test_parallel_tools_stream_emits_virtual_workers(monkeypatch, tmp_path: Path
                     "maxIterationsPerTask": 2,
                 },
             ),
+            NodeIR(id="parallel_worker_1", type=NodeType.PARALLEL_WORKER, label="Worker 1", config={"parentNodeId": "parallel", "workerIndex": 1}),
+            NodeIR(id="parallel_worker_2", type=NodeType.PARALLEL_WORKER, label="Worker 2", config={"parentNodeId": "parallel", "workerIndex": 2}),
             NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="回复", config={"template": "{{ state.worker_results }}", "outputField": "final_answer"}),
         ]
     )
-    project.edges.extend([EdgeIR(id="e1", source="start", target="parallel"), EdgeIR(id="e2", source="parallel", target="reply")])
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="parallel"),
+            EdgeIR(id="ew1", source="parallel", target="parallel_worker_1", kind=EdgeKind.WORKER),
+            EdgeIR(id="ew2", source="parallel", target="parallel_worker_2", kind=EdgeKind.WORKER),
+            EdgeIR(id="ewo1", source="parallel_worker_1", target="reply", kind=EdgeKind.WORKER),
+            EdgeIR(id="ewo2", source="parallel_worker_2", target="reply", kind=EdgeKind.WORKER),
+        ]
+    )
     runtime = {"allowedRootsJson": json.dumps([str(root)]), "networkEnabled": False, "allowedHostsJson": "[]", "maxFileBytes": 4096, "maxHttpBytes": 1024}
     input_state = {
         "messages": "分析项目",
@@ -1671,13 +1761,16 @@ def test_parallel_tools_stream_emits_virtual_workers(monkeypatch, tmp_path: Path
 
     events = list(preview.iter_project_preview_events(project, input_state, "live", None, runtime))
 
-    starts = [event for event in events if event["event"] == "virtual_node_start"]
-    ends = [event for event in events if event["event"] == "virtual_node_end"]
+    starts = [event for event in events if event["event"] == "node_start" and event["type"] == "parallel_worker"]
+    ends = [event for event in events if event["event"] == "node_end" and event["traceItem"]["type"] == "parallel_worker"]
+    parent_end_index = next(index for index, event in enumerate(events) if event["event"] == "node_end" and event["traceItem"]["nodeId"] == "parallel")
+    first_worker_start_index = next(index for index, event in enumerate(events) if event["event"] == "node_start" and event["type"] == "parallel_worker")
     run_end = events[-1]
     assert len(starts) == 2
     assert len(ends) == 2
-    assert all(event["parentNodeId"] == "parallel" for event in starts)
-    assert all(event["traceItem"]["virtual"] is True for event in ends)
+    assert first_worker_start_index < parent_end_index
+    assert {event["nodeId"] for event in starts} == {"parallel_worker_1", "parallel_worker_2"}
+    assert all("workerResults" in event["traceItem"]["outputDelta"] for event in ends)
     assert len(run_end["outputState"]["worker_results"]) == 2
     assert all(item["status"] == "ok" for item in run_end["outputState"]["worker_results"])
 

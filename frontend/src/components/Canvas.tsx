@@ -52,12 +52,26 @@ function CanvasInner() {
   const runtimeNodes = useProjectStore((state) => state.runtimeNodes);
   const selectNode = useProjectStore((state) => state.selectNode);
   const addNode = useProjectStore((state) => state.addNode);
+  const setCanvasCenter = useProjectStore((state) => state.setCanvasCenter);
   const save = useProjectStore((state) => state.save);
   const openSplitAgent = useProjectStore((state) => state.openSplitAgent);
   const onNodesChange = useProjectStore((state) => state.onNodesChange);
   const onEdgesChange = useProjectStore((state) => state.onEdgesChange);
   const onConnect = useProjectStore((state) => state.onConnect);
   const { screenToFlowPosition } = useReactFlow();
+  const viewport = useViewport();
+
+  useEffect(() => {
+    const canvas = document.querySelector(".canvas-shell");
+    const rect = canvas?.getBoundingClientRect();
+    const width = rect?.width || window.innerWidth || 1280;
+    const height = rect?.height || window.innerHeight || 720;
+    const zoom = viewport.zoom || 1;
+    setCanvasCenter({
+      x: (width / 2 - viewport.x) / zoom,
+      y: (height / 2 - viewport.y) / zoom,
+    });
+  }, [setCanvasCenter, viewport.x, viewport.y, viewport.zoom]);
 
   const handleDrop = useCallback(
     (event: React.DragEvent) => {
@@ -428,6 +442,7 @@ function renderMiniMapIcon(
 
 interface OverlayLine {
   id: string;
+  kind: EdgeIR["kind"];
   x1: number;
   y1: number;
   x2: number;
@@ -456,6 +471,7 @@ function ConnectionOverlay({ edges }: { edges: EdgeIR[] }) {
           if (!source || !target) return null;
           return {
             id: edge.id,
+            kind: edge.kind,
             x1: source.x - canvasRect.left,
             y1: source.y - canvasRect.top,
             x2: target.x - canvasRect.left,
@@ -487,7 +503,7 @@ function ConnectionOverlay({ edges }: { edges: EdgeIR[] }) {
       {lines.map((line) => (
         <path
           key={line.id}
-          className="connection-overlay__path"
+          className={`connection-overlay__path ${line.kind === "worker" ? "is-worker-edge" : ""}`}
           d={smoothPath(line.x1, line.y1, line.x2, line.y2)}
           markerEnd="url(#connection-arrow)"
         />

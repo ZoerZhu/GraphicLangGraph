@@ -57,6 +57,36 @@ BUILTIN_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "id": "builtin_task_plan",
+        "name": "task_plan",
+        "description": "把模型规划提交为 Task Splitter 可直接解析的结构化任务 JSON。用于产出 {\"tasks\":[...]}，供后续 Task Splitter 拆分 Worker 任务。",
+        "source": "builtin",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "description": "任务数组，最多 10 个。每项必须包含 goal 或 title；推荐同时给出 title、goal、targetFiles、suggestedTools。",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "可选任务 ID；不填时自动生成 task_1、task_2。"},
+                            "title": {"type": "string", "description": "任务标题，简短可扫描。"},
+                            "goal": {"type": "string", "description": "Worker 需要完成的具体目标。"},
+                            "description": {"type": "string", "description": "goal 的别名；仅在 goal 为空时使用。"},
+                            "targetFiles": {"type": "array", "description": "建议优先读取的文件路径。", "items": {"type": "string"}},
+                            "suggestedTools": {"type": "array", "description": "建议 Worker 使用的工具名。", "items": {"type": "string"}},
+                        },
+                    },
+                },
+                "sourceGoal": {"type": "string", "description": "原始用户目标或规划依据，可选。"},
+                "maxTasks": {"type": "number", "description": "最多保留任务数，默认 6，上限 10。"},
+            },
+            "required": ["tasks"],
+            "x-graphic": {"kind": "builtin_tool", "builtinId": "task_plan", "version": "0.1.0", "usageTags": ["规划"]},
+        },
+    },
+    {
         "id": "builtin_read_file_chunk",
         "name": "read_file_chunk",
         "description": "按行号或字符 offset 分片读取当前运行环境白名单目录内的文本文件。",

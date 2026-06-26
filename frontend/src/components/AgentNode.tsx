@@ -41,6 +41,7 @@ const ICONS = {
   tool: Wrench,
   task_splitter: Route,
   parallel_tools: Wrench,
+  parallel_worker: Wrench,
   retriever: Database,
   condition: GitBranch,
   ai_router: Route,
@@ -305,6 +306,11 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
         { label: "并发", value: text(config.maxConcurrentWorkers, "3") },
         { label: "输出", value: text(config.outputField, "worker_results") },
       ];
+    case "parallel_worker":
+      return [
+        { label: "槽位", value: text(config.workerIndex, "1") },
+        { label: "来源", value: "Parallel Tools" },
+      ];
     case "retriever":
       return [
         { label: "来源", value: text(config.path, "./knowledge") },
@@ -446,6 +452,8 @@ function nodeTypeLabel(type: NodeType): string {
       return "TASKS";
     case "parallel_tools":
       return "PARALLEL";
+    case "parallel_worker":
+      return "WORKER";
     case "retriever":
       return "RAG";
     case "condition":

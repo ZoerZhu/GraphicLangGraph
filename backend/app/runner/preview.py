@@ -146,7 +146,7 @@ def _walk_project(
 
     state = dict(input_state)
     trace: list[dict[str, Any]] = []
-    current = _first_target(outgoing.get(start.id, []))
+    current = _first_execution_target(outgoing.get(start.id, []))
     visited = 0
     while current and current in nodes and visited < MAX_STEPS:
         visited += 1
@@ -177,15 +177,7 @@ def _walk_project(
         if status == "error" or node.type == NodeType.DIRECT_REPLY:
             break
 
-        edges = outgoing.get(node.id, [])
-        if not edges:
-            break
-        conditional_edges = [edge for edge in edges if edge.kind == EdgeKind.CONDITIONAL]
-        if conditional_edges:
-            handle = _choose_handle(node, state)
-            current = _target_for_handle(conditional_edges, handle) or _first_target(conditional_edges)
-        else:
-            current = _first_target(edges)
+        current = _next_execution_target(node, nodes, outgoing, state)
 
     if visited >= MAX_STEPS:
         trace.append(
@@ -231,7 +223,7 @@ def _walk_project_events(
         }
         return
 
-    current = _first_target(outgoing.get(start.id, []))
+    current = _first_execution_target(outgoing.get(start.id, []))
     visited = 0
     while current and current in nodes and visited < MAX_STEPS:
         visited += 1
@@ -247,7 +239,7 @@ def _walk_project_events(
         started = time.perf_counter()
         try:
             if mode == "live" and node.type == NodeType.PARALLEL_TOOLS:
-                delta, detail = yield from _execute_live_parallel_tools_events(node, state, model_config, runtime_environment, tools)
+                delta, detail = yield from _execute_live_parallel_tools_events(project, node, state, model_config, runtime_environment, tools)
             else:
                 delta, detail = _execute_node(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             state.update(delta)
@@ -276,15 +268,7 @@ def _walk_project_events(
         if status == "error" or node.type == NodeType.DIRECT_REPLY:
             break
 
-        edges = outgoing.get(node.id, [])
-        if not edges:
-            break
-        conditional_edges = [edge for edge in edges if edge.kind == EdgeKind.CONDITIONAL]
-        if conditional_edges:
-            handle = _choose_handle(node, state)
-            current = _target_for_handle(conditional_edges, handle) or _first_target(conditional_edges)
-        else:
-            current = _first_target(edges)
+        current = _next_execution_target(node, nodes, outgoing, state)
 
     if visited >= MAX_STEPS:
         trace_item = {
@@ -441,7 +425,7 @@ def _execute_live_node(
     if node.type == NodeType.TASK_SPLITTER:
         return _execute_live_task_splitter(node, state)
     if node.type == NodeType.PARALLEL_TOOLS:
-        return _execute_live_parallel_tools(node, state, model_config, runtime_environment, tools)
+        return _execute_live_parallel_tools(project, node, state, model_config, runtime_environment, tools)
     if node.type == NodeType.RETRIEVER:
         return _execute_live_retriever(node, state)
     if node.type == NodeType.CONDITION:
@@ -1098,6 +1082,7 @@ def _run_tools_agent_session(
     ]
     calls: list[dict[str, Any]] = []
     final_answer = ""
+    latest_task_plan_payload: dict[str, Any] | None = None
     for iteration in range(max_iterations):
         response = _call_chat_model(provider, model, messages, effective_model_config)
         content = getattr(response, "content", str(response))
@@ -1118,6 +1103,9 @@ def _run_tools_agent_session(
                 observation = {"ok": False, "error": f"未知 Tool：{tool_name}", "errorType": "tool_args"}
             else:
                 observation = _invoke_registered_tool(tool_config, args, runtime_environment, effective_model_config, agent_context)
+            task_plan_payload = _task_plan_payload_from_observation(tool_name, observation)
+            if task_plan_payload:
+                latest_task_plan_payload = task_plan_payload
             recommended_next_tools = _recommended_next_tools(tool_name, args, observation)
             if recommended_next_tools:
                 observation["recommendedNextTools"] = recommended_next_tools
@@ -1142,7 +1130,21 @@ def _run_tools_agent_session(
         messages.append(("user", "工具执行结果：\n" + json.dumps(observations, ensure_ascii=False, indent=2) + "\n请继续；如果已经足够，请返回 final_answer。"))
     else:
         final_answer = _finalize_tools_agent_answer(provider, model, messages, effective_model_config, max_iterations)
+    if latest_task_plan_payload and not _normalize_worker_tasks(final_answer, max_tasks=10, fallback_goal=""):
+        final_answer = json.dumps(latest_task_plan_payload, ensure_ascii=False)
     return final_answer, calls
+
+
+def _task_plan_payload_from_observation(tool_name: str, observation: Any) -> dict[str, Any] | None:
+    if str(tool_name or "").strip() != "task_plan" or not isinstance(observation, dict) or not observation.get("ok"):
+        return None
+    result = observation.get("result")
+    if not isinstance(result, dict):
+        return None
+    tasks = _normalize_worker_tasks(result, max_tasks=10, fallback_goal="")
+    if not tasks:
+        return None
+    return {"tasks": tasks}
 
 
 def _execute_live_task_splitter(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -1162,17 +1164,19 @@ def _execute_live_task_splitter(node: NodeIR, state: dict[str, Any]) -> tuple[di
 
 
 def _execute_live_parallel_tools(
+    project: ProjectIR,
     node: NodeIR,
     state: dict[str, Any],
     model_config: ModelRuntimeConfig,
     runtime_environment: RuntimeEnvironment,
     tools: ToolRuntimeConfig,
 ) -> tuple[dict[str, Any], str]:
-    delta, detail, _events = _run_parallel_tools_node(node, state, model_config, runtime_environment, tools, emit_virtual_events=False)
+    delta, detail, _events = _run_parallel_tools_node(project, node, state, model_config, runtime_environment, tools, emit_worker_events=False)
     return delta, detail
 
 
 def _execute_live_parallel_tools_events(
+    project: ProjectIR,
     node: NodeIR,
     state: dict[str, Any],
     model_config: ModelRuntimeConfig,
@@ -1195,62 +1199,98 @@ def _execute_live_parallel_tools_events(
     max_workers = min(_positive_int(config.get("maxConcurrentWorkers"), 3), 6, len(tasks))
     store_tool_calls = _truthy(config.get("storeToolCalls", False))
     system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip() or "你是代码阅读 Worker，只完成分配给你的子任务。"
+    worker_nodes = _parallel_worker_nodes(project, node.id)
+    slots = _parallel_worker_task_slots(worker_nodes, tasks, max_workers)
 
-    def worker(index: int, task: dict[str, Any]) -> dict[str, Any]:
+    def run_slot(slot: dict[str, Any]) -> dict[str, Any]:
         started = time.perf_counter()
+        slot_results: list[dict[str, Any]] = []
         try:
-            final_answer, calls = _run_tools_agent_session(
-                provider,
-                model,
-                effective_model_config,
-                selected_tools,
-                _parallel_worker_system_prompt(system_prompt),
-                _parallel_worker_user_prompt(state, task),
-                max_iterations,
-                runtime_environment,
-            )
-            result = _normalize_worker_final_answer(task, final_answer)
-            result["durationMs"] = round((time.perf_counter() - started) * 1000, 2)
-            if store_tool_calls:
-                result["toolCalls"] = _compact_value(calls, string_limit=3000, list_limit=12)
-            return result
-        except Exception as exc:
+            for task_item in slot["tasks"]:
+                result = _run_parallel_worker_task(
+                    task_item["task"],
+                    int(task_item["taskIndex"]),
+                    state,
+                    provider,
+                    model,
+                    effective_model_config,
+                    selected_tools,
+                    system_prompt,
+                    max_iterations,
+                    runtime_environment,
+                    store_tool_calls,
+                )
+                result["workerNodeId"] = slot.get("nodeId") or ""
+                result["workerIndex"] = int(slot.get("workerIndex") or 0)
+                slot_results.append(result)
+            duration_ms = round((time.perf_counter() - started) * 1000, 2)
             return {
-                "taskId": str(task.get("id") or f"task_{index + 1}"),
-                "title": str(task.get("title") or task.get("goal") or f"任务 {index + 1}")[:120],
+                "nodeId": slot.get("nodeId"),
+                "label": slot.get("label"),
+                "workerIndex": slot.get("workerIndex"),
+                "status": "error" if slot_results and all(item.get("status") == "error" for item in slot_results) else "ok",
+                "durationMs": duration_ms,
+                "results": slot_results,
+            }
+        except Exception as exc:
+            duration_ms = round((time.perf_counter() - started) * 1000, 2)
+            return {
+                "nodeId": slot.get("nodeId"),
+                "label": slot.get("label"),
+                "workerIndex": slot.get("workerIndex"),
                 "status": "error",
-                "durationMs": round((time.perf_counter() - started) * 1000, 2),
-                "summary": "",
-                "evidence": [],
-                "warnings": [],
-                "error": _format_error(exc),
+                "durationMs": duration_ms,
+                "results": [
+                    {
+                        "taskId": str((slot.get("tasks") or [{}])[0].get("task", {}).get("id") or f"worker_{slot.get('workerIndex') or 1}"),
+                        "title": str(slot.get("label") or "Worker")[:120],
+                        "status": "error",
+                        "durationMs": duration_ms,
+                        "summary": "",
+                        "evidence": [],
+                        "warnings": [],
+                        "error": _format_error(exc),
+                    }
+                ],
             }
 
-    for index, task in enumerate(tasks):
-        yield _parallel_virtual_start_event(node, task, index, len(tasks))
+    for slot in slots:
+        if slot.get("nodeId"):
+            yield {
+                "event": "node_start",
+                "nodeId": slot["nodeId"],
+                "type": "parallel_worker",
+                "label": slot["label"],
+                "inputState": {"tasks": [item["task"] for item in slot["tasks"]]},
+            }
 
     ordered: list[dict[str, Any] | None] = [None] * len(tasks)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_index = {executor.submit(worker, index, task): index for index, task in enumerate(tasks)}
-        for future in as_completed(future_to_index):
-            index = future_to_index[future]
-            result = future.result()
-            ordered[index] = result
-            yield _parallel_virtual_end_event(node, tasks[index], result, index, len(tasks))
+    with ThreadPoolExecutor(max_workers=max(1, min(len(slots), max_workers))) as executor:
+        future_to_slot = {executor.submit(run_slot, slot): slot for slot in slots}
+        for future in as_completed(future_to_slot):
+            slot = future_to_slot[future]
+            slot_result = future.result()
+            for result in slot_result.get("results") or []:
+                task_index = int(result.get("taskIndex", -1))
+                if 0 <= task_index < len(ordered):
+                    ordered[task_index] = result
+            if slot.get("nodeId"):
+                yield _parallel_worker_end_event(slot, slot_result, state)
 
     results = [item for item in ordered if isinstance(item, dict)]
     if results and all(item.get("status") == "error" for item in results):
         raise RuntimeError("Parallel Tools 所有 Worker 均执行失败。")
-    return {output_field: results}, f"Parallel Tools 并行执行 {len(results)} 个 Worker，输出到 state.{output_field}"
+    return {output_field: results}, f"Parallel Tools 并行执行 {len(slots)} 个 Worker 槽位，完成 {len(results)} 个任务，输出到 state.{output_field}"
 
 
 def _run_parallel_tools_node(
+    project: ProjectIR,
     node: NodeIR,
     state: dict[str, Any],
     model_config: ModelRuntimeConfig,
     runtime_environment: RuntimeEnvironment,
     tools: ToolRuntimeConfig,
-    emit_virtual_events: bool,
+    emit_worker_events: bool,
 ) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
     config = node.config
     tasks_field = str(config.get("tasksField", "worker_tasks")).strip() or "worker_tasks"
@@ -1269,55 +1309,185 @@ def _run_parallel_tools_node(
     store_tool_calls = _truthy(config.get("storeToolCalls", False))
     system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip() or "你是代码阅读 Worker，只完成分配给你的子任务。"
     events: list[dict[str, Any]] = []
+    worker_nodes = _parallel_worker_nodes(project, node.id)
+    slots = _parallel_worker_task_slots(worker_nodes, tasks, max_workers)
 
-    def worker(index: int, task: dict[str, Any]) -> dict[str, Any]:
+    def run_slot(slot: dict[str, Any]) -> dict[str, Any]:
         started = time.perf_counter()
+        slot_results: list[dict[str, Any]] = []
         try:
-            final_answer, calls = _run_tools_agent_session(
-                provider,
-                model,
-                effective_model_config,
-                selected_tools,
-                _parallel_worker_system_prompt(system_prompt),
-                _parallel_worker_user_prompt(state, task),
-                max_iterations,
-                runtime_environment,
-            )
-            result = _normalize_worker_final_answer(task, final_answer)
-            result["durationMs"] = round((time.perf_counter() - started) * 1000, 2)
-            if store_tool_calls:
-                result["toolCalls"] = _compact_value(calls, string_limit=3000, list_limit=12)
-            return result
-        except Exception as exc:
+            for task_item in slot["tasks"]:
+                result = _run_parallel_worker_task(
+                    task_item["task"],
+                    int(task_item["taskIndex"]),
+                    state,
+                    provider,
+                    model,
+                    effective_model_config,
+                    selected_tools,
+                    system_prompt,
+                    max_iterations,
+                    runtime_environment,
+                    store_tool_calls,
+                )
+                result["workerNodeId"] = slot.get("nodeId") or ""
+                result["workerIndex"] = int(slot.get("workerIndex") or 0)
+                slot_results.append(result)
+            duration_ms = round((time.perf_counter() - started) * 1000, 2)
             return {
-                "taskId": str(task.get("id") or f"task_{index + 1}"),
-                "title": str(task.get("title") or task.get("goal") or f"任务 {index + 1}")[:120],
+                "nodeId": slot.get("nodeId"),
+                "label": slot.get("label"),
+                "workerIndex": slot.get("workerIndex"),
+                "status": "error" if slot_results and all(item.get("status") == "error" for item in slot_results) else "ok",
+                "durationMs": duration_ms,
+                "results": slot_results,
+            }
+        except Exception as exc:
+            duration_ms = round((time.perf_counter() - started) * 1000, 2)
+            return {
+                "nodeId": slot.get("nodeId"),
+                "label": slot.get("label"),
+                "workerIndex": slot.get("workerIndex"),
                 "status": "error",
-                "durationMs": round((time.perf_counter() - started) * 1000, 2),
-                "summary": "",
-                "evidence": [],
-                "warnings": [],
-                "error": _format_error(exc),
+                "durationMs": duration_ms,
+                "results": [
+                    {
+                        "taskId": str((slot.get("tasks") or [{}])[0].get("task", {}).get("id") or f"worker_{slot.get('workerIndex') or 1}"),
+                        "title": str(slot.get("label") or "Worker")[:120],
+                        "status": "error",
+                        "durationMs": duration_ms,
+                        "summary": "",
+                        "evidence": [],
+                        "warnings": [],
+                        "error": _format_error(exc),
+                    }
+                ],
             }
 
-    for index, task in enumerate(tasks):
-        if emit_virtual_events:
-            events.append(_parallel_virtual_start_event(node, task, index, len(tasks)))
+    for slot in slots:
+        if emit_worker_events and slot.get("nodeId"):
+            events.append(
+                {
+                    "event": "node_start",
+                    "nodeId": slot["nodeId"],
+                    "type": "parallel_worker",
+                    "label": slot["label"],
+                    "inputState": {"tasks": [item["task"] for item in slot["tasks"]]},
+                }
+            )
 
     ordered: list[dict[str, Any] | None] = [None] * len(tasks)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_index = {executor.submit(worker, index, task): index for index, task in enumerate(tasks)}
-        for future in as_completed(future_to_index):
-            index = future_to_index[future]
-            result = future.result()
-            ordered[index] = result
-            if emit_virtual_events:
-                events.append(_parallel_virtual_end_event(node, tasks[index], result, index, len(tasks)))
+    with ThreadPoolExecutor(max_workers=max(1, min(len(slots), max_workers))) as executor:
+        future_to_slot = {executor.submit(run_slot, slot): slot for slot in slots}
+        for future in as_completed(future_to_slot):
+            slot = future_to_slot[future]
+            slot_result = future.result()
+            for result in slot_result.get("results") or []:
+                task_index = int(result.get("taskIndex", -1))
+                if 0 <= task_index < len(ordered):
+                    ordered[task_index] = result
+            if emit_worker_events and slot.get("nodeId"):
+                events.append(_parallel_worker_end_event(slot, slot_result, state))
 
     results = [item for item in ordered if isinstance(item, dict)]
     if results and all(item.get("status") == "error" for item in results):
         raise RuntimeError("Parallel Tools 所有 Worker 均执行失败。")
-    return {output_field: results}, f"Parallel Tools 并行执行 {len(results)} 个 Worker，输出到 state.{output_field}", events
+    return {output_field: results}, f"Parallel Tools 并行执行 {len(slots)} 个 Worker 槽位，完成 {len(results)} 个任务，输出到 state.{output_field}", events
+
+
+def _parallel_worker_nodes(project: ProjectIR, parent_node_id: str) -> list[NodeIR]:
+    return sorted(
+        [
+            node
+            for node in project.nodes
+            if node.type == NodeType.PARALLEL_WORKER and str(node.config.get("parentNodeId") or "") == parent_node_id
+        ],
+        key=lambda item: (int(item.config.get("workerIndex") or 0), item.id),
+    )
+
+
+def _parallel_worker_task_slots(worker_nodes: list[NodeIR], tasks: list[dict[str, Any]], fallback_worker_count: int) -> list[dict[str, Any]]:
+    count = max(1, min(len(worker_nodes) or fallback_worker_count or 1, 6, len(tasks)))
+    slots: list[dict[str, Any]] = []
+    for index in range(count):
+        node = worker_nodes[index] if index < len(worker_nodes) else None
+        slots.append(
+            {
+                "nodeId": node.id if node else "",
+                "label": node.label if node else f"Worker {index + 1}",
+                "workerIndex": int(node.config.get("workerIndex") or index + 1) if node else index + 1,
+                "tasks": [],
+            }
+        )
+    for task_index, task in enumerate(tasks):
+        slots[task_index % count]["tasks"].append({"taskIndex": task_index, "task": task})
+    return [slot for slot in slots if slot["tasks"]]
+
+
+def _run_parallel_worker_task(
+    task: dict[str, Any],
+    task_index: int,
+    state: dict[str, Any],
+    provider: str,
+    model: str,
+    effective_model_config: ModelRuntimeConfig,
+    selected_tools: list[dict[str, Any]],
+    system_prompt: str,
+    max_iterations: int,
+    runtime_environment: RuntimeEnvironment,
+    store_tool_calls: bool,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        final_answer, calls = _run_tools_agent_session(
+            provider,
+            model,
+            effective_model_config,
+            selected_tools,
+            _parallel_worker_system_prompt(system_prompt),
+            _parallel_worker_user_prompt(state, task),
+            max_iterations,
+            runtime_environment,
+        )
+        result = _normalize_worker_final_answer(task, final_answer)
+        result["durationMs"] = round((time.perf_counter() - started) * 1000, 2)
+        result["taskIndex"] = task_index
+        if store_tool_calls:
+            result["toolCalls"] = _compact_value(calls, string_limit=3000, list_limit=12)
+        return result
+    except Exception as exc:
+        return {
+            "taskId": str(task.get("id") or f"task_{task_index + 1}"),
+            "taskIndex": task_index,
+            "title": str(task.get("title") or task.get("goal") or f"任务 {task_index + 1}")[:120],
+            "status": "error",
+            "durationMs": round((time.perf_counter() - started) * 1000, 2),
+            "summary": "",
+            "evidence": [],
+            "warnings": [],
+            "error": _format_error(exc),
+        }
+
+
+def _parallel_worker_end_event(slot: dict[str, Any], slot_result: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    results = slot_result.get("results") if isinstance(slot_result.get("results"), list) else []
+    status = "error" if slot_result.get("status") == "error" else "ok"
+    first_error = str((results[0] or {}).get("error") or "") if results else ""
+    detail = first_error or f"完成 {len(results)} 个任务"
+    return {
+        "event": "node_end",
+        "traceItem": {
+            "nodeId": str(slot.get("nodeId") or ""),
+            "type": "parallel_worker",
+            "label": str(slot.get("label") or "Worker"),
+            "status": status,
+            "detail": detail[:300] if detail else f"完成 {len(results)} 个任务",
+            "durationMs": float(slot_result.get("durationMs") or 0),
+            "inputState": _compact_state({"tasks": [item["task"] for item in slot.get("tasks", [])]}),
+            "outputDelta": _compact_state({"workerResults": results}),
+        },
+        "outputState": _compact_state(state),
+    }
 
 
 def _normalize_worker_tasks(value: Any, max_tasks: int, fallback_goal: str = "") -> list[dict[str, Any]]:
@@ -1539,6 +1709,12 @@ def _tools_agent_system_prompt(system_prompt: str, selected_tools: list[dict[str
         "不要输出 Markdown。"
     )
     tool_names = {str(tool.get("name") or tool.get("id") or "") for tool in selected_tools}
+    if "task_plan" in tool_names:
+        instructions += (
+            "【Task Splitter 任务规划】当节点目标是拆分 Worker 任务时，必须调用 task_plan 工具提交 tasks 数组。"
+            "每个任务至少包含 title 和 goal；可补充 targetFiles、suggestedTools。"
+            "task_plan 工具会返回 {\"tasks\":[...]}；最终 final_answer 必须只返回该结构化 JSON，不要返回自然语言分析。"
+        )
     if tool_names & {"read_file_chunk", "search_code", "list_code_symbols"}:
         instructions += (
             "【代码阅读策略】读取代码或大文件时，先用 search_code 或 list_code_symbols 定位文件、函数、类、组件或关键行；"
@@ -1934,6 +2110,8 @@ def _invoke_builtin_tool(metadata: dict[str, Any], args: dict[str, Any], runtime
         return _builtin_read_file(args, runtime)
     if builtin_id == "list_directory":
         return _builtin_list_directory(args, runtime)
+    if builtin_id == "task_plan":
+        return _builtin_task_plan(args)
     if builtin_id == "read_file_chunk":
         return _builtin_read_file_chunk(args, runtime)
     if builtin_id == "search_code":
@@ -2204,6 +2382,19 @@ def _builtin_list_directory(args: dict[str, Any], runtime: dict[str, Any]) -> di
         "recursive": recursive,
         "entries": entries,
         "truncated": len(entries) >= max_entries,
+    }
+
+
+def _builtin_task_plan(args: dict[str, Any]) -> dict[str, Any]:
+    max_tasks = min(_positive_int(args.get("maxTasks", args.get("max_tasks", 6)), 6), 10)
+    payload = {"tasks": args.get("tasks")}
+    tasks = _normalize_worker_tasks(payload, max_tasks=max_tasks, fallback_goal=str(args.get("sourceGoal") or args.get("source_goal") or ""))
+    if not tasks:
+        raise RuntimeError("task_plan 需要 tasks 数组，且每个任务至少包含 goal、description、task、title 或 name。")
+    return {
+        "format": "task_splitter_v1",
+        "taskCount": len(tasks),
+        "tasks": tasks,
     }
 
 
@@ -4266,6 +4457,40 @@ def _format_error(exc: Exception) -> str:
 
 def _first_target(edges: list) -> str | None:
     return edges[0].target if edges else None
+
+
+def _first_execution_target(edges: list) -> str | None:
+    executable = [edge for edge in edges if edge.kind != EdgeKind.WORKER]
+    return _first_target(executable)
+
+
+def _next_execution_target(node: NodeIR, nodes: dict[str, NodeIR], outgoing: dict[str, list], state: dict[str, Any]) -> str | None:
+    edges = outgoing.get(node.id, [])
+    if not edges:
+        return None
+    conditional_edges = [edge for edge in edges if edge.kind == EdgeKind.CONDITIONAL]
+    if conditional_edges:
+        handle = _choose_handle(node, state)
+        return _target_for_handle(conditional_edges, handle) or _first_target(conditional_edges)
+    normal_edges = [edge for edge in edges if edge.kind == EdgeKind.NORMAL]
+    if normal_edges:
+        return _first_target(normal_edges)
+    if node.type == NodeType.PARALLEL_TOOLS:
+        return _parallel_worker_output_target(node.id, nodes, outgoing)
+    return None
+
+
+def _parallel_worker_output_target(parent_node_id: str, nodes: dict[str, NodeIR], outgoing: dict[str, list]) -> str | None:
+    worker_ids = {
+        node.id
+        for node in nodes.values()
+        if node.type == NodeType.PARALLEL_WORKER and str(node.config.get("parentNodeId") or "") == parent_node_id
+    }
+    for worker_id in sorted(worker_ids):
+        for edge in outgoing.get(worker_id, []):
+            if edge.kind == EdgeKind.WORKER and edge.target not in worker_ids:
+                return edge.target
+    return None
 
 
 def _target_for_handle(edges: list, handle: str) -> str | None:

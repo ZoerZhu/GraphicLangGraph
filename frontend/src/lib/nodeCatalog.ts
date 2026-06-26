@@ -114,6 +114,11 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         storeToolCalls: false,
         outputField: "worker_results",
       };
+    case "parallel_worker":
+      return {
+        parentNodeId: "",
+        workerIndex: 1,
+      };
     case "retriever":
       return {
         source: "local",
@@ -241,6 +246,9 @@ export function defaultOutputs(type: NodeType): Port[] {
   }
   if (type === "parallel_tools") {
     return [{ id: "out", type: "control", label: "汇总" }];
+  }
+  if (type === "parallel_worker") {
+    return [{ id: "out", type: "control", label: "结果" }];
   }
   return [{ id: "out", type: "control", label: "输出" }];
 }
