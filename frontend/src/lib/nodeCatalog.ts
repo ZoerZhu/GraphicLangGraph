@@ -30,6 +30,10 @@ export const NODE_CATALOG: NodeCatalogItem[] = [
   { type: "tool", title: "Tools", description: "Agent 自主选择并调用工具", icon: Wrench },
   { type: "task_splitter", title: "Task Splitter", description: "解析规划并生成任务列表", icon: Route },
   { type: "parallel_tools", title: "Parallel Tools", description: "并行启动多个工具 Worker", icon: Wrench },
+  { type: "variable_assign", title: "Variable Assign", description: "写入、追加、合并或清空 state", icon: Braces },
+  { type: "template", title: "Template", description: "渲染文本或 JSON 到 state", icon: Braces },
+  { type: "json_extractor", title: "JSON Extractor", description: "按 Schema 抽取结构化 JSON", icon: Braces },
+  { type: "json_validator", title: "JSON Validator", description: "校验 JSON 并输出分支", icon: GitBranch },
   { type: "retriever", title: "Retriever", description: "检索知识库上下文", icon: Database },
   { type: "condition", title: "Condition", description: "规则分支路由", icon: GitBranch },
   { type: "ai_router", title: "AI Router", description: "按意图进行智能路由", icon: Route },
@@ -118,6 +122,61 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
       return {
         parentNodeId: "",
         workerIndex: 1,
+      };
+    case "variable_assign":
+      return {
+        inputMappingsJson: "[]",
+        assignmentsJson: JSON.stringify(
+          [
+            {
+              target: "assigned_value",
+              operation: "overwrite",
+              sourceType: "template",
+              source: "{{ state.messages }}",
+              valueType: "string",
+            },
+          ],
+          null,
+          2,
+        ),
+        resultField: "assignment_result",
+      };
+    case "template":
+      return {
+        inputMappingsJson: "[]",
+        template: "{{ state.messages }}",
+        outputType: "text",
+        outputField: "template_result",
+      };
+    case "json_extractor":
+      return {
+        provider: "openai",
+        model: "gpt-4.1-mini",
+        inputMappingsJson: JSON.stringify([{ name: "input", sourceType: "state", source: "messages", valueType: "string" }], null, 2),
+        inputText: "{{ state.messages }}",
+        instruction: "抽取可供后续节点消费的结构化 JSON。",
+        schemaFieldsJson: JSON.stringify(
+          [
+            { name: "tasks", type: "array", required: true, description: "任务数组" },
+          ],
+          null,
+          2,
+        ),
+        outputField: "extracted_json",
+        validationField: "validation_result",
+      };
+    case "json_validator":
+      return {
+        inputField: "extracted_json",
+        schemaFieldsJson: JSON.stringify(
+          [
+            { name: "tasks", type: "array", required: true, description: "任务数组" },
+          ],
+          null,
+          2,
+        ),
+        outputField: "validated_json",
+        validationField: "validation_result",
       };
     case "retriever":
       return {
@@ -242,6 +301,12 @@ export function defaultOutputs(type: NodeType): Port[] {
       { id: "approved", type: "condition", label: "通过" },
       { id: "rejected", type: "condition", label: "拒绝" },
       { id: "edit", type: "condition", label: "修改" },
+    ];
+  }
+  if (type === "json_extractor" || type === "json_validator") {
+    return [
+      { id: "valid", type: "condition", label: "valid" },
+      { id: "invalid", type: "condition", label: "invalid" },
     ];
   }
   if (type === "parallel_tools") {

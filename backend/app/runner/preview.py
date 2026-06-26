@@ -362,6 +362,25 @@ def _execute_dry_node(node: NodeIR, state: dict[str, Any], skills: SkillRuntimeC
                 }
             ]
         }, f"模拟 Parallel Tools 并行 Worker，输出到 state.{field}"
+    if node.type == NodeType.VARIABLE_ASSIGN:
+        delta, detail = _execute_variable_assign(node, state)
+        return delta, f"[dry-run] {detail}"
+    if node.type == NodeType.TEMPLATE:
+        delta, detail = _execute_template_node(node, state)
+        return delta, f"[dry-run] {detail}"
+    if node.type == NodeType.JSON_EXTRACTOR:
+        output_field = str(config.get("outputField", "extracted_json"))
+        validation_field = str(config.get("validationField", "validation_result"))
+        schema = _json_schema_from_fields(config.get("schemaFieldsJson"))
+        output = _sample_json_from_schema(schema)
+        validation = _validation_result(output, schema)
+        return {
+            output_field: output,
+            validation_field: validation,
+        }, f"模拟 JSON Extractor 输出到 state.{output_field}"
+    if node.type == NodeType.JSON_VALIDATOR:
+        delta, detail = _execute_json_validator(node, state)
+        return delta, f"[dry-run] {detail}"
     if node.type == NodeType.RETRIEVER:
         field = str(config.get("outputField", "retrieved_context"))
         return {
@@ -426,6 +445,14 @@ def _execute_live_node(
         return _execute_live_task_splitter(node, state)
     if node.type == NodeType.PARALLEL_TOOLS:
         return _execute_live_parallel_tools(project, node, state, model_config, runtime_environment, tools)
+    if node.type == NodeType.VARIABLE_ASSIGN:
+        return _execute_variable_assign(node, state)
+    if node.type == NodeType.TEMPLATE:
+        return _execute_template_node(node, state)
+    if node.type == NodeType.JSON_EXTRACTOR:
+        return _execute_live_json_extractor(node, state, model_config)
+    if node.type == NodeType.JSON_VALIDATOR:
+        return _execute_json_validator(node, state)
     if node.type == NodeType.RETRIEVER:
         return _execute_live_retriever(node, state)
     if node.type == NodeType.CONDITION:
@@ -1161,6 +1188,124 @@ def _execute_live_task_splitter(node: NodeIR, state: dict[str, Any]) -> tuple[di
     if not tasks:
         raise RuntimeError(f"Task Splitter 无法从 state.{input_field} 解析出 tasks。")
     return {output_field: tasks}, f"解析并标准化 {len(tasks)} 个 Worker 任务，输出到 state.{output_field}"
+
+
+def _execute_variable_assign(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    config = node.config
+    assignments = _json_object_list(config.get("assignmentsJson"))
+    if not assignments:
+        assignments = [
+            {
+                "target": str(config.get("targetField") or "assigned_value"),
+                "operation": "overwrite",
+                "sourceType": "template",
+                "source": str(config.get("value") or "{{ state.messages }}"),
+                "valueType": "auto",
+            }
+        ]
+    input_values = _resolve_input_mappings(config, state)
+    delta: dict[str, Any] = {}
+    operations: list[dict[str, Any]] = []
+    working = {**state}
+    for raw in assignments:
+        if not isinstance(raw, dict):
+            continue
+        target = str(raw.get("target") or raw.get("field") or raw.get("name") or "").strip()
+        if not target:
+            continue
+        operation = str(raw.get("operation") or "overwrite").strip().lower()
+        source_type = str(raw.get("sourceType") or raw.get("source_type") or "template").strip().lower()
+        source = str(raw.get("source") if raw.get("source") is not None else raw.get("value") if raw.get("value") is not None else "")
+        value_type = str(raw.get("valueType") or raw.get("value_type") or "auto")
+        if source_type == "input":
+            value = input_values.get(source)
+        else:
+            value = _resolve_mapping_value(source_type, source, value_type, {**working, **delta})
+        previous = _get_path({**working, **delta}, target)
+        if operation == "clear":
+            next_value = None
+        elif operation == "append":
+            current = previous if isinstance(previous, list) else ([] if previous in (None, "") else [previous])
+            next_value = [*current, *(value if isinstance(value, list) else [value])]
+        elif operation == "merge":
+            base = previous if isinstance(previous, dict) else {}
+            if not isinstance(value, dict):
+                raise RuntimeError(f"Variable Assign merge 需要 object 值：{target}")
+            next_value = {**base, **value}
+        else:
+            operation = "overwrite"
+            next_value = value
+        _set_path(delta, target, next_value, {**working, **delta})
+        operations.append({"target": target, "operation": operation, "previous": _compact_value(previous), "value": _compact_value(next_value)})
+    result_field = str(config.get("resultField", "assignment_result")).strip() or "assignment_result"
+    if result_field:
+        delta[result_field] = {
+            "ok": True,
+            "changedFields": [item["target"] for item in operations],
+            "operations": operations,
+        }
+    return delta, f"Variable Assign 写入 {len(operations)} 个字段"
+
+
+def _execute_template_node(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    config = node.config
+    output_field = str(config.get("outputField", "template_result")).strip() or "template_result"
+    output_type = str(config.get("outputType", "text")).strip().lower()
+    inputs = _resolve_input_mappings(config, state)
+    render_state = {**state, **inputs}
+    rendered = render_template(str(config.get("template", "")), render_state)
+    if output_type == "json":
+        try:
+            value = json.loads(rendered)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Template JSON 输出解析失败：{exc}") from exc
+    else:
+        value = rendered
+    return {output_field: value}, f"Template 渲染为 {output_type or 'text'}，输出到 state.{output_field}"
+
+
+def _execute_live_json_extractor(node: NodeIR, state: dict[str, Any], model_config: ModelRuntimeConfig) -> tuple[dict[str, Any], str]:
+    config = node.config
+    output_field = str(config.get("outputField", "extracted_json")).strip() or "extracted_json"
+    validation_field = str(config.get("validationField", "validation_result")).strip() or "validation_result"
+    schema = _json_schema_from_fields(config.get("schemaFieldsJson"))
+    inputs = _resolve_input_mappings(config, state)
+    input_text = str(config.get("inputText") or "").strip()
+    if input_text:
+        source_text = render_template(input_text, {**state, **inputs})
+    else:
+        source_text = _state_value_to_text(inputs.get("input") if "input" in inputs else state.get("messages", ""))
+    effective_model_config = _effective_model_config(config, model_config)
+    provider, model = _resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
+    response = _call_chat_model(
+        provider,
+        model,
+        [
+            ("system", _json_extractor_system_prompt(config, schema)),
+            ("user", "请从以下输入中抽取结构化 JSON：\n" + source_text),
+        ],
+        effective_model_config,
+    )
+    output = _parse_json_object_from_text(getattr(response, "content", str(response)))
+    validation = _validation_result(output, schema)
+    return {
+        output_field: output,
+        validation_field: validation,
+    }, f"JSON Extractor 抽取到 state.{output_field}，校验 {'通过' if validation['valid'] else '未通过'}"
+
+
+def _execute_json_validator(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    config = node.config
+    input_field = str(config.get("inputField", "extracted_json")).strip() or "extracted_json"
+    output_field = str(config.get("outputField", "validated_json")).strip() or "validated_json"
+    validation_field = str(config.get("validationField", "validation_result")).strip() or "validation_result"
+    schema = _json_schema_from_fields(config.get("schemaFieldsJson"))
+    value = _get_path(state, input_field)
+    validation = _validation_result(value, schema)
+    return {
+        output_field: value,
+        validation_field: validation,
+    }, f"JSON Validator 校验 state.{input_field}，结果 {'valid' if validation['valid'] else 'invalid'}"
 
 
 def _execute_live_parallel_tools(
@@ -3492,6 +3637,245 @@ def _flatten_json_object_list(value: list[Any]) -> list[dict[str, Any]]:
     return result
 
 
+def _resolve_input_mappings(config: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for mapping in _json_object_list(config.get("inputMappingsJson")):
+        name = str(mapping.get("name") or "").strip()
+        if not name:
+            continue
+        source_type = str(mapping.get("sourceType") or mapping.get("source_type") or "state").strip().lower()
+        source = str(mapping.get("source") or "")
+        value_type = str(mapping.get("valueType") or mapping.get("value_type") or "auto")
+        result[name] = _resolve_mapping_value(source_type, source, value_type, state)
+    return result
+
+
+def _resolve_mapping_value(source_type: str, source: str, value_type: str, state: dict[str, Any]) -> Any:
+    if source_type == "state":
+        value = _get_path(state, source)
+    elif source_type == "literal":
+        value = source
+    elif source_type == "json":
+        rendered = render_template(source, state)
+        try:
+            value = json.loads(rendered)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"输入映射 JSON 解析失败：{exc}") from exc
+    else:
+        value = render_template(source, state)
+    return _coerce_mapped_value(value, value_type)
+
+
+def _coerce_mapped_value(value: Any, value_type: str) -> Any:
+    kind = str(value_type or "auto").strip().lower()
+    if kind in {"", "auto", "any"}:
+        return value
+    if kind == "string":
+        return _state_value_to_text(value)
+    if kind == "number":
+        return float(value)
+    if kind == "integer":
+        return int(value)
+    if kind == "boolean":
+        return _truthy(value)
+    if kind == "json":
+        if isinstance(value, (dict, list)):
+            return value
+        return json.loads(str(value or "null"))
+    return value
+
+
+def _get_path(value: Any, path: str, default: Any = None) -> Any:
+    current = value
+    for part in [item for item in str(path or "").split(".") if item]:
+        if isinstance(current, dict):
+            if part not in current:
+                return default
+            current = current.get(part)
+        elif isinstance(current, list) and part.isdigit():
+            index = int(part)
+            if index < 0 or index >= len(current):
+                return default
+            current = current[index]
+        else:
+            return default
+    return current
+
+
+def _set_path(target: dict[str, Any], path: str, value: Any, base: dict[str, Any] | None = None) -> None:
+    parts = [item for item in str(path or "").split(".") if item]
+    if not parts:
+        return
+    if len(parts) == 1:
+        target[parts[0]] = value
+        return
+    first = parts[0]
+    if first not in target:
+        existing = (base or {}).get(first)
+        target[first] = dict(existing) if isinstance(existing, dict) else {}
+    current = target[first]
+    if not isinstance(current, dict):
+        current = {}
+        target[first] = current
+    for part in parts[1:-1]:
+        child = current.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            current[part] = child
+        current = child
+    current[parts[-1]] = value
+
+
+def _json_schema_from_fields(value: Any) -> dict[str, Any]:
+    fields = _json_object_list(value)
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for field in fields:
+        name = str(field.get("name") or "").strip()
+        if not name:
+            continue
+        field_type = str(field.get("type") or "string").strip().lower()
+        if field_type not in {"string", "number", "integer", "boolean", "object", "array"}:
+            field_type = "string"
+        schema: dict[str, Any] = {"type": field_type}
+        description = str(field.get("description") or "").strip()
+        if description:
+            schema["description"] = description
+        enum_values = _enum_values(field.get("enumValues") or field.get("enum_values"))
+        if enum_values:
+            schema["enum"] = enum_values
+        default_value = _field_default_value(field.get("defaultValue"))
+        if default_value is not None:
+            schema["default"] = default_value
+        if field_type == "array":
+            schema.setdefault("items", {})
+        properties[name] = schema
+        if _truthy(field.get("required")):
+            required.append(name)
+    schema = {"type": "object", "properties": properties, "additionalProperties": True}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def _enum_values(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return [item for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [item.strip() for item in re.split(r"[,，\n;；]+", text) if item.strip()]
+
+
+def _field_default_value(value: Any) -> Any:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _validation_result(value: Any, schema: dict[str, Any]) -> dict[str, Any]:
+    errors = _validate_json_value(value, schema, "$")
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "schema": schema,
+        "output": value,
+    }
+
+
+def _validate_json_value(value: Any, schema: dict[str, Any], path: str) -> list[str]:
+    errors: list[str] = []
+    expected_type = str(schema.get("type") or "object")
+    if not _json_type_matches(value, expected_type):
+        return [f"{path} expected {expected_type}, got {type(value).__name__}"]
+    if "enum" in schema and isinstance(schema.get("enum"), list) and value not in schema["enum"]:
+        errors.append(f"{path} must be one of {schema['enum']}")
+    if expected_type != "object" or not isinstance(value, dict):
+        return errors
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = {str(item) for item in schema.get("required", []) if str(item)}
+    for key in sorted(required):
+        if key not in value or value.get(key) is None:
+            errors.append(f"{path}.{key} is required")
+    for key, property_schema in properties.items():
+        if key not in value or value.get(key) is None:
+            continue
+        if isinstance(property_schema, dict):
+            errors.extend(_validate_json_value(value.get(key), property_schema, f"{path}.{key}"))
+    return errors
+
+
+def _json_type_matches(value: Any, expected_type: str) -> bool:
+    if expected_type == "object":
+        return isinstance(value, dict)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return True
+
+
+def _sample_json_from_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    result: dict[str, Any] = {}
+    for key, field_schema in properties.items():
+        if not isinstance(field_schema, dict):
+            result[key] = ""
+            continue
+        if "default" in field_schema:
+            result[key] = field_schema["default"]
+            continue
+        field_type = str(field_schema.get("type") or "string")
+        result[key] = [] if field_type == "array" else {} if field_type == "object" else False if field_type == "boolean" else 0 if field_type in {"number", "integer"} else ""
+    return result
+
+
+def _json_extractor_system_prompt(config: dict[str, Any], schema: dict[str, Any]) -> str:
+    instruction = str(config.get("instruction") or "").strip()
+    prompt = (
+        "你是 JSON Extractor。请严格根据 JSON Schema 从用户输入中抽取一个 JSON object。"
+        "只输出 JSON object，不要输出 Markdown 或解释。缺失且非必填的字段可以省略。"
+    )
+    if instruction:
+        prompt += "\n\n抽取说明：\n" + instruction
+    prompt += "\n\nJSON Schema：\n" + json.dumps(schema, ensure_ascii=False, indent=2)
+    return prompt
+
+
+def _parse_json_object_from_text(content: str, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    text = str(content or "").strip()
+    candidates = [text]
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidates.insert(0, fenced.group(1).strip())
+    start = text.find("{")
+    end = text.rfind("}")
+    if 0 <= start < end:
+        candidates.append(text[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    if fallback is not None:
+        return fallback
+    raise RuntimeError("模型响应不是合法 JSON object。")
+
+
 def _tool_configs_by_id(project: ProjectIR) -> ToolRuntimeConfig:
     result: ToolRuntimeConfig = {}
     for tool in _workspace_tool_dicts():
@@ -4258,6 +4642,11 @@ def _choose_handle(node: NodeIR, state: dict[str, Any]) -> str:
         return str(state.get(str(config.get("routeField", "route_key"))) or config.get("fallback", "other"))
     if node.type == NodeType.HUMAN_APPROVAL:
         return str(state.get(str(config.get("actionField", "approval_action"))) or config.get("fallback", "rejected"))
+    if node.type in {NodeType.JSON_EXTRACTOR, NodeType.JSON_VALIDATOR}:
+        validation = state.get(str(config.get("validationField", "validation_result")))
+        if isinstance(validation, dict) and validation.get("valid") is True:
+            return "valid"
+        return "invalid"
     return str(config.get("fallback", "fallback"))
 
 

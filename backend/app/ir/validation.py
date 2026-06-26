@@ -100,6 +100,14 @@ def validate_project(project: ProjectIR) -> ValidationResult:
             _validate_task_splitter(node.id, node.config, issues)
         if node.type == NodeType.PARALLEL_TOOLS:
             _validate_parallel_tools(node.id, node.config, issues)
+        if node.type == NodeType.VARIABLE_ASSIGN:
+            _validate_variable_assign(node.id, node.config, issues)
+        if node.type == NodeType.TEMPLATE:
+            _validate_template(node.id, node.config, issues)
+        if node.type == NodeType.JSON_EXTRACTOR:
+            _validate_json_branch_node(node.id, node.config, outgoing[node.id], issues, "JSON Extractor")
+        if node.type == NodeType.JSON_VALIDATOR:
+            _validate_json_branch_node(node.id, node.config, outgoing[node.id], issues, "JSON Validator")
         if node.type == NodeType.HTTP:
             _validate_http(node.id, node.config, issues)
         if node.type == NodeType.CUSTOM_FUNCTION:
@@ -393,6 +401,49 @@ def _validate_parallel_tools(node_id: str, config: dict, issues: list[Validation
         issues.append(_issue("PARALLEL_TOOLS_REQUIRED", "Parallel Tools 至少需要选择一个 Tool。", nodeId=node_id, field="toolIdsJson"))
 
 
+def _validate_variable_assign(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
+    assignments = _json_object_list(config.get("assignmentsJson"))
+    if not assignments:
+        issues.append(_issue("VARIABLE_ASSIGN_REQUIRED", "Variable Assign 至少需要一个赋值规则。", nodeId=node_id, field="assignmentsJson"))
+        return
+    for index, assignment in enumerate(assignments):
+        target = _clean_field(assignment.get("target") or assignment.get("field") or assignment.get("name"))
+        if not target:
+            issues.append(_issue("VARIABLE_ASSIGN_TARGET", f"第 {index + 1} 个赋值规则缺少目标字段。", nodeId=node_id, field="assignmentsJson"))
+        operation = str(assignment.get("operation") or "overwrite").strip().lower()
+        if operation not in {"overwrite", "append", "merge", "clear"}:
+            issues.append(_issue("VARIABLE_ASSIGN_OPERATION", f"不支持的赋值操作：{operation}。", nodeId=node_id, field="assignmentsJson"))
+
+
+def _validate_template(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
+    if not _clean_field(config.get("outputField")):
+        issues.append(_issue("TEMPLATE_OUTPUT_FIELD", "Template 必须配置输出字段。", nodeId=node_id, field="outputField"))
+    output_type = str(config.get("outputType") or "text").strip().lower()
+    if output_type not in {"text", "json"}:
+        issues.append(_issue("TEMPLATE_OUTPUT_TYPE", "Template 输出类型只支持 text 或 json。", nodeId=node_id, field="outputType"))
+
+
+def _validate_json_branch_node(node_id: str, config: dict, outgoing_edges: list, issues: list[ValidationIssue], label: str) -> None:
+    if not _clean_field(config.get("outputField")):
+        issues.append(_issue("JSON_NODE_OUTPUT_FIELD", f"{label} 必须配置输出字段。", nodeId=node_id, field="outputField"))
+    if not _clean_field(config.get("validationField")):
+        issues.append(_issue("JSON_NODE_VALIDATION_FIELD", f"{label} 必须配置 validationField。", nodeId=node_id, field="validationField"))
+    if not _json_object_list(config.get("schemaFieldsJson")):
+        issues.append(_issue("JSON_NODE_SCHEMA_FIELDS", f"{label} 至少需要一个 Schema 字段。", nodeId=node_id, field="schemaFieldsJson"))
+    handles = {edge.sourceHandle for edge in outgoing_edges if edge.kind == EdgeKind.CONDITIONAL}
+    missing = [branch for branch in ("valid", "invalid") if branch not in handles]
+    if missing:
+        issues.append(
+            _issue(
+                "JSON_NODE_BRANCH_EDGE",
+                f"{label} 分支缺少连线：{', '.join(missing)}。",
+                nodeId=node_id,
+                field="outputs",
+                suggestion="为 valid 和 invalid 分支分别连接后续节点。",
+            )
+        )
+
+
 def _validate_custom_function(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:
     code = str(config.get("code", "return {}"))
     try:
@@ -437,6 +488,17 @@ def _state_writes_for_node(node_type: NodeType, config: dict[str, Any]) -> set[s
         return {_clean_field(config.get("outputField", ""))}
     if node_type == NodeType.PARALLEL_TOOLS:
         return {_clean_field(config.get("outputField", ""))}
+    if node_type == NodeType.VARIABLE_ASSIGN:
+        fields = {_clean_field(config.get("resultField", "assignment_result"))}
+        for assignment in _json_object_list(config.get("assignmentsJson")):
+            target = _clean_field(assignment.get("target") or assignment.get("field") or assignment.get("name"))
+            if target:
+                fields.add(target.split(".", 1)[0])
+        return fields
+    if node_type == NodeType.TEMPLATE:
+        return {_clean_field(config.get("outputField", ""))}
+    if node_type in {NodeType.JSON_EXTRACTOR, NodeType.JSON_VALIDATOR}:
+        return {_clean_field(config.get("outputField", "")), _clean_field(config.get("validationField", ""))}
     if node_type == NodeType.RETRIEVER:
         return {_clean_field(config.get("outputField", ""))}
     if node_type == NodeType.HTTP:
@@ -467,6 +529,25 @@ def _has_selected_tools(config: dict[str, Any]) -> bool:
         if isinstance(parsed, list) and parsed:
             return True
     return bool(str(config.get("tools", "")).strip())
+
+
+def _json_object_list(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        return [value]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return []
+    if isinstance(parsed, dict):
+        return [parsed]
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+    return []
 
 
 def _clean_field(value: Any) -> str:

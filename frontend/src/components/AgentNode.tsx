@@ -42,6 +42,10 @@ const ICONS = {
   task_splitter: Route,
   parallel_tools: Wrench,
   parallel_worker: Wrench,
+  variable_assign: Braces,
+  template: Braces,
+  json_extractor: Braces,
+  json_validator: GitBranch,
   retriever: Database,
   condition: GitBranch,
   ai_router: Route,
@@ -311,6 +315,28 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
         { label: "槽位", value: text(config.workerIndex, "1") },
         { label: "来源", value: "Parallel Tools" },
       ];
+    case "variable_assign":
+      return [
+        { label: "规则", value: `${parseObjectList(config.assignmentsJson).length} 个` },
+        { label: "结果", value: text(config.resultField, "assignment_result") },
+      ];
+    case "template":
+      return [
+        { label: "类型", value: text(config.outputType, "text") },
+        { label: "输出", value: text(config.outputField, "template_result") },
+      ];
+    case "json_extractor":
+      return [
+        { label: "模型", value: text(config.model, "gpt-4.1-mini") },
+        { label: "Schema", value: `${parseObjectList(config.schemaFieldsJson).length} 字段` },
+        { label: "输出", value: text(config.outputField, "extracted_json") },
+      ];
+    case "json_validator":
+      return [
+        { label: "输入", value: text(config.inputField, "extracted_json") },
+        { label: "Schema", value: `${parseObjectList(config.schemaFieldsJson).length} 字段` },
+        { label: "结果", value: text(config.validationField, "validation_result") },
+      ];
     case "retriever":
       return [
         { label: "来源", value: text(config.path, "./knowledge") },
@@ -454,6 +480,14 @@ function nodeTypeLabel(type: NodeType): string {
       return "PARALLEL";
     case "parallel_worker":
       return "WORKER";
+    case "variable_assign":
+      return "ASSIGN";
+    case "template":
+      return "TEMPLATE";
+    case "json_extractor":
+      return "EXTRACT";
+    case "json_validator":
+      return "VALIDATE";
     case "retriever":
       return "RAG";
     case "condition":

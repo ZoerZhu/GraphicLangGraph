@@ -3101,6 +3101,70 @@ def _node_function(node: NodeIR) -> str:
         raise RuntimeError("Parallel Tools 所有 Worker 均执行失败。")
     return {{"{output_field}": final_results}}
 '''
+    if node.type == NodeType.VARIABLE_ASSIGN:
+        assignments = json.dumps(_json_object_list(node.config.get("assignmentsJson")), ensure_ascii=False)
+        input_mappings = json.dumps(_json_object_list(node.config.get("inputMappingsJson")), ensure_ascii=False)
+        result_field = json.dumps(str(node.config.get("resultField", "assignment_result")))
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    inputs = _resolve_input_mappings({input_mappings}, state)
+    return _run_variable_assign({assignments}, inputs, state, {result_field})
+'''
+    if node.type == NodeType.TEMPLATE:
+        input_mappings = json.dumps(_json_object_list(node.config.get("inputMappingsJson")), ensure_ascii=False)
+        template = json.dumps(str(node.config.get("template", "")))
+        output_type = json.dumps(str(node.config.get("outputType", "text")))
+        output_field = json.dumps(str(node.config.get("outputField", "template_result")))
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    inputs = _resolve_input_mappings({input_mappings}, state)
+    render_state = {{**dict(state), **inputs}}
+    rendered = render_template({template}, render_state)
+    if {output_type}.strip().lower() == "json":
+        try:
+            value = json.loads(rendered)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Template JSON 输出解析失败：{{exc}}") from exc
+    else:
+        value = rendered
+    return {{{output_field}: value}}
+'''
+    if node.type == NodeType.JSON_EXTRACTOR:
+        provider = json.dumps(str(node.config.get("provider", "openai")))
+        model = json.dumps(str(node.config.get("model", "gpt-4.1-mini")))
+        base_url = json.dumps(str(node.config.get("baseUrl", "")))
+        api_key_env = json.dumps(str(node.config.get("apiKeyEnv", "")))
+        api_version = json.dumps(str(node.config.get("apiVersion", "")))
+        organization = json.dumps(str(node.config.get("organization", "")))
+        input_mappings = json.dumps(_json_object_list(node.config.get("inputMappingsJson")), ensure_ascii=False)
+        input_text = json.dumps(str(node.config.get("inputText", "")))
+        instruction = json.dumps(str(node.config.get("instruction", "")))
+        schema = json.dumps(_json_schema_from_fields(node.config.get("schemaFieldsJson")), ensure_ascii=False)
+        output_field = json.dumps(str(node.config.get("outputField", "extracted_json")))
+        validation_field = json.dumps(str(node.config.get("validationField", "validation_result")))
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    model_ref = _chat_model({provider}, {model}, {base_url}, {api_key_env}, {api_version}, {organization})
+    inputs = _resolve_input_mappings({input_mappings}, state)
+    render_state = {{**dict(state), **inputs}}
+    source_text = render_template({input_text}, render_state) if {input_text}.strip() else _state_value_to_text(inputs.get("input") if "input" in inputs else state.get("messages", ""))
+    schema = {schema}
+    response = model_ref.invoke([
+        ("system", _json_extractor_system_prompt({instruction}, schema)),
+        ("user", "请从以下输入中抽取结构化 JSON：\\n" + source_text),
+    ])
+    output = _parse_json_object_from_text(getattr(response, "content", str(response)))
+    validation = _validation_result(output, schema)
+    return {{{output_field}: output, {validation_field}: validation}}
+'''
+    if node.type == NodeType.JSON_VALIDATOR:
+        input_field = json.dumps(str(node.config.get("inputField", "extracted_json")))
+        output_field = json.dumps(str(node.config.get("outputField", "validated_json")))
+        validation_field = json.dumps(str(node.config.get("validationField", "validation_result")))
+        schema = json.dumps(_json_schema_from_fields(node.config.get("schemaFieldsJson")), ensure_ascii=False)
+        return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
+    schema = {schema}
+    value = _get_path(state, {input_field})
+    validation = _validation_result(value, schema)
+    return {{{output_field}: value, {validation_field}: validation}}
+'''
     if node.type == NodeType.RETRIEVER:
         path = json.dumps(str(node.config.get("path", "./knowledge")))
         query = json.dumps(str(node.config.get("query", "{{ state.messages }}")))
@@ -3305,7 +3369,7 @@ def _routers_py(project: ProjectIR) -> str:
     condition_nodes = [
         node
         for node in project.nodes
-        if node.type in {NodeType.CONDITION, NodeType.AI_ROUTER, NodeType.HUMAN_APPROVAL}
+        if node.type in {NodeType.CONDITION, NodeType.AI_ROUTER, NodeType.HUMAN_APPROVAL, NodeType.JSON_EXTRACTOR, NodeType.JSON_VALIDATOR}
     ]
     if not condition_nodes:
         return "from __future__ import annotations\n\n"
@@ -3326,6 +3390,14 @@ def _routers_py(project: ProjectIR) -> str:
 
 def _route_function(node: NodeIR) -> str:
     name = py_name(node.id)
+    if node.type in {NodeType.JSON_EXTRACTOR, NodeType.JSON_VALIDATOR}:
+        validation_field = str(node.config.get("validationField", "validation_result"))
+        return f'''def route_{name}(state: AgentState) -> str:
+    validation = state.get({validation_field!r})
+    if isinstance(validation, dict) and validation.get("valid") is True:
+        return "valid"
+    return "invalid"
+'''
     if node.type == NodeType.AI_ROUTER:
         route_field = py_name(str(node.config.get("routeField", "route_key")))
         fallback = str(node.config.get("fallback", "other"))
@@ -3382,7 +3454,7 @@ def _graph_py(project: ProjectIR) -> str:
     condition_ids = {
         node.id
         for node in project.nodes
-        if node.type in {NodeType.CONDITION, NodeType.AI_ROUTER, NodeType.HUMAN_APPROVAL}
+        if node.type in {NodeType.CONDITION, NodeType.AI_ROUTER, NodeType.HUMAN_APPROVAL, NodeType.JSON_EXTRACTOR, NodeType.JSON_VALIDATOR}
     }
     has_human_approval = any(node.type == NodeType.HUMAN_APPROVAL for node in project.nodes)
 
@@ -3650,6 +3722,175 @@ def _agent_user_content(state: AgentState, user_prompt: str = "") -> str:
     elif value:
         user_text = str(value)
     return "用户输入：\\n" + user_text + "\\n\\n当前流程 state：\\n" + json.dumps(dict(state), ensure_ascii=False, default=str, indent=2)
+
+
+def _resolve_input_mappings(mappings: list[dict[str, Any]], state: AgentState) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            continue
+        name = str(mapping.get("name") or "").strip()
+        if not name:
+            continue
+        source_type = str(mapping.get("sourceType") or mapping.get("source_type") or "state").strip().lower()
+        source = str(mapping.get("source") or "")
+        value_type = str(mapping.get("valueType") or mapping.get("value_type") or "auto")
+        result[name] = _resolve_mapping_value(source_type, source, value_type, state)
+    return result
+
+
+def _resolve_mapping_value(source_type: str, source: str, value_type: str, state: AgentState) -> Any:
+    if source_type == "state":
+        value = _get_path(state, source)
+    elif source_type == "literal":
+        value = source
+    elif source_type == "json":
+        value = json.loads(render_template(source, state))
+    else:
+        value = render_template(source, state)
+    return _coerce_mapped_value(value, value_type)
+
+
+def _coerce_mapped_value(value: Any, value_type: str) -> Any:
+    kind = str(value_type or "auto").strip().lower()
+    if kind in {"", "auto", "any"}:
+        return value
+    if kind == "string":
+        return _state_value_to_text(value)
+    if kind == "number":
+        return float(value)
+    if kind == "integer":
+        return int(value)
+    if kind == "boolean":
+        return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"} if not isinstance(value, bool) else value
+    if kind == "json":
+        return value if isinstance(value, (dict, list)) else json.loads(str(value or "null"))
+    return value
+
+
+def _get_path(value: Any, path: str, default: Any = None) -> Any:
+    current = value
+    for part in [item for item in str(path or "").split(".") if item]:
+        if isinstance(current, dict):
+            if part not in current:
+                return default
+            current = current.get(part)
+        elif isinstance(current, list) and part.isdigit():
+            index = int(part)
+            if index < 0 or index >= len(current):
+                return default
+            current = current[index]
+        else:
+            return default
+    return current
+
+
+def _set_path(target: dict[str, Any], path: str, value: Any, base: dict[str, Any] | None = None) -> None:
+    parts = [item for item in str(path or "").split(".") if item]
+    if not parts:
+        return
+    if len(parts) == 1:
+        target[parts[0]] = value
+        return
+    first = parts[0]
+    if first not in target:
+        existing = (base or {}).get(first)
+        target[first] = dict(existing) if isinstance(existing, dict) else {}
+    current = target[first]
+    if not isinstance(current, dict):
+        current = {}
+        target[first] = current
+    for part in parts[1:-1]:
+        child = current.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            current[part] = child
+        current = child
+    current[parts[-1]] = value
+
+
+def _run_variable_assign(assignments: list[dict[str, Any]], inputs: dict[str, Any], state: AgentState, result_field: str = "assignment_result") -> dict[str, Any]:
+    delta: dict[str, Any] = {}
+    operations: list[dict[str, Any]] = []
+    for raw in assignments:
+        if not isinstance(raw, dict):
+            continue
+        target = str(raw.get("target") or raw.get("field") or raw.get("name") or "").strip()
+        if not target:
+            continue
+        operation = str(raw.get("operation") or "overwrite").strip().lower()
+        source_type = str(raw.get("sourceType") or raw.get("source_type") or "template").strip().lower()
+        source = str(raw.get("source") if raw.get("source") is not None else raw.get("value") if raw.get("value") is not None else "")
+        value_type = str(raw.get("valueType") or raw.get("value_type") or "auto")
+        value = inputs.get(source) if source_type == "input" else _resolve_mapping_value(source_type, source, value_type, {**dict(state), **delta})
+        previous = _get_path({**dict(state), **delta}, target)
+        if operation == "clear":
+            next_value = None
+        elif operation == "append":
+            current = previous if isinstance(previous, list) else ([] if previous in (None, "") else [previous])
+            next_value = [*current, *(value if isinstance(value, list) else [value])]
+        elif operation == "merge":
+            if not isinstance(value, dict):
+                raise RuntimeError(f"Variable Assign merge 需要 object 值：{target}")
+            next_value = {**(previous if isinstance(previous, dict) else {}), **value}
+        else:
+            operation = "overwrite"
+            next_value = value
+        _set_path(delta, target, next_value, {**dict(state), **delta})
+        operations.append({"target": target, "operation": operation, "previous": _compact_value(previous), "value": _compact_value(next_value)})
+    if result_field:
+        delta[result_field] = {"ok": True, "changedFields": [item["target"] for item in operations], "operations": operations}
+    return delta
+
+
+def _validation_result(value: Any, schema: dict[str, Any]) -> dict[str, Any]:
+    errors = _validate_json_value(value, schema, "$")
+    return {"valid": not errors, "errors": errors, "schema": schema, "output": value}
+
+
+def _validate_json_value(value: Any, schema: dict[str, Any], path: str) -> list[str]:
+    errors: list[str] = []
+    expected_type = str(schema.get("type") or "object")
+    if not _json_type_matches(value, expected_type):
+        return [f"{path} expected {expected_type}, got {type(value).__name__}"]
+    if "enum" in schema and isinstance(schema.get("enum"), list) and value not in schema["enum"]:
+        errors.append(f"{path} must be one of {schema['enum']}")
+    if expected_type != "object" or not isinstance(value, dict):
+        return errors
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = {str(item) for item in schema.get("required", []) if str(item)}
+    for key in sorted(required):
+        if key not in value or value.get(key) is None:
+            errors.append(f"{path}.{key} is required")
+    for key, property_schema in properties.items():
+        if key not in value or value.get(key) is None:
+            continue
+        if isinstance(property_schema, dict):
+            errors.extend(_validate_json_value(value.get(key), property_schema, f"{path}.{key}"))
+    return errors
+
+
+def _json_type_matches(value: Any, expected_type: str) -> bool:
+    if expected_type == "object":
+        return isinstance(value, dict)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return True
+
+
+def _json_extractor_system_prompt(instruction: str, schema: dict[str, Any]) -> str:
+    prompt = "你是 JSON Extractor。请严格根据 JSON Schema 从用户输入中抽取一个 JSON object。只输出 JSON object，不要输出 Markdown 或解释。缺失且非必填的字段可以省略。"
+    if instruction.strip():
+        prompt += "\\n\\n抽取说明：\\n" + instruction.strip()
+    return prompt + "\\n\\nJSON Schema：\\n" + json.dumps(schema, ensure_ascii=False, indent=2)
 
 
 def _last_message_content(value: Any) -> str:
@@ -4162,7 +4403,61 @@ def _json_list(value: Any) -> list[Any]:
 
 
 def _json_object_list(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        return [value]
     return [item for item in _json_list(value) if isinstance(item, dict)]
+
+
+def _json_schema_from_fields(value: Any) -> dict[str, Any]:
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for field in _json_object_list(value):
+        name = str(field.get("name") or "").strip()
+        if not name:
+            continue
+        field_type = str(field.get("type") or "string").strip().lower()
+        if field_type not in {"string", "number", "integer", "boolean", "object", "array"}:
+            field_type = "string"
+        schema: dict[str, Any] = {"type": field_type}
+        description = str(field.get("description") or "").strip()
+        if description:
+            schema["description"] = description
+        enum_values = _enum_values(field.get("enumValues") or field.get("enum_values"))
+        if enum_values:
+            schema["enum"] = enum_values
+        default_value = _field_default_value(field.get("defaultValue"))
+        if default_value is not None:
+            schema["default"] = default_value
+        if field_type == "array":
+            schema.setdefault("items", {})
+        properties[name] = schema
+        if str(field.get("required") or "").strip().lower() in {"1", "true", "yes", "on"} or field.get("required") is True:
+            required.append(name)
+    result: dict[str, Any] = {"type": "object", "properties": properties, "additionalProperties": True}
+    if required:
+        result["required"] = required
+    return result
+
+
+def _enum_values(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [item.strip() for item in re.split(r"[,，\n;；]+", text) if item.strip()]
+
+
+def _field_default_value(value: Any) -> Any:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
 
 
 def _parse_json_object(value: str) -> dict[str, Any]:

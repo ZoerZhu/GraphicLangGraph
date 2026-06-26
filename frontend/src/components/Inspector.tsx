@@ -501,6 +501,133 @@ export function Inspector() {
           </Field>
         </InspectorSplit>
       )}
+      {node.type === "variable_assign" && (
+        <>
+          <InputMappingsEditor
+            value={node.config.inputMappingsJson}
+            onChange={(value) => updateNodeConfig(node.id, { inputMappingsJson: value })}
+          />
+          <AssignmentsEditor
+            value={node.config.assignmentsJson}
+            onChange={(value) => updateNodeConfig(node.id, { assignmentsJson: value })}
+          />
+          <Field label="赋值摘要字段">
+            <input
+              value={String(node.config.resultField ?? "assignment_result")}
+              onChange={(event) => updateNodeConfig(node.id, { resultField: event.target.value })}
+            />
+          </Field>
+        </>
+      )}
+      {node.type === "template" && (
+        <>
+          <InputMappingsEditor
+            value={node.config.inputMappingsJson}
+            onChange={(value) => updateNodeConfig(node.id, { inputMappingsJson: value })}
+          />
+          <Field label="模板">
+            <textarea
+              rows={8}
+              value={String(node.config.template ?? "")}
+              onChange={(event) => updateNodeConfig(node.id, { template: event.target.value })}
+              placeholder="{{ state.messages }}"
+            />
+          </Field>
+          <div className="inline-grid">
+            <Field label="输出类型">
+              <select value={String(node.config.outputType ?? "text")} onChange={(event) => updateNodeConfig(node.id, { outputType: event.target.value })}>
+                <option value="text">text</option>
+                <option value="json">json</option>
+              </select>
+            </Field>
+            <Field label="输出字段">
+              <input
+                value={String(node.config.outputField ?? "template_result")}
+                onChange={(event) => updateNodeConfig(node.id, { outputField: event.target.value })}
+              />
+            </Field>
+          </div>
+        </>
+      )}
+      {node.type === "json_extractor" && (
+        <>
+          <ModelSelectionFields
+            config={node.config}
+            defaultModel="gpt-4.1-mini"
+            defaultProvider="openai"
+            modelConfigs={availableModelConfigs}
+            nodeId={node.id}
+            providerLabel="抽取模型配置"
+            providerManualLabel="抽取模型供应商"
+            providerNote="该模型只负责把输入内容抽取成符合 Schema 的 JSON object。"
+            updateNodeConfig={updateNodeConfig}
+          />
+          <InputMappingsEditor
+            value={node.config.inputMappingsJson}
+            onChange={(value) => updateNodeConfig(node.id, { inputMappingsJson: value })}
+          />
+          <Field label="输入文本模板">
+            <textarea
+              rows={3}
+              value={String(node.config.inputText ?? "{{ state.messages }}")}
+              onChange={(event) => updateNodeConfig(node.id, { inputText: event.target.value })}
+            />
+          </Field>
+          <Field label="抽取说明">
+            <textarea
+              rows={3}
+              value={String(node.config.instruction ?? "")}
+              onChange={(event) => updateNodeConfig(node.id, { instruction: event.target.value })}
+            />
+          </Field>
+          <SchemaFieldsEditor
+            value={node.config.schemaFieldsJson}
+            onChange={(value) => updateNodeConfig(node.id, { schemaFieldsJson: value })}
+          />
+          <div className="inline-grid">
+            <Field label="输出字段">
+              <input
+                value={String(node.config.outputField ?? "extracted_json")}
+                onChange={(event) => updateNodeConfig(node.id, { outputField: event.target.value })}
+              />
+            </Field>
+            <Field label="校验结果字段">
+              <input
+                value={String(node.config.validationField ?? "validation_result")}
+                onChange={(event) => updateNodeConfig(node.id, { validationField: event.target.value })}
+              />
+            </Field>
+          </div>
+        </>
+      )}
+      {node.type === "json_validator" && (
+        <>
+          <Field label="输入字段">
+            <input
+              value={String(node.config.inputField ?? "extracted_json")}
+              onChange={(event) => updateNodeConfig(node.id, { inputField: event.target.value })}
+            />
+          </Field>
+          <SchemaFieldsEditor
+            value={node.config.schemaFieldsJson}
+            onChange={(value) => updateNodeConfig(node.id, { schemaFieldsJson: value })}
+          />
+          <div className="inline-grid">
+            <Field label="输出字段">
+              <input
+                value={String(node.config.outputField ?? "validated_json")}
+                onChange={(event) => updateNodeConfig(node.id, { outputField: event.target.value })}
+              />
+            </Field>
+            <Field label="校验结果字段">
+              <input
+                value={String(node.config.validationField ?? "validation_result")}
+                onChange={(event) => updateNodeConfig(node.id, { validationField: event.target.value })}
+              />
+            </Field>
+          </div>
+        </>
+      )}
       {node.type === "retriever" && (
         <>
           <Field label="绑定 RAG 知识库">
@@ -1070,6 +1197,141 @@ export function Inspector() {
   );
 }
 
+function InputMappingsEditor({ value, onChange }: { value: unknown; onChange: (value: string) => void }) {
+  const rows = parseObjectList(value);
+  const updateRow = (index: number, patch: Record<string, unknown>) => onChange(stringifyObjectList(rows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row))));
+  const addRow = () => onChange(stringifyObjectList([...rows, { name: "input", sourceType: "state", source: "messages", valueType: "string" }]));
+  const removeRow = (index: number) => onChange(stringifyObjectList(rows.filter((_row, rowIndex) => rowIndex !== index)));
+  return (
+    <div className="config-table">
+      <div className="config-table__head">
+        <span>输入映射</span>
+        <button type="button" onClick={addRow}>
+          <Plus size={14} />
+          <span>添加</span>
+        </button>
+      </div>
+      {rows.map((row, index) => (
+        <div className="config-table__row" key={index}>
+          <input value={String(row.name ?? "")} onChange={(event) => updateRow(index, { name: event.target.value })} placeholder="name" />
+          <select value={String(row.sourceType ?? "state")} onChange={(event) => updateRow(index, { sourceType: event.target.value })}>
+            <option value="state">state</option>
+            <option value="template">template</option>
+            <option value="literal">literal</option>
+            <option value="json">json</option>
+          </select>
+          <input value={String(row.source ?? "")} onChange={(event) => updateRow(index, { source: event.target.value })} placeholder="messages 或 {{ state.messages }}" />
+          <select value={String(row.valueType ?? "auto")} onChange={(event) => updateRow(index, { valueType: event.target.value })}>
+            <option value="auto">auto</option>
+            <option value="string">string</option>
+            <option value="number">number</option>
+            <option value="integer">integer</option>
+            <option value="boolean">boolean</option>
+            <option value="json">json</option>
+          </select>
+          <button className="icon-only" type="button" onClick={() => removeRow(index)} title="删除映射">
+            <Trash2 size={14} />
+          </button>
+        </div>
+      ))}
+      {rows.length === 0 ? <small className="model-config-note">未配置时节点仍可直接读取 state。</small> : null}
+    </div>
+  );
+}
+
+function AssignmentsEditor({ value, onChange }: { value: unknown; onChange: (value: string) => void }) {
+  const rows = parseObjectList(value);
+  const updateRow = (index: number, patch: Record<string, unknown>) => onChange(stringifyObjectList(rows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row))));
+  const addRow = () => onChange(stringifyObjectList([...rows, { target: "assigned_value", operation: "overwrite", sourceType: "template", source: "{{ state.messages }}", valueType: "string" }]));
+  const removeRow = (index: number) => onChange(stringifyObjectList(rows.filter((_row, rowIndex) => rowIndex !== index)));
+  return (
+    <div className="config-table">
+      <div className="config-table__head">
+        <span>赋值规则</span>
+        <button type="button" onClick={addRow}>
+          <Plus size={14} />
+          <span>添加</span>
+        </button>
+      </div>
+      {rows.map((row, index) => (
+        <div className="config-table__row config-table__row--assignment" key={index}>
+          <input value={String(row.target ?? "")} onChange={(event) => updateRow(index, { target: event.target.value })} placeholder="target field" />
+          <select value={String(row.operation ?? "overwrite")} onChange={(event) => updateRow(index, { operation: event.target.value })}>
+            <option value="overwrite">overwrite</option>
+            <option value="append">append</option>
+            <option value="merge">merge</option>
+            <option value="clear">clear</option>
+          </select>
+          <select value={String(row.sourceType ?? "template")} onChange={(event) => updateRow(index, { sourceType: event.target.value })}>
+            <option value="state">state</option>
+            <option value="template">template</option>
+            <option value="literal">literal</option>
+            <option value="json">json</option>
+            <option value="input">input</option>
+          </select>
+          <input value={String(row.source ?? "")} onChange={(event) => updateRow(index, { source: event.target.value })} placeholder="source" />
+          <select value={String(row.valueType ?? "auto")} onChange={(event) => updateRow(index, { valueType: event.target.value })}>
+            <option value="auto">auto</option>
+            <option value="string">string</option>
+            <option value="number">number</option>
+            <option value="integer">integer</option>
+            <option value="boolean">boolean</option>
+            <option value="json">json</option>
+          </select>
+          <button className="icon-only" type="button" onClick={() => removeRow(index)} title="删除赋值">
+            <Trash2 size={14} />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SchemaFieldsEditor({ value, onChange }: { value: unknown; onChange: (value: string) => void }) {
+  const rows = parseObjectList(value);
+  const updateRow = (index: number, patch: Record<string, unknown>) => onChange(stringifyObjectList(rows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row))));
+  const addRow = () => onChange(stringifyObjectList([...rows, { name: "field", type: "string", required: false, description: "" }]));
+  const removeRow = (index: number) => onChange(stringifyObjectList(rows.filter((_row, rowIndex) => rowIndex !== index)));
+  return (
+    <div className="config-table">
+      <div className="config-table__head">
+        <span>Schema 字段</span>
+        <button type="button" onClick={addRow}>
+          <Plus size={14} />
+          <span>添加</span>
+        </button>
+      </div>
+      {rows.map((row, index) => (
+        <div className="config-table__row config-table__row--schema" key={index}>
+          <input value={String(row.name ?? "")} onChange={(event) => updateRow(index, { name: event.target.value })} placeholder="字段名" />
+          <select value={String(row.type ?? "string")} onChange={(event) => updateRow(index, { type: event.target.value })}>
+            <option value="string">string</option>
+            <option value="number">number</option>
+            <option value="integer">integer</option>
+            <option value="boolean">boolean</option>
+            <option value="object">object</option>
+            <option value="array">array</option>
+          </select>
+          <label className="checkbox-row config-table__checkbox">
+            <input type="checkbox" checked={Boolean(row.required)} onChange={(event) => updateRow(index, { required: event.target.checked })} />
+            <span>必填</span>
+          </label>
+          <input value={String(row.description ?? "")} onChange={(event) => updateRow(index, { description: event.target.value })} placeholder="描述" />
+          <input value={String(row.enumValues ?? "")} onChange={(event) => updateRow(index, { enumValues: event.target.value })} placeholder="枚举，可选" />
+          <button className="icon-only" type="button" onClick={() => removeRow(index)} title="删除字段">
+            <Trash2 size={14} />
+          </button>
+        </div>
+      ))}
+      {rows.length === 0 ? <small className="model-config-note">至少添加一个字段，Extractor/Validator 才能校验输出。</small> : null}
+    </div>
+  );
+}
+
+function stringifyObjectList(rows: Array<Record<string, unknown>>): string {
+  return JSON.stringify(rows, null, 2);
+}
+
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="field">
@@ -1450,6 +1712,24 @@ function parseStringList(value: unknown): string[] {
   }
 }
 
+function parseObjectList(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+  }
+  if (value && typeof value === "object") return [value as Record<string, unknown>];
+  const text = String(value ?? "").trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+    }
+    return parsed && typeof parsed === "object" ? [parsed as Record<string, unknown>] : [];
+  } catch {
+    return [];
+  }
+}
+
 function parseMcpToolList(value: unknown): McpToolInspection[] {
   if (Array.isArray(value)) {
     return value.filter(isMcpToolInspection);
@@ -1597,6 +1877,30 @@ function detectStateFieldsFromNodes(nodes: NodeIR[]): DetectedStateField[] {
       }
       case "retriever":
         fields.push(detectedFieldFromConfig(node, "outputField", "retrieved_context", "str", "检索结果"));
+        break;
+      case "variable_assign":
+        fields.push(detectedFieldFromConfig(node, "resultField", "assignment_result", "dict", "赋值摘要"));
+        for (const assignment of parseObjectList(node.config.assignmentsJson)) {
+          const target = normalizeStateFieldName(assignment.target ?? assignment.field ?? assignment.name);
+          if (target) fields.push(detectedField(node, target.split(".")[0], "Any", "赋值写入字段"));
+        }
+        break;
+      case "template":
+        fields.push(detectedFieldFromConfig(node, "outputField", "template_result", String(node.config.outputType ?? "text") === "json" ? "dict" : "str", "模板输出"));
+        break;
+      case "json_extractor":
+        fields.push(detectedFieldFromConfig(node, "outputField", "extracted_json", "dict", "JSON 抽取结果"));
+        fields.push(detectedFieldFromConfig(node, "validationField", "validation_result", "dict", "JSON 校验结果"));
+        break;
+      case "json_validator":
+        fields.push(detectedFieldFromConfig(node, "outputField", "validated_json", "dict", "JSON 校验输出"));
+        fields.push(detectedFieldFromConfig(node, "validationField", "validation_result", "dict", "JSON 校验结果"));
+        break;
+      case "task_splitter":
+        fields.push(detectedFieldFromConfig(node, "outputField", "worker_tasks", "list", "任务列表"));
+        break;
+      case "parallel_tools":
+        fields.push(detectedFieldFromConfig(node, "outputField", "worker_results", "list", "Worker 结果"));
         break;
       case "ai_router":
         fields.push(detectedFieldFromConfig(node, "routeField", "route_key", "str", "路由结果"));

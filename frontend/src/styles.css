@@ -2980,6 +2980,56 @@ button.icon-only {
   line-height: 1.4;
 }
 
+.config-table {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.config-table__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.config-table__head button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.config-table__row {
+  display: grid;
+  grid-template-columns: minmax(86px, 0.8fr) minmax(94px, 0.8fr) minmax(150px, 1.3fr) minmax(86px, 0.75fr) 36px;
+  gap: 7px;
+  align-items: center;
+}
+
+.config-table__row--assignment {
+  grid-template-columns: minmax(92px, 0.8fr) minmax(96px, 0.7fr) minmax(94px, 0.7fr) minmax(150px, 1.2fr) minmax(86px, 0.7fr) 36px;
+}
+
+.config-table__row--schema {
+  grid-template-columns: minmax(92px, 0.9fr) minmax(96px, 0.7fr) 82px minmax(130px, 1.1fr) minmax(110px, 0.9fr) 36px;
+}
+
+.config-table__row input,
+.config-table__row select {
+  min-width: 0;
+}
+
+.config-table__checkbox {
+  margin: 0;
+  min-height: 38px;
+  align-items: center;
+}
+
 .api-key-source {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -5121,6 +5171,9 @@ button.primary-danger:hover {
   .model-extra-row,
   .model-row,
   .rag-path-import,
+  .config-table__row,
+  .config-table__row--assignment,
+  .config-table__row--schema,
   .inline-grid {
     grid-template-columns: 1fr;
   }

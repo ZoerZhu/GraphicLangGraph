@@ -178,6 +178,98 @@ def test_codegen_exports_mcp_node_model_tool_selection():
     assert "_run_mcp_node_auto_call" in nodes_py
     assert "_select_mcp_tool_with_model" in nodes_py
     assert "web_search_exa" in nodes_py
+
+
+def test_codegen_exports_workflow_core_data_shaping_nodes():
+    project = create_default_project("Workflow Core Export")
+    project.state.fields.extend(
+        [
+            StateField(name="assigned_value", type="str"),
+            StateField(name="assignment_result", type="dict"),
+            StateField(name="template_result", type="dict"),
+            StateField(name="validated_json", type="dict"),
+            StateField(name="validation_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    schema_fields = json.dumps([{"name": "message", "type": "string", "required": True, "description": "消息"}])
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="assign_1",
+                type=NodeType.VARIABLE_ASSIGN,
+                label="Assign",
+                config={
+                    "assignmentsJson": json.dumps([{"target": "assigned_value", "operation": "overwrite", "sourceType": "state", "source": "messages", "valueType": "string"}]),
+                    "resultField": "assignment_result",
+                },
+            ),
+            NodeIR(id="template_1", type=NodeType.TEMPLATE, label="Template", config={"template": '{"message":"{{ state.assigned_value }}"}', "outputType": "json", "outputField": "template_result"}),
+            NodeIR(
+                id="validator_1",
+                type=NodeType.JSON_VALIDATOR,
+                label="Validator",
+                config={"inputField": "template_result", "schemaFieldsJson": schema_fields, "outputField": "validated_json", "validationField": "validation_result"},
+                outputs=[
+                    {"id": "valid", "type": "condition", "label": "valid"},
+                    {"id": "invalid", "type": "condition", "label": "invalid"},
+                ],
+            ),
+            NodeIR(id="reply_valid", type=NodeType.DIRECT_REPLY, label="Valid Reply", config={"template": "{{ state.validated_json }}", "outputField": "final_answer"}),
+            NodeIR(id="reply_invalid", type=NodeType.DIRECT_REPLY, label="Invalid Reply", config={"template": "invalid", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="assign_1"),
+            EdgeIR(id="e2", source="assign_1", target="template_1"),
+            EdgeIR(id="e3", source="template_1", target="validator_1"),
+            EdgeIR(id="e4", source="validator_1", target="reply_valid", kind=EdgeKind.CONDITIONAL, sourceHandle="valid"),
+            EdgeIR(id="e5", source="validator_1", target="reply_invalid", kind=EdgeKind.CONDITIONAL, sourceHandle="invalid"),
+        ]
+    )
+
+    export_id, zip_path, files, smoke_test = export_project_zip(project)
+    generated = generate_project_files(project)
+    nodes_py = next(value for path, value in generated.items() if path.endswith("/nodes.py"))
+    routers_py = next(value for path, value in generated.items() if path.endswith("/routers.py"))
+
+    assert export_id
+    assert zip_path.exists()
+    assert smoke_test.passed
+    assert "_run_variable_assign" in nodes_py
+    assert "_validation_result" in nodes_py
+    assert "def route_validator_1" in routers_py
+    assert "valid" in routers_py and "invalid" in routers_py
+    compile(nodes_py, "nodes.py", "exec")
+    compile(routers_py, "routers.py", "exec")
+
+
+def test_codegen_exports_json_extractor_model_call():
+    project = create_default_project("Extractor Export")
+    project.state.fields.extend([StateField(name="extracted_json", type="dict"), StateField(name="validation_result", type="dict")])
+    project.nodes.append(
+        NodeIR(
+            id="extract_1",
+            type=NodeType.JSON_EXTRACTOR,
+            label="Extractor",
+            config={
+                "schemaFieldsJson": json.dumps([{"name": "tasks", "type": "array", "required": True}]),
+                "outputField": "extracted_json",
+                "validationField": "validation_result",
+                "instruction": "抽取任务",
+            },
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="extract_1"))
+
+    files = generate_project_files(project)
+    nodes_py = next(value for path, value in files.items() if path.endswith("/nodes.py"))
+
+    assert "_json_extractor_system_prompt" in nodes_py
+    assert "_parse_json_object_from_text" in nodes_py
+    assert '"tasks"' in nodes_py
+    compile(nodes_py, "nodes.py", "exec")
     assert "OPENAI_API_KEY=replace_me" in files[".env.example"]
     compile(nodes_py, "nodes.py", "exec")
 

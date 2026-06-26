@@ -921,6 +921,162 @@ def test_tools_agent_task_plan_tool_outputs_splitter_tasks(monkeypatch):
     assert state["task_plan_tool_calls"][0]["tool"] == "task_plan"
 
 
+def test_workflow_core_variable_assign_and_template_live_run():
+    project = create_default_project("Workflow Core")
+    project.state.fields.extend(
+        [
+            StateField(name="assigned_value", type="str"),
+            StateField(name="list_value", type="list"),
+            StateField(name="merged_value", type="dict"),
+            StateField(name="assignment_result", type="dict"),
+            StateField(name="template_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="assign",
+                type=NodeType.VARIABLE_ASSIGN,
+                label="Variable Assign",
+                config={
+                    "assignmentsJson": json.dumps(
+                        [
+                            {"target": "assigned_value", "operation": "overwrite", "sourceType": "state", "source": "messages", "valueType": "string"},
+                            {"target": "list_value", "operation": "append", "sourceType": "literal", "source": "item", "valueType": "string"},
+                            {"target": "merged_value", "operation": "merge", "sourceType": "json", "source": '{"ok": true}', "valueType": "json"},
+                        ]
+                    ),
+                    "resultField": "assignment_result",
+                },
+            ),
+            NodeIR(
+                id="template",
+                type=NodeType.TEMPLATE,
+                label="Template",
+                config={
+                    "template": '{"message":"{{ state.assigned_value }}","ok":true}',
+                    "outputType": "json",
+                    "outputField": "template_result",
+                },
+            ),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="回复", config={"template": "{{ state.template_result }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend([EdgeIR(id="e1", source="start", target="assign"), EdgeIR(id="e2", source="assign", target="template"), EdgeIR(id="e3", source="template", target="reply")])
+
+    trace, state = preview.run_project_preview(project, {"messages": "hello"}, "live")
+
+    assert [item["status"] for item in trace] == ["ok", "ok", "ok"]
+    assert state["assigned_value"] == "hello"
+    assert state["list_value"] == ["item"]
+    assert state["merged_value"] == {"ok": True}
+    assert state["assignment_result"]["changedFields"] == ["assigned_value", "list_value", "merged_value"]
+    assert state["template_result"] == {"message": "hello", "ok": True}
+
+
+def test_json_extractor_valid_branch_feeds_task_splitter(monkeypatch):
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        return FakeResponse(json.dumps({"tasks": [{"title": "分析入口", "goal": "阅读入口文件"}]}, ensure_ascii=False))
+
+    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+
+    project = create_default_project("Extractor Tasks")
+    project.state.fields.extend(
+        [
+            StateField(name="extracted_json", type="dict"),
+            StateField(name="validation_result", type="dict"),
+            StateField(name="worker_tasks", type="list"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    schema_fields = json.dumps([{"name": "tasks", "type": "array", "required": True, "description": "任务数组"}])
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="extract",
+                type=NodeType.JSON_EXTRACTOR,
+                label="JSON Extractor",
+                config={
+                    "inputText": "{{ state.messages }}",
+                    "schemaFieldsJson": schema_fields,
+                    "outputField": "extracted_json",
+                    "validationField": "validation_result",
+                },
+                outputs=[
+                    {"id": "valid", "type": "condition", "label": "valid"},
+                    {"id": "invalid", "type": "condition", "label": "invalid"},
+                ],
+            ),
+            NodeIR(id="splitter", type=NodeType.TASK_SPLITTER, label="Task Splitter", config={"inputField": "extracted_json", "outputField": "worker_tasks", "maxTasks": 5, "fallbackToSingleTask": False}),
+            NodeIR(id="reply_valid", type=NodeType.DIRECT_REPLY, label="回复", config={"template": "{{ state.worker_tasks }}", "outputField": "final_answer"}),
+            NodeIR(id="reply_invalid", type=NodeType.DIRECT_REPLY, label="无效回复", config={"template": "invalid", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="extract"),
+            EdgeIR(id="e2", source="extract", target="splitter", kind=EdgeKind.CONDITIONAL, sourceHandle="valid"),
+            EdgeIR(id="e3", source="extract", target="reply_invalid", kind=EdgeKind.CONDITIONAL, sourceHandle="invalid"),
+            EdgeIR(id="e4", source="splitter", target="reply_valid"),
+        ]
+    )
+
+    trace, state = preview.run_project_preview(project, {"messages": "拆分任务"}, "live")
+
+    assert [item["nodeId"] for item in trace] == ["extract", "splitter", "reply_valid"]
+    assert state["validation_result"]["valid"] is True
+    assert state["worker_tasks"][0]["title"] == "分析入口"
+
+
+def test_json_validator_invalid_branch_is_business_route():
+    project = create_default_project("Validator Invalid")
+    project.state.fields.extend(
+        [
+            StateField(name="candidate", type="dict"),
+            StateField(name="validated_json", type="dict"),
+            StateField(name="validation_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    schema_fields = json.dumps([{"name": "tasks", "type": "array", "required": True, "description": "任务数组"}])
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="validator",
+                type=NodeType.JSON_VALIDATOR,
+                label="JSON Validator",
+                config={
+                    "inputField": "candidate",
+                    "schemaFieldsJson": schema_fields,
+                    "outputField": "validated_json",
+                    "validationField": "validation_result",
+                },
+                outputs=[
+                    {"id": "valid", "type": "condition", "label": "valid"},
+                    {"id": "invalid", "type": "condition", "label": "invalid"},
+                ],
+            ),
+            NodeIR(id="reply_valid", type=NodeType.DIRECT_REPLY, label="有效回复", config={"template": "valid", "outputField": "final_answer"}),
+            NodeIR(id="reply_invalid", type=NodeType.DIRECT_REPLY, label="无效回复", config={"template": "invalid", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="validator"),
+            EdgeIR(id="e2", source="validator", target="reply_valid", kind=EdgeKind.CONDITIONAL, sourceHandle="valid"),
+            EdgeIR(id="e3", source="validator", target="reply_invalid", kind=EdgeKind.CONDITIONAL, sourceHandle="invalid"),
+        ]
+    )
+
+    trace, state = preview.run_project_preview(project, {"messages": "x", "candidate": {"tasks": "not a list"}}, "live")
+
+    assert [item["nodeId"] for item in trace] == ["validator", "reply_invalid"]
+    assert trace[0]["status"] == "ok"
+    assert state["validation_result"]["valid"] is False
+    assert state["final_answer"] == "invalid"
+
+
 def test_builtin_read_file_respects_runtime_allowed_roots(tmp_path: Path):
     allowed = tmp_path / "allowed"
     allowed.mkdir()

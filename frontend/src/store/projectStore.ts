@@ -2047,6 +2047,7 @@ function stateWriteKeysForNodeType(type: NodeType): string[] {
     case "tool":
     case "task_splitter":
     case "parallel_tools":
+    case "template":
     case "retriever":
     case "http":
     case "direct_reply":
@@ -2054,6 +2055,11 @@ function stateWriteKeysForNodeType(type: NodeType): string[] {
     case "skill_node":
     case "mcp_node":
       return ["outputField"];
+    case "variable_assign":
+      return ["resultField"];
+    case "json_extractor":
+    case "json_validator":
+      return ["outputField", "validationField"];
     default:
       return [];
   }
@@ -2076,6 +2082,14 @@ function defaultWriteFieldName(type: NodeType, key: string): string {
       return "worker_tasks";
     case "parallel_tools":
       return "worker_results";
+    case "variable_assign":
+      return "assignment_result";
+    case "template":
+      return "template_result";
+    case "json_extractor":
+      return key === "validationField" ? "validation_result" : "extracted_json";
+    case "json_validator":
+      return key === "validationField" ? "validation_result" : "validated_json";
     case "retriever":
       return "retrieved_context";
     case "http":
@@ -2100,6 +2114,24 @@ function parseJsonStringList(value: unknown): string[] {
     return Array.isArray(parsed) ? parsed.map((item) => String(item).trim()).filter(Boolean) : [];
   } catch {
     return text.split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean);
+  }
+}
+
+function parseJsonObjectList(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+  }
+  if (value && typeof value === "object") return [value as Record<string, unknown>];
+  const text = String(value ?? "").trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+    }
+    return parsed && typeof parsed === "object" ? [parsed as Record<string, unknown>] : [];
+  } catch {
+    return [];
   }
 }
 
@@ -2139,6 +2171,26 @@ function stateFieldsForNode(node: NodeIR): StateField[] {
       return [stateFieldFromConfig(config, "outputField", "worker_tasks", "list", `${node.label} 任务列表`)];
     case "parallel_tools":
       return [stateFieldFromConfig(config, "outputField", "worker_results", "list", `${node.label} Worker 结果`)];
+    case "variable_assign": {
+      const fields = [stateFieldFromConfig(config, "resultField", "assignment_result", "dict", `${node.label} 赋值摘要`)];
+      for (const assignment of parseJsonObjectList(config.assignmentsJson)) {
+        const target = normalizeFieldName(assignment.target ?? assignment.field ?? assignment.name);
+        if (target) fields.push({ name: target.split(".")[0], type: "Any", description: `${node.label} 写入字段` });
+      }
+      return fields;
+    }
+    case "template":
+      return [stateFieldFromConfig(config, "outputField", "template_result", String(config.outputType ?? "text") === "json" ? "dict" : "str", `${node.label} 输出`)];
+    case "json_extractor":
+      return [
+        stateFieldFromConfig(config, "outputField", "extracted_json", "dict", `${node.label} 抽取结果`),
+        stateFieldFromConfig(config, "validationField", "validation_result", "dict", `${node.label} 校验结果`),
+      ];
+    case "json_validator":
+      return [
+        stateFieldFromConfig(config, "outputField", "validated_json", "dict", `${node.label} 校验输出`),
+        stateFieldFromConfig(config, "validationField", "validation_result", "dict", `${node.label} 校验结果`),
+      ];
     case "retriever":
       return [stateFieldFromConfig(config, "outputField", "retrieved_context", "str", `${node.label} 检索结果`)];
     case "ai_router":
