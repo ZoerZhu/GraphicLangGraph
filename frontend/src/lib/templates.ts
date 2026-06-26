@@ -5,6 +5,7 @@ export interface ProjectTemplate {
   name: string;
   description: string;
   kind: "agent" | "agents";
+  sampleInput?: Record<string, unknown>;
   fields: StateField[];
   nodes: NodeIR[];
   edges: EdgeIR[];
@@ -183,6 +184,9 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     name: "并发任务处理 Flow Control v2",
     description: "校验 Task Plan，并发 ForEach 处理每个任务，收集单项错误，Merge 聚合结果后直接回复。",
     kind: "agent",
+    sampleInput: {
+      messages: "请把这次验收拆成三个任务：检查数据输入、处理每个任务、汇总结果。",
+    },
     fields: [
       { name: "task_plan", type: "dict", description: "结构化任务规划" },
       { name: "extract_validation", type: "dict", description: "抽取阶段校验结果" },

@@ -26,7 +26,7 @@ export function TemplatePanel() {
             <div>
               <strong>{template.name}</strong>
               <p>{template.description}</p>
-              <small>{template.nodes.length} 节点 · {template.edges.length} 连线</small>
+              <small>{template.nodes.length} 节点 · {template.edges.length} 连线{template.sampleInput ? " · 含样例输入" : ""}</small>
             </div>
             <button className="primary" onClick={() => void applyTemplate(template.id)} type="button">
               应用

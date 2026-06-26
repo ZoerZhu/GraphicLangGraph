@@ -1649,6 +1649,80 @@ def test_parallel_for_each_stream_preserves_child_trace():
     assert any(item["nodeId"] == "each" and item.get("parallel") is True for item in run_end["trace"])
 
 
+def test_stream_for_each_parent_timeout_fallback_continues(monkeypatch):
+    project = create_default_project("Stream ForEach Timeout")
+    project.state.fields.extend(
+        [
+            StateField(name="items", type="list"),
+            StateField(name="item_result", type="dict"),
+            StateField(name="merged_results", type="list"),
+            StateField(name="merge_result", type="dict"),
+            StateField(name="fallback_result", type="str"),
+            StateField(name="node_error", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="each",
+                type=NodeType.FOR_EACH,
+                label="ForEach",
+                config={
+                    "itemsField": "items",
+                    "itemField": "current_item",
+                    "indexField": "current_index",
+                    "nodeTimeoutSec": 0.01,
+                    "errorPolicy": "fallback",
+                    "fallbackOutputJson": json.dumps({"fallback_result": "foreach timeout"}),
+                    "errorOutputField": "node_error",
+                },
+            ),
+            NodeIR(id="slow_http", type=NodeType.HTTP, label="Slow HTTP", config={"method": "GET", "url": "https://example.com/slow", "mockResponseJson": "", "outputField": "item_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.fallback_result }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="slow_http", sourceHandle="item"),
+            EdgeIR(id="e3", source="slow_http", target="merge"),
+            EdgeIR(id="e4", source="merge", target="reply"),
+        ]
+    )
+
+    class FakeHttpResponse:
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True}
+
+    def fake_request(*_args, **_kwargs):
+        import time
+
+        time.sleep(0.05)
+        return FakeHttpResponse()
+
+    monkeypatch.setattr(preview.httpx, "request", fake_request)
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ["a"]}, "live"))
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    each_trace = next(item for item in run_end["trace"] if item["nodeId"] == "each")
+
+    assert any(event.get("event") == "node_start" and event.get("nodeId") == "slow_http" for event in events)
+    assert each_trace["status"] == "ok"
+    assert each_trace["errorPolicy"] == "fallback"
+    assert each_trace["timeoutSec"] == 0.01
+    assert each_trace["attempts"][0]["errorType"] == "timeout"
+    assert run_end["outputState"]["fallback_result"] == "foreach timeout"
+    assert run_end["outputState"]["node_error"]["errorType"] == "timeout"
+    assert run_end["outputState"]["final_answer"] == "foreach timeout"
+
+
 def test_branch_merge_merges_current_branch_state():
     project = create_default_project("Branch Merge")
     project.state.fields.extend(

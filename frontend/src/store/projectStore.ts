@@ -1038,6 +1038,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     const historyRecords = recordProjectHistory(saved, `应用模板：${template.name}`);
     set({
       project: saved,
+      runInput: template.sampleInput ? JSON.stringify(template.sampleInput, null, 2) : get().runInput,
       selectedNodeId: null,
       pendingConnection: null,
       validation: null,

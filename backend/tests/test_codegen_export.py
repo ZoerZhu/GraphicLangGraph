@@ -1,7 +1,11 @@
 import json
+import os
+import subprocess
+import sys
 import zipfile
 
-from app.compiler import export_project_zip, generate_project_files
+from app.compiler import build_project, export_project_zip, generate_project_files
+from app.compiler.codegen import package_name
 from app.ir.schemas import EdgeIR, EdgeKind, ImportedAgentConfig, MCPServerConfig, NodeIR, NodeType, Position, StateField, ToolConfig, create_default_project
 
 
@@ -498,6 +502,85 @@ def test_codegen_exports_branch_merge_mode():
     assert '"branch"' in nodes_py
     assert '"mergeMode": merge_mode' in nodes_py
     compile(nodes_py, "nodes.py", "exec")
+
+
+def test_exported_flow_control_v2_graph_invokes_smoke():
+    project = create_default_project("Flow Control v2 Invoke Smoke")
+    project.project.id = "flow_control_v2_invoke_smoke"
+    project.state.fields.extend(
+        [
+            StateField(name="items", type="list"),
+            StateField(name="current_item", type="str"),
+            StateField(name="current_index", type="int"),
+            StateField(name="item_result", type="str"),
+            StateField(name="merged_results", type="list"),
+            StateField(name="merge_result", type="dict"),
+            StateField(name="route", type="str"),
+            StateField(name="branch_result", type="str"),
+            StateField(name="merged_branch", type="str"),
+            StateField(name="branch_merge_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="each",
+                type=NodeType.FOR_EACH,
+                label="ForEach",
+                config={
+                    "itemsField": "items",
+                    "itemField": "current_item",
+                    "indexField": "current_index",
+                    "executionMode": "parallel",
+                    "maxConcurrency": 2,
+                    "preserveOrder": True,
+                    "itemFailurePolicy": "collect_errors",
+                    "retryPolicyJson": json.dumps({"enabled": True, "maxRetries": 1, "backoffMs": 0}),
+                    "resultField": "for_each_result",
+                },
+            ),
+            NodeIR(id="item_template", type=NodeType.TEMPLATE, label="Item", config={"template": "{{ state.current_item }}", "outputType": "text", "outputField": "item_result"}),
+            NodeIR(id="foreach_merge", type=NodeType.MERGE, label="ForEach Merge", config={"mergeMode": "for_each", "reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+            NodeIR(id="condition", type=NodeType.CONDITION, label="Condition", config={"field": "route", "operator": "equals", "value": "a", "trueBranch": "true", "falseBranch": "false", "fallback": "false"}),
+            NodeIR(id="branch_a", type=NodeType.TEMPLATE, label="A", config={"template": "A", "outputType": "text", "outputField": "branch_result"}),
+            NodeIR(id="branch_b", type=NodeType.TEMPLATE, label="B", config={"template": "B", "outputType": "text", "outputField": "branch_result"}),
+            NodeIR(id="branch_merge", type=NodeType.MERGE, label="Branch Merge", config={"mergeMode": "branch", "reducersJson": json.dumps([{"target": "merged_branch", "source": "branch_result", "reducer": "overwrite"}]), "resultField": "branch_merge_result"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_branch }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="item_template", sourceHandle="item"),
+            EdgeIR(id="e3", source="item_template", target="foreach_merge"),
+            EdgeIR(id="e4", source="foreach_merge", target="condition"),
+            EdgeIR(id="e5", source="condition", target="branch_a", kind=EdgeKind.CONDITIONAL, sourceHandle="true"),
+            EdgeIR(id="e6", source="condition", target="branch_b", kind=EdgeKind.CONDITIONAL, sourceHandle="false"),
+            EdgeIR(id="e7", source="branch_a", target="branch_merge"),
+            EdgeIR(id="e8", source="branch_b", target="branch_merge"),
+            EdgeIR(id="e9", source="branch_merge", target="reply"),
+        ]
+    )
+
+    build_dir, files = build_project(project)
+    package = package_name(project)
+    script = f"""
+from {package}.graph import graph
+
+result = graph.invoke({{"messages": "run", "items": ["a", "b"], "route": "b"}})
+assert result["merged_results"] == ["a", "b"], result
+assert result["merge_result"]["mergeMode"] == "for_each", result
+assert result["branch_merge_result"]["mergeMode"] == "branch", result
+assert result["merged_branch"] == "B", result
+assert result["final_answer"] == "B", result
+"""
+
+    env = {**os.environ, "PYTHONPATH": str(build_dir / "src")}
+    completed = subprocess.run([sys.executable, "-c", script], cwd=build_dir, env=env, capture_output=True, text=True, timeout=30, check=False)
+
+    assert "tests/test_graph_smoke.py" in files
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_codegen_embeds_agent_ref_project(monkeypatch):

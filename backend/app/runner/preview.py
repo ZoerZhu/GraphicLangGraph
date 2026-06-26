@@ -364,11 +364,16 @@ def _walk_project_events(
         trace_meta: dict[str, Any] = {}
         try:
             if mode == "live" and node.type == NodeType.PARALLEL_TOOLS:
-                delta, detail = yield from _execute_live_parallel_tools_events(project, node, state, model_config, runtime_environment, tools)
-                trace_meta = _successful_policy_trace_meta(node, [])
+                def run_parallel_tools_stream():
+                    stream_delta, stream_detail = yield from _execute_live_parallel_tools_events(project, node, state, model_config, runtime_environment, tools)
+                    return stream_delta, stream_detail, []
+
+                delta, detail, child_trace_items, trace_meta = yield from _execute_stream_node_with_policy(node, state, run_parallel_tools_stream)
             elif mode == "live" and node.type == NodeType.FOR_EACH:
-                delta, detail, child_trace_items = yield from _execute_for_each_node_events(project, node, state, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
-                trace_meta = _successful_policy_trace_meta(node, [])
+                def run_for_each_stream():
+                    return (yield from _execute_for_each_node_events(project, node, state, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth))
+
+                delta, detail, child_trace_items, trace_meta = yield from _execute_stream_node_with_policy(node, state, run_for_each_stream)
             else:
                 delta, detail, trace_meta = _execute_node_with_policy(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             state.update(delta)
@@ -530,6 +535,103 @@ def _call_node_with_timeout(fn, timeout_sec: float | None) -> tuple[dict[str, An
     except FutureTimeoutError as exc:
         future.cancel()
         raise NodeTimeoutError(f"节点执行超过 {timeout_sec}s。") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _execute_stream_node_with_policy(
+    node: NodeIR,
+    state: dict[str, Any],
+    stream_factory,
+):
+    policy = _node_runtime_policy(node.config)
+    attempts: list[dict[str, Any]] = []
+    max_attempts = 1 + (policy["maxRetries"] if policy["retryEnabled"] else 0)
+    last_exc: Exception | None = None
+    for attempt_index in range(1, max_attempts + 1):
+        started = time.perf_counter()
+        try:
+            delta, detail, child_trace_items = yield from _call_stream_with_timeout(stream_factory, policy["timeoutSec"])
+            attempts.append(
+                {
+                    "attempt": attempt_index,
+                    "status": "ok",
+                    "durationMs": round((time.perf_counter() - started) * 1000, 2),
+                }
+            )
+            if attempt_index > 1:
+                detail = f"{detail}；重试第 {attempt_index} 次后成功。"
+            return delta, detail, child_trace_items or [], _successful_policy_trace_meta(node, attempts)
+        except Exception as exc:
+            last_exc = exc
+            error_type = _policy_error_type(exc)
+            attempts.append(
+                {
+                    "attempt": attempt_index,
+                    "status": "error",
+                    "durationMs": round((time.perf_counter() - started) * 1000, 2),
+                    "errorType": error_type,
+                    "message": str(exc),
+                }
+            )
+            if attempt_index < max_attempts and _should_retry_error(policy, error_type, exc):
+                backoff_ms = min(max(policy["backoffMs"], 0) * attempt_index, 5000)
+                if backoff_ms:
+                    time.sleep(backoff_ms / 1000)
+                continue
+            break
+    assert last_exc is not None
+    payload = _runtime_error_payload(node, last_exc)
+    payload["attempts"] = attempts
+    payload["errorPolicy"] = policy["errorPolicy"]
+    if policy["timeoutSec"]:
+        payload["timeoutSec"] = policy["timeoutSec"]
+    if policy["errorPolicy"] == "fallback":
+        delta = _fallback_policy_delta(node, state, policy, payload)
+        return delta, f"{payload['errorType']}: {payload['message']}；已按 fallback 策略继续。", [], _failed_policy_trace_meta(node, attempts, policy)
+    if policy["errorPolicy"] == "continue":
+        field = policy["errorOutputField"] or "last_error"
+        return {field: payload}, f"{payload['errorType']}: {payload['message']}；已按 continue 策略继续。", [], _failed_policy_trace_meta(node, attempts, policy)
+    raise NodePolicyError(node, last_exc, payload, attempts, policy)
+
+
+def _call_stream_with_timeout(stream_factory, timeout_sec: float | None):
+    if not timeout_sec:
+        return (yield from stream_factory())
+    event_queue: Queue[tuple[str, Any]] = Queue()
+
+    def pump() -> None:
+        try:
+            generator = stream_factory()
+            while True:
+                try:
+                    event_queue.put(("event", next(generator)))
+                except StopIteration as stop:
+                    event_queue.put(("result", stop.value))
+                    return
+        except Exception as exc:
+            event_queue.put(("error", exc))
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(pump)
+    deadline = time.perf_counter() + timeout_sec
+    try:
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                future.cancel()
+                raise NodeTimeoutError(f"节点执行超过 {timeout_sec}s。")
+            try:
+                kind, payload = event_queue.get(timeout=min(0.05, remaining))
+            except Empty:
+                continue
+            if kind == "event":
+                yield payload
+                continue
+            if kind == "result":
+                return payload
+            if kind == "error":
+                raise payload
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 

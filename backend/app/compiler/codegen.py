@@ -3034,8 +3034,8 @@ def _node_has_runtime_policy(node: NodeIR) -> bool:
 def _wrap_policy_node_function(source: str, function_name: str, node: NodeIR, has_error_edge: bool = False) -> str:
     impl_name = f"_glg_{function_name}_body"
     wrapped_source = source.replace(f"def {function_name}(", f"def {impl_name}(", 1)
-    node_meta = json.dumps({"type": str(node.type), "label": node.label}, ensure_ascii=False)
-    config = json.dumps(node.config, ensure_ascii=False)
+    node_meta = repr({"type": str(node.type), "label": node.label})
+    config = repr(node.config)
     return wrapped_source + f'''
 
 
@@ -3960,6 +3960,30 @@ def _call_node_with_timeout(fn: Any, timeout_sec: float | None) -> dict[str, Any
         raise RuntimeError(f"timeout: 节点执行超过 {timeout_sec}s。") from exc
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _parse_json_object(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _positive_int(value: Any, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+def _positive_float(value: Any, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
 
 
 def _node_runtime_policy(config: dict[str, Any]) -> dict[str, Any]:
