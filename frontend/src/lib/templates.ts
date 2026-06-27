@@ -660,8 +660,8 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     recommendedRunMode: "live",
     requiresModel: true,
     requiresNetwork: false,
-    expectedOutputFields: ["route_key", "route_reason", "order_info", "approval_result", "agent_result", "final_answer"],
-    expectedTraceTypes: ["ai_router", "http", "human_approval", "agent", "direct_reply"],
+    expectedOutputFields: ["route_key", "route_reason"],
+    expectedTraceTypes: ["ai_router", "human_approval"],
     sampleInput: {
       messages: "我要申请退款，订单号是 A20260614001，原因是商品不符合预期。",
       order_id: "A20260614001",
@@ -784,6 +784,17 @@ export function getProjectTemplateDependencyLabels(template: ProjectTemplate): s
     ...(template.requiredRuntimeHosts?.length ? [`Host: ${template.requiredRuntimeHosts.join(", ")}`] : []),
     ...(template.requiredEnvVars?.length ? [`Env: ${template.requiredEnvVars.join(", ")}`] : []),
   ];
+}
+
+export function pickAssistantTemplateId(prompt: string): string {
+  const normalized = prompt.trim();
+  if (/exa|websearch|web search|联网|搜索|网页|mcp/i.test(normalized)) return "websearch_exa_mcp";
+  if (/多.?agent|子.?agent|协作|编排|handoff|agent tool|历史 Agent/i.test(normalized)) return "multi_agent_orchestration";
+  if (/api|json|清洗|校验|订单接口|订单 API/i.test(normalized)) return "api_json_cleanup";
+  if (/并发|foreach|for each|任务处理|task plan|结构化任务|错误兜底|merge|worker/i.test(normalized)) return "flow_control_task_processing";
+  if (/客服|售后|订单|退款/.test(normalized)) return "customer_support";
+  if (/知识库|问答|文档|rag|检索/i.test(normalized)) return "knowledge_qa";
+  return "knowledge_qa";
 }
 
 function node(

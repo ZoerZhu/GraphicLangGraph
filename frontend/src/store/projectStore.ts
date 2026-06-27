@@ -41,7 +41,7 @@ import {
   validateProject,
 } from "../lib/api";
 import { createNode, defaultOutputs } from "../lib/nodeCatalog";
-import { applyTemplateToProject, getProjectTemplateForProject, PROJECT_TEMPLATES, type ProjectTemplate } from "../lib/templates";
+import { applyTemplateToProject, getProjectTemplateForProject, pickAssistantTemplateId, PROJECT_TEMPLATES, type ProjectTemplate } from "../lib/templates";
 import type {
   AgentLinkConfig,
   EdgeIR,
@@ -1823,16 +1823,6 @@ function normalizeSkills(skills: SkillConfig[]): SkillConfig[] {
       metadataJson: String(skill.metadataJson || "{}"),
       enabled: skill.enabled !== false,
     }));
-}
-
-function pickAssistantTemplateId(prompt: string): string {
-  if (/exa|websearch|web search|联网|搜索网页|网页搜索|mcp/i.test(prompt)) return "websearch_exa_mcp";
-  if (/多.?agent|子.?agent|协作|编排|handoff|agent tool|历史 Agent/i.test(prompt)) return "multi_agent_orchestration";
-  if (/api|json|清洗|校验|订单接口|订单 API/i.test(prompt)) return "api_json_cleanup";
-  if (/并发|foreach|for each|任务处理|task plan|结构化任务|错误兜底|merge|worker/i.test(prompt)) return "flow_control_task_processing";
-  if (/客服|售后|订单|退款/.test(prompt)) return "customer_support";
-  if (/知识库|问答|文档|rag|检索/i.test(prompt)) return "knowledge_qa";
-  return "knowledge_qa";
 }
 
 function applyTemplateRuntimeDependencies(project: ProjectIR, template: ProjectTemplate): ProjectIR {

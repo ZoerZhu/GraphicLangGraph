@@ -1,6 +1,6 @@
 import { Send, WandSparkles, X } from "lucide-react";
 import { useState } from "react";
-import { getProjectTemplateDependencyLabels, getProjectTemplateScene, PROJECT_TEMPLATES } from "../lib/templates";
+import { getProjectTemplateDependencyLabels, getProjectTemplateScene, pickAssistantTemplateId, PROJECT_TEMPLATES } from "../lib/templates";
 import { useProjectStore } from "../store/projectStore";
 
 export function AssistantPanel() {
@@ -30,7 +30,10 @@ export function AssistantPanel() {
       <textarea
         rows={7}
         value={prompt}
-        onChange={(event) => setPrompt(event.target.value)}
+        onChange={(event) => {
+          setPrompt(event.target.value);
+          setPreviewTemplateId(null);
+        }}
         placeholder="例如：帮我做一个知识库问答 Agent，先改写问题，再检索文档，最后回答。"
       />
       <div className="assistant-actions">
@@ -70,7 +73,7 @@ export function AssistantPanel() {
         }} type="button">
           并发任务
         </button>
-        <button className="primary" onClick={() => setPreviewTemplateId(pickTemplateId(prompt))} type="button">
+        <button className="primary" onClick={() => setPreviewTemplateId(pickAssistantTemplateId(prompt))} type="button">
           <Send size={15} />
           <span>匹配场景</span>
         </button>
@@ -120,15 +123,4 @@ export function AssistantPanel() {
       ) : null}
     </aside>
   );
-}
-
-function pickTemplateId(prompt: string) {
-  const normalized = prompt.trim();
-  if (/exa|websearch|web search|联网|搜索|网页|mcp/i.test(normalized)) return "websearch_exa_mcp";
-  if (/多.?agent|子.?agent|协作|编排|handoff|agent tool|历史 Agent/i.test(normalized)) return "multi_agent_orchestration";
-  if (/api|json|清洗|校验|订单接口|订单 API/i.test(normalized)) return "api_json_cleanup";
-  if (/并发|foreach|for each|任务处理|task plan|结构化任务|错误兜底|merge/i.test(normalized)) return "flow_control_task_processing";
-  if (/客服|售后|订单|退款/.test(normalized)) return "customer_support";
-  if (/知识库|问答|文档|rag|检索/i.test(normalized)) return "knowledge_qa";
-  return "knowledge_qa";
 }
