@@ -9,6 +9,21 @@ import { FloatingPanel } from "./FloatingPanel";
 import { RunInputEditor, RunModelPicker, RunStartButton } from "./RunControls";
 import { RuntimeValueView } from "./RuntimeValueView";
 
+type TraceFilter = "all" | "errors" | "slow" | "tools" | "mcp" | "agent" | "human" | "flow" | "policy" | "data";
+
+const TRACE_FILTERS: Array<{ id: TraceFilter; label: string }> = [
+  { id: "all", label: "全部" },
+  { id: "errors", label: "错误" },
+  { id: "slow", label: "慢节点" },
+  { id: "tools", label: "Tool" },
+  { id: "mcp", label: "MCP" },
+  { id: "agent", label: "Agent" },
+  { id: "human", label: "Human" },
+  { id: "flow", label: "Flow" },
+  { id: "policy", label: "策略" },
+  { id: "data", label: "数据" },
+];
+
 export function RunPreviewPanel() {
   const open = useProjectStore((state) => state.runOpen);
   const collapsed = useProjectStore((state) => state.runCollapsed);
@@ -494,6 +509,13 @@ function RunResultView({
   selectableNodeIds: Set<string>;
   onSelectNode: (nodeId: string | null) => void;
 }) {
+  const [traceFilter, setTraceFilter] = useState<TraceFilter>("all");
+  const [traceSearch, setTraceSearch] = useState("");
+  const observability = useMemo(() => buildRunObservability(result), [result]);
+  const filteredTrace = useMemo(
+    () => filterTraceItems(result.trace, traceFilter, traceSearch, observability.slowest?.nodeId ?? ""),
+    [result.trace, traceFilter, traceSearch, observability.slowest?.nodeId],
+  );
   return (
     <div className="run-result">
       <div className={`run-valid ${result.valid ? "is-valid" : "is-invalid"}`}>
@@ -516,22 +538,47 @@ function RunResultView({
       ) : null}
 
       {templateAcceptance ? <TemplateAcceptanceSummary result={templateAcceptance} /> : null}
+      <RunObservabilitySummary summary={observability} />
+      <RuntimeCallSummary calls={observability.calls} />
 
       <section className="run-trace-section">
         <div className="run-section-title">
           <strong>节点追踪</strong>
-          <span>{result.trace.length} 个节点</span>
+          <span>{filteredTrace.length}/{result.trace.length} 个节点</span>
+        </div>
+        <div className="trace-filter-bar">
+          <div className="trace-filter-bar__buttons">
+            {TRACE_FILTERS.map((filter) => (
+              <button
+                key={filter.id}
+                className={traceFilter === filter.id ? "is-active" : ""}
+                onClick={() => setTraceFilter(filter.id)}
+                type="button"
+              >
+                {filter.label}
+              </button>
+            ))}
+          </div>
+          <input
+            value={traceSearch}
+            onChange={(event) => setTraceSearch(event.target.value)}
+            placeholder="搜索节点、类型、ID、detail"
+          />
         </div>
         <div className="run-trace">
-          {result.trace.map((item, index) => (
-            <RunTraceCard
-              key={`${item.nodeId}-${index}`}
-              index={index}
-              item={item}
-              selectable={selectableNodeIds.has(item.nodeId)}
-              onSelectNode={onSelectNode}
-            />
-          ))}
+          {filteredTrace.length ? (
+            filteredTrace.map((item, index) => (
+              <RunTraceCard
+                key={`${item.nodeId}-${index}`}
+                index={result.trace.indexOf(item)}
+                item={item}
+                selectable={selectableNodeIds.has(item.nodeId)}
+                onSelectNode={onSelectNode}
+              />
+            ))
+          ) : (
+            <div className="run-empty">没有匹配当前筛选条件的 trace。</div>
+          )}
         </div>
       </section>
 
@@ -545,6 +592,78 @@ function RunResultView({
         </div>
       </section>
     </div>
+  );
+}
+
+function RunObservabilitySummary({ summary }: { summary: RunObservabilitySummaryData }) {
+  const hints = observabilityHints(summary);
+  return (
+    <section className="observability-panel">
+      <div className="run-section-title">
+        <strong>运行观测</strong>
+        <span>{summary.statusLabel}</span>
+      </div>
+      <div className="observability-grid">
+        <ObservabilityMetric label="节点" value={`${summary.nodeCount}`} detail={`${summary.okCount} 成功 / ${summary.errorCount} 失败`} tone={summary.errorCount ? "error" : "ok"} />
+        <ObservabilityMetric label="总耗时" value={`${formatDuration(summary.totalDurationMs)}`} detail={summary.slowest ? `最慢 ${summary.slowest.label}` : "无节点耗时"} />
+        <ObservabilityMetric label="策略" value={`${summary.policyNodeCount}`} detail={`${summary.retryNodeCount} 重试 / ${summary.timeoutNodeCount} 超时`} tone={summary.policyNodeCount ? "warning" : "ok"} />
+        <ObservabilityMetric label="子链路" value={`${summary.childTraceCount}`} detail={`${summary.parallelTraceCount} 并发 trace`} />
+        <ObservabilityMetric label="调用" value={`${summary.calls.length}`} detail={callSummaryLabel(summary.calls)} tone={summary.calls.some((call) => call.ok === false) ? "error" : "neutral"} />
+        <ObservabilityMetric label="状态" value={summary.paused ? "待审批" : summary.failed ? "失败" : "完成"} detail={summary.skippedCount ? `${summary.skippedCount} 跳过` : "无跳过节点"} tone={summary.paused ? "warning" : summary.failed ? "error" : "ok"} />
+      </div>
+      {hints.length ? (
+        <div className="observability-hints">
+          {hints.map((hint) => <span key={hint}>{hint}</span>)}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function ObservabilityMetric({
+  label,
+  value,
+  detail,
+  tone = "neutral",
+}: {
+  label: string;
+  value: string;
+  detail: string;
+  tone?: "neutral" | "ok" | "warning" | "error";
+}) {
+  return (
+    <div className={`observability-metric is-${tone}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </div>
+  );
+}
+
+function RuntimeCallSummary({ calls }: { calls: RuntimeCallRecord[] }) {
+  if (!calls.length) return null;
+  const visible = calls.slice(0, 8);
+  return (
+    <section className="runtime-call-summary">
+      <div className="run-section-title">
+        <strong>调用链</strong>
+        <span>{calls.length} 次 Tool/MCP/Agent 调用</span>
+      </div>
+      <div className="runtime-call-list">
+        {visible.map((call, index) => (
+          <div key={`${call.field}-${index}`} className={`runtime-call-item ${call.ok === false ? "is-error" : ""}`}>
+            <span>{call.source}</span>
+            <strong>{call.name}</strong>
+            <small>
+              {call.durationMs != null ? `${formatDuration(call.durationMs)}` : "无耗时"}
+              {call.errorType ? ` · ${call.errorType}` : ""}
+              {call.field ? ` · ${call.field}` : ""}
+            </small>
+          </div>
+        ))}
+      </div>
+      {calls.length > visible.length ? <small className="runtime-call-summary__more">还有 {calls.length - visible.length} 次调用未展开。</small> : null}
+    </section>
   );
 }
 
@@ -584,6 +703,7 @@ function RunTraceCard({
   const outputs = Object.entries(item.outputDelta);
   const dataShaping = traceRecord(item.dataShaping);
   const approval = traceRecord(item.approval);
+  const badges = traceDiagnosticBadges(item);
   return (
     <article className={`run-trace-item is-${item.status}`}>
       <button
@@ -596,7 +716,13 @@ function RunTraceCard({
         <strong>{index + 1}. {item.label}</strong>
         <span>{item.type} · {statusLabel(item.status)} · {item.durationMs}ms</span>
       </button>
+      {badges.length ? (
+        <div className="run-trace-badges">
+          {badges.map((badge) => <span key={badge}>{badge}</span>)}
+        </div>
+      ) : null}
       {item.detail ? <p>{item.detail}</p> : null}
+      <RuntimeDiagnosticsSummary item={item} />
       {approval ? <ApprovalTraceSummary data={approval} paused={item.pause === true} /> : null}
       {dataShaping ? <DataShapingTraceSummary data={dataShaping} /> : null}
       {outputs.length ? (
@@ -628,6 +754,25 @@ function ApprovalTraceSummary({ data, paused }: { data: Record<string, unknown>;
     <div className={`run-trace-meta approval-trace-meta ${paused ? "is-paused" : "is-resumed"}`}>
       <div className="run-trace-meta__title">{paused ? "Human Approval · Paused" : "Human Approval · Resumed"}</div>
       {details.length ? <div className="run-trace-meta__body">{details.join(" · ")}</div> : null}
+    </div>
+  );
+}
+
+function RuntimeDiagnosticsSummary({ item }: { item: RunTraceItem }) {
+  const attempts = item.attempts ?? [];
+  const errorPayload = traceRecord(item.outputDelta.last_error);
+  const details = [
+    attempts.length ? `尝试 ${attempts.map(formatAttempt).join(" / ")}` : "",
+    item.timeoutSec ? `超时 ${item.timeoutSec}s` : "",
+    item.errorPolicy && item.errorPolicy !== "default" ? `错误策略 ${item.errorPolicy}` : "",
+    item.itemFailurePolicy ? `Item 失败策略 ${item.itemFailurePolicy}` : "",
+    errorPayload ? `错误 ${traceText(errorPayload.errorType) || "runtime"}: ${traceText(errorPayload.message)}` : "",
+  ].filter(Boolean);
+  if (!details.length) return null;
+  return (
+    <div className="run-trace-meta diagnostics-trace-meta">
+      <div className="run-trace-meta__title">Runtime Diagnostics</div>
+      <div className="run-trace-meta__body">{details.join(" · ")}</div>
     </div>
   );
 }
@@ -684,6 +829,205 @@ function traceBool(value: unknown) {
 function traceList(value: unknown) {
   if (!Array.isArray(value)) return "";
   return value.map(traceText).filter(Boolean).join(", ");
+}
+
+interface RuntimeCallRecord {
+  source: "tool" | "mcp" | "agent" | "unknown";
+  name: string;
+  field: string;
+  durationMs: number | null;
+  ok: boolean | null;
+  errorType: string;
+}
+
+interface RunObservabilitySummaryData {
+  statusLabel: string;
+  nodeCount: number;
+  okCount: number;
+  errorCount: number;
+  skippedCount: number;
+  totalDurationMs: number;
+  slowest: RunTraceItem | null;
+  retryNodeCount: number;
+  timeoutNodeCount: number;
+  policyNodeCount: number;
+  childTraceCount: number;
+  parallelTraceCount: number;
+  paused: boolean;
+  failed: boolean;
+  calls: RuntimeCallRecord[];
+}
+
+function buildRunObservability(result: RunPreviewResult): RunObservabilitySummaryData {
+  const trace = result.trace;
+  const errorCount = trace.filter((item) => traceHasError(item)).length;
+  const skippedCount = trace.filter((item) => item.status === "skipped").length;
+  const slowest = trace.reduce<RunTraceItem | null>((current, item) => (!current || item.durationMs > current.durationMs ? item : current), null);
+  const status = result.status ?? (errorCount ? "failed" : "completed");
+  return {
+    statusLabel: runStatusLabel(status),
+    nodeCount: trace.length,
+    okCount: trace.filter((item) => item.status === "ok").length,
+    errorCount,
+    skippedCount,
+    totalDurationMs: trace.reduce((sum, item) => sum + item.durationMs, 0),
+    slowest,
+    retryNodeCount: trace.filter((item) => (item.attempts?.length ?? 0) > 1).length,
+    timeoutNodeCount: trace.filter((item) => Boolean(item.timeoutSec) || (item.attempts ?? []).some((attempt) => traceText(attempt.errorType) === "timeout")).length,
+    policyNodeCount: trace.filter(traceHasPolicy).length,
+    childTraceCount: trace.filter((item) => Boolean(item.parentNodeId)).length,
+    parallelTraceCount: trace.filter((item) => item.parallel === true || item.type === "parallel_worker").length,
+    paused: status === "paused",
+    failed: status === "failed" || errorCount > 0,
+    calls: collectRuntimeCalls(result),
+  };
+}
+
+function filterTraceItems(items: RunTraceItem[], filter: TraceFilter, search: string, slowestNodeId: string): RunTraceItem[] {
+  const query = search.trim().toLowerCase();
+  return items.filter((item) => traceMatchesFilter(item, filter, slowestNodeId) && traceMatchesSearch(item, query));
+}
+
+function traceMatchesFilter(item: RunTraceItem, filter: TraceFilter, slowestNodeId: string): boolean {
+  switch (filter) {
+    case "errors":
+      return traceHasError(item);
+    case "slow":
+      return item.nodeId === slowestNodeId || item.durationMs >= 1000;
+    case "tools":
+      return ["tool", "http", "parallel_tools", "parallel_worker"].includes(item.type);
+    case "mcp":
+      return item.type === "mcp_node" || traceContainsRuntimeCall(item, "mcp");
+    case "agent":
+      return ["agent", "agent_ref", "llm"].includes(item.type) || traceContainsRuntimeCall(item, "agent");
+    case "human":
+      return item.type === "human_approval" || Boolean(item.approval);
+    case "flow":
+      return ["condition", "ai_router", "for_each", "merge", "error_handler", "task_splitter"].includes(item.type);
+    case "policy":
+      return traceHasPolicy(item);
+    case "data":
+      return Boolean(item.dataShaping) || ["variable_assign", "template", "json_extractor", "json_validator"].includes(item.type);
+    case "all":
+    default:
+      return true;
+  }
+}
+
+function traceMatchesSearch(item: RunTraceItem, query: string): boolean {
+  if (!query) return true;
+  return [item.nodeId, item.label, item.type, item.detail, item.parentNodeId ?? "", item.sourceNodeId ?? ""]
+    .join(" ")
+    .toLowerCase()
+    .includes(query);
+}
+
+function traceHasError(item: RunTraceItem): boolean {
+  return item.status === "error" || Boolean(traceRecord(item.outputDelta.last_error)) || (item.attempts ?? []).some((attempt) => traceText(attempt.status) === "error");
+}
+
+function traceHasPolicy(item: RunTraceItem): boolean {
+  return Boolean(item.timeoutSec) || Boolean(item.errorPolicy && item.errorPolicy !== "default") || (item.attempts?.length ?? 0) > 1;
+}
+
+function traceContainsRuntimeCall(item: RunTraceItem, source: "mcp" | "agent" | "tool"): boolean {
+  return collectRuntimeCalls({ mode: "live", valid: true, issues: [], trace: [item], outputState: item.outputDelta }).some((call) => call.source === source);
+}
+
+function collectRuntimeCalls(result: RunPreviewResult): RuntimeCallRecord[] {
+  const calls: RuntimeCallRecord[] = [];
+  const seen = new Set<string>();
+  const visit = (value: unknown, path: string) => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      if (path.endsWith("_tool_calls") || path.endsWith("_mcp_tool_calls") || path.endsWith("_agent_tool_calls")) {
+        value.forEach((item, index) => {
+          const record = traceRecord(item);
+          if (!record) return;
+          const call = runtimeCallFromRecord(record, `${path}[${index}]`);
+          const key = `${call.field}:${call.source}:${call.name}:${call.durationMs ?? ""}:${call.errorType}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            calls.push(call);
+          }
+        });
+      }
+      value.forEach((item, index) => visit(item, `${path}[${index}]`));
+      return;
+    }
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      visit(nested, path ? `${path}.${key}` : key);
+    }
+  };
+  visit(result.outputState, "state");
+  result.trace.forEach((item, index) => visit(item.outputDelta, `trace[${index}].outputDelta`));
+  return calls;
+}
+
+function runtimeCallFromRecord(record: Record<string, unknown>, field: string): RuntimeCallRecord {
+  const source = inferRuntimeCallSource(record, field);
+  const name = traceText(record.tool) || traceText(record.toolName) || traceText(record.agentName) || traceText(record.serverName) || traceText(record.name) || "未命名调用";
+  return {
+    source,
+    name,
+    field,
+    durationMs: typeof record.durationMs === "number" ? record.durationMs : null,
+    ok: typeof record.ok === "boolean" ? record.ok : traceText(record.errorType) ? false : null,
+    errorType: traceText(record.errorType),
+  };
+}
+
+function inferRuntimeCallSource(record: Record<string, unknown>, field: string): RuntimeCallRecord["source"] {
+  const source = traceText(record.source).toLowerCase();
+  if (source === "mcp" || field.includes("_mcp_tool_calls") || record.serverName) return "mcp";
+  if (source === "agent" || field.includes("_agent_tool_calls") || record.agentName || record.projectId) return "agent";
+  if (source === "tool" || field.includes("_tool_calls")) return "tool";
+  return "unknown";
+}
+
+function traceDiagnosticBadges(item: RunTraceItem): string[] {
+  const badges = [
+    item.parentNodeId ? `Parent ${item.parentNodeId}` : "",
+    item.iterationIndex != null ? `Item #${item.iterationIndex}` : "",
+    (item.attempts?.length ?? 0) > 1 ? `Retry x${item.attempts?.length}` : "",
+    item.timeoutSec ? `Timeout ${item.timeoutSec}s` : "",
+    item.errorPolicy && item.errorPolicy !== "default" ? `Policy ${item.errorPolicy}` : "",
+    item.parallel ? "Parallel" : "",
+    item.itemFailurePolicy ? `Item ${item.itemFailurePolicy}` : "",
+    item.pause ? "Pause" : "",
+    item.dataShaping ? "Data" : "",
+  ].filter(Boolean);
+  return badges.slice(0, 8);
+}
+
+function formatAttempt(value: Record<string, unknown>, index: number) {
+  const status = traceText(value.status) || "unknown";
+  const duration = typeof value.durationMs === "number" ? formatDuration(value.durationMs) : "无耗时";
+  const error = traceText(value.errorType);
+  return `#${index + 1} ${status} ${duration}${error ? ` ${error}` : ""}`;
+}
+
+function observabilityHints(summary: RunObservabilitySummaryData): string[] {
+  const hints: string[] = [];
+  if (summary.paused) hints.push("运行已暂停：先处理 Human Approval 卡片再恢复后续流程。");
+  if (summary.errorCount) hints.push("存在失败节点：切到“错误”筛选查看 last_error 和 attempts。");
+  if (summary.retryNodeCount) hints.push("存在重试节点：检查 Runtime Diagnostics 中每次尝试的错误类型。");
+  if (summary.slowest && summary.slowest.durationMs >= 1000) hints.push(`最慢节点是 ${summary.slowest.label}，耗时 ${formatDuration(summary.slowest.durationMs)}。`);
+  if (summary.calls.some((call) => call.ok === false)) hints.push("调用链中存在失败的 Tool/MCP/Agent 调用。");
+  return hints.slice(0, 4);
+}
+
+function callSummaryLabel(calls: RuntimeCallRecord[]) {
+  const mcp = calls.filter((call) => call.source === "mcp").length;
+  const agent = calls.filter((call) => call.source === "agent").length;
+  const tool = calls.filter((call) => call.source === "tool").length;
+  return [`${tool} Tool`, `${mcp} MCP`, `${agent} Agent`].join(" / ");
+}
+
+function formatDuration(value: number) {
+  if (!Number.isFinite(value)) return "0ms";
+  if (value >= 1000) return `${(value / 1000).toFixed(value >= 10000 ? 1 : 2)}s`;
+  return `${Math.round(value)}ms`;
 }
 
 function formatIssue(issue: ValidationIssue) {
