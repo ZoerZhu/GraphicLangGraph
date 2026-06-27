@@ -32,6 +32,7 @@ export function RunPreviewPanel() {
   const runInput = useProjectStore((state) => state.runInput);
   const runRunning = useProjectStore((state) => state.runRunning);
   const workspaceModelConfigs = useProjectStore((state) => state.workspaceModelConfigs);
+  const workspaceRuntimeEnvironments = useProjectStore((state) => state.workspaceRuntimeEnvironments);
   const selectedRunModelConfigId = useProjectStore((state) => state.selectedRunModelConfigId);
   const runResult = useProjectStore((state) => state.runResult);
   const runHistoryRecords = useProjectStore((state) => state.runHistoryRecords);
@@ -54,7 +55,14 @@ export function RunPreviewPanel() {
   const enabledModels = workspaceModelConfigs.filter((config) => config.enabled);
   const projectTemplate = getProjectTemplateForProject(project);
   const requiresModel = projectTemplate?.requiresModel ?? true;
-  const templateAcceptance = useMemo(() => evaluateTemplateAcceptance(project, runResult), [project, runResult]);
+  const selectedRuntimeEnvironment = useMemo(
+    () => pickRuntimeEnvironment(workspaceRuntimeEnvironments, project?.project.runtimeEnvironmentId ?? ""),
+    [workspaceRuntimeEnvironments, project?.project.runtimeEnvironmentId],
+  );
+  const templateAcceptance = useMemo(
+    () => evaluateTemplateAcceptance(project, runResult, selectedRuntimeEnvironment),
+    [project, runResult, selectedRuntimeEnvironment],
+  );
   const selectableNodeIds = runHistoryMismatch && runHistoryReplayMode === "details"
     ? new Set<string>()
     : new Set(project?.nodes.map((node) => node.id) ?? []);

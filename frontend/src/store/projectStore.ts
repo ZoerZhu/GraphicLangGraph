@@ -41,7 +41,7 @@ import {
   validateProject,
 } from "../lib/api";
 import { createNode, defaultOutputs } from "../lib/nodeCatalog";
-import { applyTemplateToProject, getProjectTemplateForProject, PROJECT_TEMPLATES } from "../lib/templates";
+import { applyTemplateToProject, getProjectTemplateForProject, PROJECT_TEMPLATES, type ProjectTemplate } from "../lib/templates";
 import type {
   AgentLinkConfig,
   EdgeIR,
@@ -1035,13 +1035,23 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       set({ status: "模板不存在" });
       return;
     }
-    const nextProject = syncAllParallelWorkers(applyTemplateToProject(project, template));
+    const runtimeEnvironments = normalizeRuntimeEnvironments(get().workspaceRuntimeEnvironments);
+    const projectWithRuntime = ensureProjectRuntimeEnvironment(project, runtimeEnvironments);
+    const nextProject = syncAllParallelWorkers(applyTemplateRuntimeDependencies(applyTemplateToProject(projectWithRuntime, template), template));
     const saved = await saveProject(nextProject);
+    const runtimeDependencyUpdate = ensureTemplateRuntimeHosts(runtimeEnvironments, saved.project.runtimeEnvironmentId, template.requiredRuntimeHosts ?? []);
+    const savedRuntimeEnvironments = runtimeDependencyUpdate.changed
+      ? normalizeRuntimeEnvironments(await saveWorkspaceRuntimeEnvironments(runtimeDependencyUpdate.configs))
+      : get().workspaceRuntimeEnvironments;
     const historyRecords = recordProjectHistory(saved, `应用模板：${template.name}`);
     const sampleHint = template.sampleInput ? "，已填入样例输入" : "";
     const modelHint = template.requiresModel ? "，请选择模型后运行" : "，可直接真实运行";
+    const mcpHint = template.requiredMcpServers?.length ? `，已加入 ${template.requiredMcpServers.length} 个 MCP` : "";
+    const hostHint = runtimeDependencyUpdate.addedHosts.length ? `，已允许域名 ${runtimeDependencyUpdate.addedHosts.join(", ")}` : "";
+    const envHint = template.requiredEnvVars?.length ? `，需配置环境变量 ${template.requiredEnvVars.join(", ")}` : "";
     set({
       project: saved,
+      workspaceRuntimeEnvironments: savedRuntimeEnvironments,
       runInput: template.sampleInput ? JSON.stringify(template.sampleInput, null, 2) : get().runInput,
       selectedNodeId: null,
       pendingConnection: null,
@@ -1055,7 +1065,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       runHistoryReplayMode: "overlay",
       runHistoryMismatch: null,
       templatesOpen: false,
-      status: `已应用模板：${template.name}${sampleHint}${modelHint}`,
+      status: `已应用模板：${template.name}${sampleHint}${mcpHint}${hostHint}${modelHint}${envHint}`,
     });
   },
 
@@ -1073,15 +1083,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       set({ status: "请输入搭建需求" });
       return;
     }
-    const templateId = /api|json|清洗|校验|订单接口|订单 API/i.test(normalized)
-      ? "api_json_cleanup"
-      : /并发|foreach|for each|任务处理|task plan|结构化任务|错误兜底|merge|worker/i.test(normalized)
-        ? "flow_control_task_processing"
-        : /客服|售后|订单|退款/.test(normalized)
-          ? "customer_support"
-          : /知识库|问答|文档|rag|检索/i.test(normalized)
-            ? "knowledge_qa"
-            : "knowledge_qa";
+    const templateId = pickAssistantTemplateId(normalized);
     await get().applyTemplate(templateId);
     set({ assistantOpen: false });
   },
@@ -1823,6 +1825,59 @@ function normalizeSkills(skills: SkillConfig[]): SkillConfig[] {
     }));
 }
 
+function pickAssistantTemplateId(prompt: string): string {
+  if (/exa|websearch|web search|联网|搜索网页|网页搜索|mcp/i.test(prompt)) return "websearch_exa_mcp";
+  if (/多.?agent|子.?agent|协作|编排|handoff|agent tool|历史 Agent/i.test(prompt)) return "multi_agent_orchestration";
+  if (/api|json|清洗|校验|订单接口|订单 API/i.test(prompt)) return "api_json_cleanup";
+  if (/并发|foreach|for each|任务处理|task plan|结构化任务|错误兜底|merge|worker/i.test(prompt)) return "flow_control_task_processing";
+  if (/客服|售后|订单|退款/.test(prompt)) return "customer_support";
+  if (/知识库|问答|文档|rag|检索/i.test(prompt)) return "knowledge_qa";
+  return "knowledge_qa";
+}
+
+function applyTemplateRuntimeDependencies(project: ProjectIR, template: ProjectTemplate): ProjectIR {
+  const requiredMcpServers = template.requiredMcpServers ?? [];
+  if (!requiredMcpServers.length) return project;
+  return {
+    ...project,
+    mcpServers: mergeTemplateMcpServers(project.mcpServers ?? [], requiredMcpServers),
+  };
+}
+
+function mergeTemplateMcpServers(existing: MCPServerConfig[], required: MCPServerConfig[]): MCPServerConfig[] {
+  const byId = new Map(existing.map((server) => [server.id, server]));
+  const orderedIds = existing.map((server) => server.id);
+  required.forEach((server) => {
+    const current = byId.get(server.id);
+    if (!current) {
+      byId.set(server.id, { ...server });
+      orderedIds.push(server.id);
+      return;
+    }
+    byId.set(server.id, mergeTemplateMcpServer(current, server));
+  });
+  return orderedIds
+    .map((id) => byId.get(id))
+    .filter((server): server is MCPServerConfig => Boolean(server));
+}
+
+function mergeTemplateMcpServer(current: MCPServerConfig, required: MCPServerConfig): MCPServerConfig {
+  const merged = { ...required, ...current, enabled: true } as MCPServerConfig;
+  const currentRecord = merged as unknown as Record<string, unknown>;
+  const requiredRecord = required as unknown as Record<string, unknown>;
+  Object.entries(requiredRecord).forEach(([key, value]) => {
+    const currentValue = currentRecord[key];
+    if (typeof value === "string" && value.trim() && typeof currentValue === "string" && !currentValue.trim()) {
+      if (key === "apiKeyEnv" && merged.apiKeyMode === "direct" && merged.apiKey.trim()) return;
+      currentRecord[key] = value;
+    }
+    if (typeof value === "number" && (!Number.isFinite(Number(currentValue)) || Number(currentValue) <= 0)) {
+      currentRecord[key] = value;
+    }
+  });
+  return merged;
+}
+
 function normalizeMcpServers(servers: MCPServerConfig[]): MCPServerConfig[] {
   return servers
     .filter((server) => server && typeof server.id === "string")
@@ -1924,6 +1979,34 @@ function normalizeRuntimeEnvironments(configs: RuntimeEnvironmentConfig[]): Runt
   return normalized.length ? normalized : [newDefaultRuntimeEnvironment()];
 }
 
+function ensureTemplateRuntimeHosts(
+  configs: RuntimeEnvironmentConfig[],
+  runtimeEnvironmentId: string | null,
+  requiredHosts: string[],
+): { configs: RuntimeEnvironmentConfig[]; changed: boolean; addedHosts: string[] } {
+  const hosts = Array.from(new Set(requiredHosts.map((host) => host.trim()).filter(Boolean)));
+  const normalized = normalizeRuntimeEnvironments(configs);
+  if (!hosts.length) return { configs: normalized, changed: false, addedHosts: [] };
+  const selected = pickRuntimeEnvironment(normalized, runtimeEnvironmentId);
+  if (!selected || selected.allowAllHosts === true) return { configs: normalized, changed: false, addedHosts: [] };
+  const currentHosts = parseStringList(selected.allowedHostsJson);
+  const addedHosts = hosts.filter((host) => !isHostAllowedByList(host, currentHosts));
+  const shouldEnableNetwork = selected.networkEnabled === false;
+  if (!addedHosts.length && !shouldEnableNetwork) return { configs: normalized, changed: false, addedHosts: [] };
+  const mergedHosts = Array.from(new Set([...currentHosts, ...addedHosts]));
+  return {
+    configs: normalized.map((config) => config.id === selected.id
+      ? {
+          ...config,
+          networkEnabled: true,
+          allowedHostsJson: JSON.stringify(mergedHosts, null, 2),
+        }
+      : config),
+    changed: true,
+    addedHosts,
+  };
+}
+
 function safeJsonList(value: unknown, fallback: string[]): string {
   if (Array.isArray(value)) {
     const items = value.map((item) => String(item).trim()).filter(Boolean);
@@ -1942,6 +2025,30 @@ function safeJsonList(value: unknown, fallback: string[]): string {
     return JSON.stringify(items.length ? items : fallback, null, 2);
   }
   return JSON.stringify(fallback, null, 2);
+}
+
+function parseStringList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
+  const text = String(value ?? "").trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) return parsed.map((item) => String(item).trim()).filter(Boolean);
+  } catch {
+    return text.split(/[;,\n]+/).map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function isHostAllowedByList(host: string, allowedHosts: string[]): boolean {
+  const normalizedHost = host.trim().toLowerCase();
+  return allowedHosts.some((item) => {
+    const candidate = item.trim().toLowerCase();
+    if (!candidate) return false;
+    if (candidate === "*" || candidate === normalizedHost) return true;
+    if (candidate.startsWith("*.")) return normalizedHost.endsWith(candidate.slice(1));
+    return false;
+  });
 }
 
 function newDefaultRuntimeEnvironment(): RuntimeEnvironmentConfig {

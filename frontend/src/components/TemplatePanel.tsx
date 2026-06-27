@@ -31,6 +31,9 @@ export function TemplatePanel() {
                 <span>{template.requiresModel ? "需要模型" : "无需模型"}</span>
                 <span>{template.requiresNetwork ? "需要网络" : "本地/mock"}</span>
                 <span>{template.recommendedRunMode === "live" ? "推荐真实运行" : "推荐 dry-run"}</span>
+                {template.requiredMcpServers?.length ? <span>{template.requiredMcpServers.length} MCP</span> : null}
+                {template.requiredRuntimeHosts?.length ? <span>Host: {template.requiredRuntimeHosts.join(", ")}</span> : null}
+                {template.requiredEnvVars?.length ? <span>Env: {template.requiredEnvVars.join(", ")}</span> : null}
               </div>
               <div className="template-card__outputs">
                 {template.expectedOutputFields.slice(0, 4).map((field) => <span key={field}>{field}</span>)}

@@ -1,4 +1,4 @@
-import type { EdgeIR, NodeIR, ProjectIR, StateField } from "../types";
+import type { EdgeIR, MCPServerConfig, NodeIR, ProjectIR, StateField } from "../types";
 
 export type ProjectTemplateCategory = "knowledge" | "coding" | "workflow" | "data" | "support";
 export type ProjectTemplateRunMode = "dry" | "live";
@@ -15,11 +15,43 @@ export interface ProjectTemplate {
   requiresNetwork: boolean;
   expectedOutputFields: string[];
   expectedTraceTypes: NodeIR["type"][];
+  requiredMcpServers?: MCPServerConfig[];
+  requiredRuntimeHosts?: string[];
+  requiredEnvVars?: string[];
   sampleInput?: Record<string, unknown>;
   fields: StateField[];
   nodes: NodeIR[];
   edges: EdgeIR[];
 }
+
+export const EXA_WEBSEARCH_MCP_SERVER: MCPServerConfig = {
+  id: "exa_search_mcp",
+  name: "Exa Search MCP",
+  transport: "http",
+  command: "",
+  argsJson: "[]",
+  envJson: "{}",
+  envVarsJson: "[]",
+  cwd: "",
+  url: "https://mcp.exa.ai/mcp",
+  apiKey: "",
+  apiKeyEnv: "EXA_API_KEY",
+  apiKeyMode: "env",
+  apiKeyHeader: "x-api-key",
+  apiKeyPrefix: "",
+  bearerTokenEnvVar: "",
+  httpHeadersJson: "{}",
+  envHttpHeadersJson: "{\"x-api-key\":\"EXA_API_KEY\"}",
+  enabled: true,
+  startupTimeoutSec: 10,
+  toolTimeoutSec: 60,
+  enabledToolsJson: "[]",
+  disabledToolsJson: "[]",
+  defaultToolsApprovalMode: "auto",
+  sourceType: "template",
+  sourcePath: "https://mcp.exa.ai/mcp",
+  description: "Exa remote MCP web search server",
+};
 
 export const PROJECT_TEMPLATES: ProjectTemplate[] = [
   {
@@ -147,6 +179,9 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     requiresNetwork: true,
     expectedOutputFields: ["exa_search_result", "search_answer", "final_answer"],
     expectedTraceTypes: ["mcp_node", "llm", "direct_reply"],
+    requiredMcpServers: [EXA_WEBSEARCH_MCP_SERVER],
+    requiredRuntimeHosts: ["mcp.exa.ai"],
+    requiredEnvVars: ["EXA_API_KEY"],
     sampleInput: {
       messages: "请搜索 2026 年 AI Agent 工作流编排工具的最新趋势，并用中文总结三点。",
     },
@@ -163,36 +198,7 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
         transport: "http",
         command: "",
         url: "https://mcp.exa.ai/mcp",
-        mcpServerSnapshotJson: JSON.stringify([
-          {
-            id: "exa_search_mcp",
-            name: "Exa Search MCP",
-            transport: "http",
-            command: "",
-            argsJson: "[]",
-            envJson: "{}",
-            envVarsJson: "[]",
-            cwd: "",
-            url: "https://mcp.exa.ai/mcp",
-            apiKey: "",
-            apiKeyEnv: "EXA_API_KEY",
-            apiKeyMode: "env",
-            apiKeyHeader: "x-api-key",
-            apiKeyPrefix: "",
-            bearerTokenEnvVar: "",
-            httpHeadersJson: "{}",
-            envHttpHeadersJson: "{\"x-api-key\":\"EXA_API_KEY\"}",
-            enabled: true,
-            startupTimeoutSec: 10,
-            toolTimeoutSec: 60,
-            enabledToolsJson: "[]",
-            disabledToolsJson: "[]",
-            defaultToolsApprovalMode: "auto",
-            sourceType: "template",
-            sourcePath: "https://mcp.exa.ai/mcp",
-            description: "Exa remote MCP web search server",
-          },
-        ], null, 2),
+        mcpServerSnapshotJson: JSON.stringify([EXA_WEBSEARCH_MCP_SERVER], null, 2),
         mcpToolsJson: "[]",
         toolName: "",
         toolSelectionMode: "model",
