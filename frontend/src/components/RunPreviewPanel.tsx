@@ -183,13 +183,15 @@ function PendingApprovalPanel({
   result: RunPreviewResult;
   recordId: string | null;
   running: boolean;
-  onResume: (recordId: string, action: "approved" | "rejected", comment: string) => Promise<void>;
+  onResume: (recordId: string, action: string, comment: string) => Promise<void>;
 }) {
   const [comment, setComment] = useState("");
   const [copyMessage, setCopyMessage] = useState("");
   const approval = result.pendingApproval;
   if (result.status !== "paused" || !approval) return null;
   const disabled = running || !recordId;
+  const actions = approvalActions(approval);
+  const defaultAction = approvalDefaultAction(approval, actions);
   const stateText = approval.state ? JSON.stringify(approval.state, null, 2) : "";
   async function copyApprovalText(label: string, value: string) {
     if (!value) return;
@@ -200,11 +202,21 @@ function PendingApprovalPanel({
       setCopyMessage("当前浏览器不允许写入剪贴板");
     }
   }
+  async function submitApproval(action: string) {
+    if (!recordId || disabled) return;
+    await onResume(recordId, action, comment);
+    setComment("");
+  }
   return (
     <section className="approval-panel">
       <div className="run-section-title">
         <strong>等待人工审批</strong>
-        <span>{approval.nodeLabel ?? approval.nodeId}</span>
+        <span>{approval.nodeLabel ?? approval.nodeId} · {recordId ?? "未保存运行"}</span>
+      </div>
+      <div className="approval-panel__meta">
+        <span>默认：{approvalActionLabel(defaultAction)}</span>
+        <span>动作：{actions.map(approvalActionLabel).join(" / ")}</span>
+        <span>输出：{approval.outputField ?? "approval_result"}</span>
       </div>
       {approval.prompt ? <p className="approval-panel__prompt">{approval.prompt}</p> : null}
       <div className="approval-panel__tools">
@@ -228,14 +240,16 @@ function PendingApprovalPanel({
         />
       </label>
       <div className="approval-panel__actions">
-        <button disabled={disabled} onClick={() => recordId && void onResume(recordId, "approved", comment)} type="button">
-          <ShieldCheck size={14} />
-          通过并继续
+        <button className="primary" disabled={disabled} onClick={() => void submitApproval(defaultAction)} type="button">
+          <RotateCcw size={14} />
+          使用默认动作继续
         </button>
-        <button disabled={disabled} onClick={() => recordId && void onResume(recordId, "rejected", comment)} type="button">
-          <X size={14} />
-          拒绝并继续
-        </button>
+        {actions.map((action) => (
+          <button key={action} disabled={disabled} onClick={() => void submitApproval(action)} type="button">
+            {approvalActionIcon(action)}
+            {approvalActionLabel(action)}并继续
+          </button>
+        ))}
       </div>
       {approval.state ? (
         <details className="runtime-value__fold">
@@ -247,6 +261,37 @@ function PendingApprovalPanel({
       ) : null}
     </section>
   );
+}
+
+function approvalActions(approval: NonNullable<RunPreviewResult["pendingApproval"]>): string[] {
+  const values = Array.isArray(approval.actions) ? approval.actions : [];
+  const actions = values.map((item) => String(item).trim()).filter(Boolean);
+  return actions.length ? Array.from(new Set(actions)) : ["approved", "rejected"];
+}
+
+function approvalDefaultAction(approval: NonNullable<RunPreviewResult["pendingApproval"]>, actions: string[]) {
+  const configured = String(approval.defaultAction ?? "").trim();
+  if (configured && actions.includes(configured)) return configured;
+  return actions[0] ?? "approved";
+}
+
+function approvalActionLabel(action: string) {
+  switch (action) {
+    case "approved":
+      return "通过";
+    case "rejected":
+      return "拒绝";
+    case "edit":
+      return "修改";
+    default:
+      return action || "继续";
+  }
+}
+
+function approvalActionIcon(action: string) {
+  if (action === "approved") return <ShieldCheck size={14} />;
+  if (action === "rejected") return <X size={14} />;
+  return <RotateCcw size={14} />;
 }
 
 function PatchApplicationPanel({ result }: { result: RunPreviewResult }) {
@@ -831,8 +876,12 @@ function ApprovalTraceSummary({ data, paused }: { data: Record<string, unknown>;
   const comment = traceText(data.comment);
   const prompt = traceText(data.prompt);
   const resumedAt = traceText(data.resumedAt);
+  const defaultAction = traceText(data.defaultAction);
+  const actions = traceList(data.actions) || traceList(data.availableActions);
   const details = [
     paused ? "状态 等待审批" : action ? `动作 ${action}` : "",
+    defaultAction ? `默认 ${defaultAction}` : "",
+    actions ? `可选 ${actions}` : "",
     comment ? `备注 ${comment}` : "",
     resumedAt ? `恢复 ${formatTime(resumedAt)}` : "",
     prompt ? `提示 ${prompt}` : "",

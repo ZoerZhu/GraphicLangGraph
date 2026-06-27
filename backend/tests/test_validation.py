@@ -133,6 +133,38 @@ def test_rejects_ai_router_without_fallback_edge():
     assert any(issue.code == "ROUTER_BRANCH_EDGE" for issue in result.issues)
 
 
+def test_human_approval_requires_configured_action_edges():
+    project = create_default_project()
+    project.nodes.extend(
+        [
+            NodeIR(
+                id="approval_1",
+                type=NodeType.HUMAN_APPROVAL,
+                label="审批",
+                config={"actions": "approved,rejected,edit", "fallback": "rejected"},
+                outputs=[
+                    {"id": "approved", "type": "condition", "label": "通过"},
+                    {"id": "rejected", "type": "condition", "label": "拒绝"},
+                    {"id": "edit", "type": "condition", "label": "修改"},
+                ],
+            ),
+            NodeIR(id="reply_1", type=NodeType.DIRECT_REPLY, label="回复"),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="approval_1"),
+            EdgeIR(id="e2", source="approval_1", sourceHandle="approved", target="reply_1", kind=EdgeKind.CONDITIONAL),
+            EdgeIR(id="e3", source="approval_1", sourceHandle="rejected", target="reply_1", kind=EdgeKind.CONDITIONAL),
+        ]
+    )
+
+    result = validate_project(project)
+
+    assert not result.valid
+    assert any(issue.code == "ROUTER_BRANCH_EDGE" and "edit" in issue.message for issue in result.issues)
+
+
 def test_rejects_invalid_tool_params_json():
     project = create_default_project()
     project.nodes.extend(

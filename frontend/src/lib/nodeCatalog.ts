@@ -265,6 +265,7 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
     case "human_approval":
       return {
         prompt: "请审批本次操作是否可以继续。",
+        actions: "approved,rejected,edit",
         actionField: "approval_action",
         outputField: "approval_result",
         defaultAction: "approved",

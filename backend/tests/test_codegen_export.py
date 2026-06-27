@@ -863,6 +863,7 @@ def test_codegen_human_approval_uses_interrupt_and_checkpointer():
             EdgeIR(id="e1", source="start", target="approval_1"),
             EdgeIR(id="e2", source="approval_1", sourceHandle="approved", target="reply_1", kind=EdgeKind.CONDITIONAL),
             EdgeIR(id="e3", source="approval_1", sourceHandle="rejected", target="reply_1", kind=EdgeKind.CONDITIONAL),
+            EdgeIR(id="e4", source="approval_1", sourceHandle="edit", target="reply_1", kind=EdgeKind.CONDITIONAL),
         ]
     )
 
@@ -872,6 +873,7 @@ def test_codegen_human_approval_uses_interrupt_and_checkpointer():
     readme = files["README.md"]
 
     assert "interrupt(payload)" in nodes_py
+    assert '"actions": ["approved", "rejected", "edit"]' in nodes_py
     assert "InMemorySaver" in graph_py
     assert "compile(checkpointer=checkpointer)" in graph_py
     assert "Human approval resume" in readme

@@ -383,13 +383,21 @@ def _resume_project(
     node = nodes.get(approval_node_id)
     if node is None or node.type != NodeType.HUMAN_APPROVAL:
         raise RuntimeError("待恢复节点不是 Human Approval。")
-    normalized_action = action if action in {"approved", "rejected"} else "rejected"
+    outgoing: dict[str, list] = {}
+    for edge in project.edges:
+        outgoing.setdefault(edge.source, []).append(edge)
+    available_actions = _human_approval_actions(node, outgoing)
+    fallback = str(node.config.get("fallback", "rejected") or "rejected").strip() or "rejected"
+    normalized_action = action if action in available_actions else fallback
+    if normalized_action not in available_actions:
+        normalized_action = available_actions[0] if available_actions else "rejected"
     action_field = str(node.config.get("actionField", "approval_action"))
     output_field = str(node.config.get("outputField", "approval_result"))
     approval_result = {
         "action": normalized_action,
         "comment": comment,
         "approved": normalized_action == "approved",
+        "status": "resumed",
         "resumedAt": datetime.now(timezone.utc).isoformat(),
     }
     before = dict(state)
@@ -412,6 +420,11 @@ def _resume_project(
                 "nodeLabel": node.label,
                 "action": normalized_action,
                 "comment": comment,
+                "availableActions": available_actions,
+                "defaultAction": str(node.config.get("defaultAction", available_actions[0] if available_actions else "approved") or "approved"),
+                "actionField": action_field,
+                "outputField": output_field,
+                "resumedAt": approval_result["resumedAt"],
             },
         }
     ]
@@ -419,9 +432,6 @@ def _resume_project(
     tools = _tool_configs_by_id(project)
     mcp_servers = _mcp_configs_by_id(project)
     agents = _agent_configs_by_id(project)
-    outgoing: dict[str, list] = {}
-    for edge in project.edges:
-        outgoing.setdefault(edge.source, []).append(edge)
     current = _next_execution_target(node, nodes, outgoing, state)
     visited = 0
     while current and current in nodes and visited < MAX_STEPS:
@@ -1011,7 +1021,7 @@ def _execute_live_node(
     if node.type == NodeType.AI_ROUTER:
         return _execute_live_ai_router(node, state, model_config)
     if node.type == NodeType.HUMAN_APPROVAL:
-        return _execute_live_human_approval(node, state)
+        return _execute_live_human_approval(node, project, state)
     if node.type == NodeType.HTTP:
         return _execute_live_http(node, state)
     if node.type == NodeType.DIRECT_REPLY:
@@ -1548,14 +1558,20 @@ def _execute_live_ai_router(node: NodeIR, state: dict[str, Any], model_config: M
     return {field: route, reason_field: "live-run llm router"}, f"LLM 路由选择 {route}"
 
 
-def _execute_live_human_approval(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+def _execute_live_human_approval(node: NodeIR, project: ProjectIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
     config = node.config
     action_field = str(config.get("actionField", "approval_action"))
     output_field = str(config.get("outputField", "approval_result"))
+    outgoing: dict[str, list] = {}
+    for edge in project.edges:
+        outgoing.setdefault(edge.source, []).append(edge)
+    available_actions = _human_approval_actions(node, outgoing)
+    fallback = str(config.get("fallback", "rejected") or "rejected").strip() or "rejected"
     provided_action = str(state.get(action_field) or "").strip()
     if provided_action:
-        fallback = str(config.get("fallback", "rejected") or "rejected")
-        normalized_action = provided_action if provided_action in {"approved", "rejected", "edit"} else fallback
+        normalized_action = provided_action if provided_action in available_actions else fallback
+        if normalized_action not in available_actions:
+            normalized_action = available_actions[0] if available_actions else "rejected"
         approval_result = {
             "action": normalized_action,
             "approved": normalized_action == "approved",
@@ -1568,8 +1584,8 @@ def _execute_live_human_approval(node: NodeIR, state: dict[str, Any]) -> tuple[d
         "nodeId": node.id,
         "nodeLabel": node.label,
         "prompt": prompt,
-        "actions": ["approved", "rejected"],
-        "defaultAction": str(config.get("defaultAction", "approved") or "approved"),
+        "actions": available_actions,
+        "defaultAction": str(config.get("defaultAction", available_actions[0] if available_actions else "approved") or "approved"),
         "actionField": action_field,
         "outputField": output_field,
         "state": _compact_state(state),
@@ -6698,6 +6714,36 @@ def _first_target(edges: list) -> str | None:
 def _first_execution_target(edges: list) -> str | None:
     executable = [edge for edge in edges if edge.kind not in {EdgeKind.WORKER, EdgeKind.ERROR}]
     return _first_target(executable)
+
+
+def _human_approval_actions(node: NodeIR, outgoing: dict[str, list] | None = None) -> list[str]:
+    actions: list[str] = []
+    for action in _approval_action_items(node.config.get("actions", "")):
+        if action and action not in actions:
+            actions.append(action)
+    if outgoing:
+        for edge in outgoing.get(node.id, []):
+            handle = str(getattr(edge, "sourceHandle", "") or "").strip()
+            if edge.kind == EdgeKind.CONDITIONAL and handle and handle not in actions:
+                actions.append(handle)
+    if not actions:
+        actions = ["approved", "rejected"]
+    return actions
+
+
+def _approval_action_items(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return [item.strip() for item in re.split(r"[,，\n;；]+", text) if item.strip()]
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return []
 
 
 def _next_execution_target(node: NodeIR, nodes: dict[str, NodeIR], outgoing: dict[str, list], state: dict[str, Any]) -> str | None:

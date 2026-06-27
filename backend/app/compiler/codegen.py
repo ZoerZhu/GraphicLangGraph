@@ -3604,11 +3604,12 @@ def _node_function(node: NodeIR, project: ProjectIR) -> str:
         output_field = py_name(str(node.config.get("outputField", "approval_result")))
         default_action = json.dumps(str(node.config.get("defaultAction", "approved")))
         prompt = json.dumps(str(node.config.get("prompt", "")))
+        actions = json.dumps(_human_approval_actions_for_codegen(node, project), ensure_ascii=False)
         return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
     payload = {{
         "type": "human_approval",
         "prompt": render_template({prompt}, state),
-        "actions": ["approved", "rejected", "edit"],
+        "actions": {actions},
         "defaultAction": {default_action},
     }}
     resume = interrupt(payload)
@@ -5378,6 +5379,35 @@ def _csv_tool_names(value: str) -> list[str]:
         if name and name not in names:
             names.append(name)
     return names
+
+
+def _human_approval_actions_for_codegen(node: NodeIR, project: ProjectIR) -> list[str]:
+    actions: list[str] = []
+    for action in _approval_action_items_for_codegen(node.config.get("actions", "")):
+        if action and action not in actions:
+            actions.append(action)
+    for edge in project.edges:
+        if edge.source != node.id or edge.kind != EdgeKind.CONDITIONAL:
+            continue
+        handle = str(edge.sourceHandle or "").strip()
+        if handle and handle not in actions:
+            actions.append(handle)
+    return actions or ["approved", "rejected"]
+
+
+def _approval_action_items_for_codegen(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return [item.strip() for item in re.split(r"[,，\n;；]+", text) if item.strip()]
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return []
 
 
 def _json_string_list(value: Any) -> list[str]:

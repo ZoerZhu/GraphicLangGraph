@@ -340,7 +340,8 @@ def _validate_human_approval(
             )
         )
         return
-    expected = {fallback, "approved", "rejected"}
+    configured_actions = _approval_action_items(config.get("actions", ""))
+    expected = {fallback, *(configured_actions or ["approved", "rejected"])}
     handles = {edge.sourceHandle for edge in outgoing_edges}
     missing = sorted(branch for branch in expected if branch not in handles)
     if missing:
@@ -353,6 +354,21 @@ def _validate_human_approval(
                 suggestion="至少连接通过、拒绝和 fallback 动作分支。",
             )
         )
+
+
+def _approval_action_items(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return [item.strip() for item in re.split(r"[,，\n;；]+", text) if item.strip()]
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return []
 
 
 def _validate_agent(node_id: str, config: dict, issues: list[ValidationIssue]) -> None:

@@ -247,6 +247,7 @@ def test_project_run_human_approval_pauses_and_resumes(tmp_path, monkeypatch):
                 "position": {"x": 320, "y": 220},
                 "config": {
                     "prompt": "请确认是否继续：{{ state.messages }}",
+                    "actions": "approved,rejected,edit",
                     "actionField": "approval_action",
                     "outputField": "approval_result",
                     "fallback": "rejected",
@@ -255,6 +256,7 @@ def test_project_run_human_approval_pauses_and_resumes(tmp_path, monkeypatch):
                 "outputs": [
                     {"id": "approved", "type": "control", "label": "通过"},
                     {"id": "rejected", "type": "control", "label": "拒绝"},
+                    {"id": "edit", "type": "control", "label": "修改"},
                 ],
             },
             {
@@ -275,6 +277,15 @@ def test_project_run_human_approval_pauses_and_resumes(tmp_path, monkeypatch):
                 "inputs": [{"id": "in", "type": "control", "label": "输入"}],
                 "outputs": [],
             },
+            {
+                "id": "reply_edit",
+                "type": "direct_reply",
+                "label": "修改回复",
+                "position": {"x": 560, "y": 340},
+                "config": {"template": "edit: {{ state.approval_result.comment }}", "outputField": "final_answer"},
+                "inputs": [{"id": "in", "type": "control", "label": "输入"}],
+                "outputs": [],
+            },
         ]
     )
     project["edges"].extend(
@@ -282,6 +293,7 @@ def test_project_run_human_approval_pauses_and_resumes(tmp_path, monkeypatch):
             {"id": "e_start_approval", "source": "start", "sourceHandle": "out", "target": "approval_1", "kind": "normal"},
             {"id": "e_approved", "source": "approval_1", "sourceHandle": "approved", "target": "reply_ok", "kind": "conditional"},
             {"id": "e_rejected", "source": "approval_1", "sourceHandle": "rejected", "target": "reply_no", "kind": "conditional"},
+            {"id": "e_edit", "source": "approval_1", "sourceHandle": "edit", "target": "reply_edit", "kind": "conditional"},
         ]
     )
     assert client.put(f"/api/projects/{project_id}", json=project).status_code == 200
@@ -291,6 +303,7 @@ def test_project_run_human_approval_pauses_and_resumes(tmp_path, monkeypatch):
     paused = preview.json()
     assert paused["status"] == "paused"
     assert paused["pendingApproval"]["nodeId"] == "approval_1"
+    assert paused["pendingApproval"]["actions"] == ["approved", "rejected", "edit"]
     assert paused["trace"][-1]["pause"] is True
 
     record = {
@@ -308,20 +321,22 @@ def test_project_run_human_approval_pauses_and_resumes(tmp_path, monkeypatch):
 
     resumed = client.post(
         f"/api/projects/{project_id}/runs/history_pending_approval/resume",
-        json={"action": "approved", "comment": "同意"},
+        json={"action": "edit", "comment": "需要补充材料"},
     )
     assert resumed.status_code == 200
     body = resumed.json()
     assert body["status"] == "completed"
     assert body["pendingApproval"] is None
-    assert body["outputState"]["approval_action"] == "approved"
-    assert body["outputState"]["approval_result"]["comment"] == "同意"
-    assert body["outputState"]["final_answer"] == "approved: 同意"
+    assert body["outputState"]["approval_action"] == "edit"
+    assert body["outputState"]["approval_result"]["status"] == "resumed"
+    assert body["outputState"]["approval_result"]["comment"] == "需要补充材料"
+    assert body["outputState"]["final_answer"] == "edit: 需要补充材料"
+    assert body["trace"][-2]["approval"]["availableActions"] == ["approved", "rejected", "edit"]
 
     run_file = runs_dir / project_id / "history_pending_approval.json"
     saved = json.loads(run_file.read_text(encoding="utf-8"))
     assert saved["result"]["status"] == "completed"
-    assert saved["result"]["outputState"]["final_answer"] == "approved: 同意"
+    assert saved["result"]["outputState"]["final_answer"] == "edit: 需要补充材料"
 
     repeated = client.post(
         f"/api/projects/{project_id}/runs/history_pending_approval/resume",

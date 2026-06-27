@@ -1052,7 +1052,15 @@ export function Inspector() {
               value={String(node.config.prompt ?? "")}
               onChange={(event) => updateNodeConfig(node.id, { prompt: event.target.value })}
             />
-            <small>Workspace v1 会在此节点暂停运行，前端提交通过/拒绝和备注后继续；edit 暂保留为导出兼容动作。</small>
+            <small>Workspace 会在此节点暂停运行，前端提交审批动作和备注后继续。</small>
+          </Field>
+          <Field label="动作列表">
+            <input
+              value={String(node.config.actions ?? "approved,rejected,edit")}
+              onChange={(event) => updateNodeConfig(node.id, { actions: event.target.value })}
+              placeholder="approved,rejected,edit"
+            />
+            <small>可用逗号、分号或换行分隔；动作名应与条件输出分支一致。</small>
           </Field>
           <div className="inline-grid">
             <Field label="默认动作">

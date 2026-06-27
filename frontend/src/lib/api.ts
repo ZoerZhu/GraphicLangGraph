@@ -372,7 +372,7 @@ export async function runProjectPreview(
 export async function resumeProjectRun(
   projectId: string,
   runId: string,
-  action: "approved" | "rejected",
+  action: string,
   comment: string,
   modelConfig?: ModelConfig,
   runtimeEnvironment?: RuntimeEnvironmentConfig,

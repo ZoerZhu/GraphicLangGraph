@@ -119,7 +119,7 @@ class RunPreviewResponse(BaseModel):
 
 
 class ResumeRunRequest(BaseModel):
-    action: Literal["approved", "rejected"]
+    action: str
     comment: str = ""
     modelConfig: RunModelConfig | None = None
     runtimeEnvironment: RuntimeEnvironmentConfig | None = None

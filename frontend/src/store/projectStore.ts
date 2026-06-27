@@ -188,7 +188,7 @@ interface ProjectStore {
   clearRunHistory: () => Promise<void>;
   cancelRun: () => void;
   runPreview: () => Promise<void>;
-  resumePausedRun: (recordId: string, action: "approved" | "rejected", comment: string) => Promise<void>;
+  resumePausedRun: (recordId: string, action: string, comment: string) => Promise<void>;
   openSplitAgent: (projectId: string) => Promise<void>;
   closeSplitAgent: () => void;
   setSplitRatio: (ratio: number) => void;
