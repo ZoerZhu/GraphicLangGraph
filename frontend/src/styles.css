@@ -2932,6 +2932,65 @@ button.icon-only {
   gap: 5px;
 }
 
+.observability-details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 7px;
+}
+
+.observability-list {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  border: 1px solid rgba(18, 24, 38, 0.08);
+  border-radius: 11px;
+  padding: 7px 8px;
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.observability-list > strong {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 780;
+}
+
+.observability-list span,
+.observability-list em {
+  min-width: 0;
+  border-radius: 9px;
+  padding: 5px 6px;
+  color: var(--muted);
+  background: rgba(248, 250, 252, 0.82);
+  font-size: 10px;
+  font-style: normal;
+}
+
+.observability-list span.is-error {
+  color: #8f271c;
+  background: rgba(255, 245, 242, 0.8);
+}
+
+.observability-list b,
+.observability-list small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.observability-list b {
+  color: var(--ink);
+  font-weight: 760;
+}
+
+.observability-list small {
+  margin-top: 2px;
+  color: inherit;
+  opacity: 0.74;
+}
+
 .observability-hints span {
   border: 1px solid rgba(154, 100, 0, 0.18);
   border-radius: 10px;
@@ -2945,6 +3004,48 @@ button.icon-only {
 .runtime-call-list {
   display: grid;
   gap: 7px;
+}
+
+.runtime-call-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 7px;
+}
+
+.runtime-call-group {
+  min-width: 0;
+  border: 1px solid rgba(18, 24, 38, 0.08);
+  border-radius: 11px;
+  padding: 7px 8px;
+  background: rgba(255, 255, 255, 0.7);
+}
+
+.runtime-call-group.is-error {
+  border-color: rgba(180, 35, 24, 0.24);
+  background: rgba(255, 245, 242, 0.8);
+}
+
+.runtime-call-group strong,
+.runtime-call-group small,
+.runtime-call-group em {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-call-group strong {
+  color: var(--ink);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.runtime-call-group small,
+.runtime-call-group em {
+  color: var(--muted);
+  font-size: 10px;
+  font-style: normal;
 }
 
 .runtime-call-item {
@@ -3070,6 +3171,12 @@ button.icon-only {
   gap: 5px;
 }
 
+.run-trace-delta-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
 .run-trace-badges span {
   border: 1px solid rgba(18, 24, 38, 0.08);
   border-radius: 999px;
@@ -3078,6 +3185,16 @@ button.icon-only {
   background: rgba(255, 255, 255, 0.68);
   font-size: 10px;
   font-weight: 720;
+}
+
+.run-trace-delta-fields span {
+  border: 1px solid rgba(24, 169, 87, 0.16);
+  border-radius: 999px;
+  padding: 3px 6px;
+  color: #17663b;
+  background: rgba(244, 255, 248, 0.76);
+  font-size: 10px;
+  font-weight: 760;
 }
 
 .run-trace-meta {

@@ -547,7 +547,7 @@ function RunResultView({
 
       {templateAcceptance ? <TemplateAcceptanceSummary result={templateAcceptance} /> : null}
       <RunObservabilitySummary summary={observability} />
-      <RuntimeCallSummary calls={observability.calls} />
+      <RuntimeCallSummary calls={observability.calls} groups={observability.callGroups} />
 
       <section className="run-trace-section">
         <div className="run-section-title">
@@ -619,12 +619,76 @@ function RunObservabilitySummary({ summary }: { summary: RunObservabilitySummary
         <ObservabilityMetric label="调用" value={`${summary.calls.length}`} detail={callSummaryLabel(summary.calls)} tone={summary.calls.some((call) => call.ok === false) ? "error" : "neutral"} />
         <ObservabilityMetric label="状态" value={summary.paused ? "待审批" : summary.failed ? "失败" : "完成"} detail={summary.skippedCount ? `${summary.skippedCount} 跳过` : "无跳过节点"} tone={summary.paused ? "warning" : summary.failed ? "error" : "ok"} />
       </div>
+      <ObservabilityDetails summary={summary} />
       {hints.length ? (
         <div className="observability-hints">
           {hints.map((hint) => <span key={hint}>{hint}</span>)}
         </div>
       ) : null}
     </section>
+  );
+}
+
+function ObservabilityDetails({ summary }: { summary: RunObservabilitySummaryData }) {
+  return (
+    <div className="observability-details">
+      <ObservabilityList
+        title="错误分类"
+        empty="无错误"
+        items={summary.errorGroups.map((group) => ({
+          key: group.errorType,
+          title: `${group.errorType} · ${group.count}`,
+          detail: group.nodes.slice(0, 3).join(" / "),
+          tone: "error" as const,
+        }))}
+      />
+      <ObservabilityList
+        title="慢节点 Top"
+        empty="无耗时数据"
+        items={summary.slowNodes.map((item) => ({
+          key: item.nodeId,
+          title: `${item.label} · ${formatDuration(item.durationMs)}`,
+          detail: `${item.type} · ${item.status}`,
+          tone: item.status === "error" ? "error" as const : "neutral" as const,
+        }))}
+      />
+      <ObservabilityList
+        title="State 写入热点"
+        empty="无输出字段"
+        items={summary.stateDeltaFields.map((field) => ({
+          key: field.field,
+          title: `${field.field} · ${field.count}`,
+          detail: field.nodes.slice(0, 3).join(" / "),
+          tone: "neutral" as const,
+        }))}
+      />
+    </div>
+  );
+}
+
+function ObservabilityList({
+  title,
+  empty,
+  items,
+}: {
+  title: string;
+  empty: string;
+  items: Array<{ key: string; title: string; detail: string; tone: "neutral" | "error" }>;
+}) {
+  return (
+    <div className="observability-list">
+      <strong>{title}</strong>
+      {items.length ? (
+        items.slice(0, 5).map((item) => (
+          <span key={item.key} className={item.tone === "error" ? "is-error" : ""}>
+            <b>{item.title}</b>
+            <small>{item.detail || "无详情"}</small>
+          </span>
+        ))
+      ) : (
+        <em>{empty}</em>
+      )}
+    </div>
   );
 }
 
@@ -648,17 +712,25 @@ function ObservabilityMetric({
   );
 }
 
-function RuntimeCallSummary({ calls }: { calls: RuntimeCallRecord[] }) {
+function RuntimeCallSummary({ calls, groups }: { calls: RuntimeCallRecord[]; groups: RuntimeCallGroup[] }) {
   if (!calls.length) return null;
-  const visible = calls.slice(0, 8);
   return (
     <section className="runtime-call-summary">
       <div className="run-section-title">
         <strong>调用链</strong>
         <span>{calls.length} 次 Tool/MCP/Agent 调用</span>
       </div>
+      <div className="runtime-call-groups">
+        {groups.map((group) => (
+          <div key={group.source} className={`runtime-call-group ${group.errorCount ? "is-error" : ""}`}>
+            <strong>{group.source}</strong>
+            <small>{group.okCount} 成功 / {group.errorCount} 失败 · {formatDuration(group.totalDurationMs)}</small>
+            {group.errorTypes.length ? <em>{group.errorTypes.join(", ")}</em> : null}
+          </div>
+        ))}
+      </div>
       <div className="runtime-call-list">
-        {visible.map((call, index) => (
+        {calls.slice(0, 10).map((call, index) => (
           <div key={`${call.field}-${index}`} className={`runtime-call-item ${call.ok === false ? "is-error" : ""}`}>
             <span>{call.source}</span>
             <strong>{call.name}</strong>
@@ -670,7 +742,7 @@ function RuntimeCallSummary({ calls }: { calls: RuntimeCallRecord[] }) {
           </div>
         ))}
       </div>
-      {calls.length > visible.length ? <small className="runtime-call-summary__more">还有 {calls.length - visible.length} 次调用未展开。</small> : null}
+      {calls.length > 10 ? <small className="runtime-call-summary__more">还有 {calls.length - 10} 次调用未展开。</small> : null}
     </section>
   );
 }
@@ -712,6 +784,7 @@ function RunTraceCard({
   const dataShaping = traceRecord(item.dataShaping);
   const approval = traceRecord(item.approval);
   const badges = traceDiagnosticBadges(item);
+  const changedFields = outputDeltaFields(item.outputDelta);
   return (
     <article className={`run-trace-item is-${item.status}`}>
       <button
@@ -727,6 +800,12 @@ function RunTraceCard({
       {badges.length ? (
         <div className="run-trace-badges">
           {badges.map((badge) => <span key={badge}>{badge}</span>)}
+        </div>
+      ) : null}
+      {changedFields.length ? (
+        <div className="run-trace-delta-fields">
+          {changedFields.slice(0, 8).map((field) => <span key={field}>state.{field}</span>)}
+          {changedFields.length > 8 ? <span>+{changedFields.length - 8}</span> : null}
         </div>
       ) : null}
       {item.detail ? <p>{item.detail}</p> : null}
@@ -848,6 +927,27 @@ interface RuntimeCallRecord {
   errorType: string;
 }
 
+interface RuntimeCallGroup {
+  source: RuntimeCallRecord["source"];
+  count: number;
+  okCount: number;
+  errorCount: number;
+  totalDurationMs: number;
+  errorTypes: string[];
+}
+
+interface ErrorGroup {
+  errorType: string;
+  count: number;
+  nodes: string[];
+}
+
+interface StateDeltaField {
+  field: string;
+  count: number;
+  nodes: string[];
+}
+
 interface RunObservabilitySummaryData {
   statusLabel: string;
   nodeCount: number;
@@ -864,6 +964,10 @@ interface RunObservabilitySummaryData {
   paused: boolean;
   failed: boolean;
   calls: RuntimeCallRecord[];
+  callGroups: RuntimeCallGroup[];
+  errorGroups: ErrorGroup[];
+  slowNodes: RunTraceItem[];
+  stateDeltaFields: StateDeltaField[];
 }
 
 function buildRunObservability(result: RunPreviewResult): RunObservabilitySummaryData {
@@ -872,6 +976,7 @@ function buildRunObservability(result: RunPreviewResult): RunObservabilitySummar
   const skippedCount = trace.filter((item) => item.status === "skipped").length;
   const slowest = trace.reduce<RunTraceItem | null>((current, item) => (!current || item.durationMs > current.durationMs ? item : current), null);
   const status = result.status ?? (errorCount ? "failed" : "completed");
+  const calls = collectRuntimeCalls(result);
   return {
     statusLabel: runStatusLabel(status),
     nodeCount: trace.length,
@@ -887,7 +992,15 @@ function buildRunObservability(result: RunPreviewResult): RunObservabilitySummar
     parallelTraceCount: trace.filter((item) => item.parallel === true || item.type === "parallel_worker").length,
     paused: status === "paused",
     failed: status === "failed" || errorCount > 0,
-    calls: collectRuntimeCalls(result),
+    calls,
+    callGroups: groupRuntimeCalls(calls),
+    errorGroups: collectErrorGroups(trace, calls),
+    slowNodes: trace
+      .filter((item) => Number.isFinite(item.durationMs) && item.durationMs > 0)
+      .slice()
+      .sort((a, b) => b.durationMs - a.durationMs)
+      .slice(0, 5),
+    stateDeltaFields: collectStateDeltaFields(trace),
   };
 }
 
@@ -945,6 +1058,14 @@ function traceContainsRuntimeCall(item: RunTraceItem, source: "mcp" | "agent" | 
 function collectRuntimeCalls(result: RunPreviewResult): RuntimeCallRecord[] {
   const calls: RuntimeCallRecord[] = [];
   const seen = new Set<string>();
+  const addCall = (record: Record<string, unknown>, field: string) => {
+    const call = runtimeCallFromRecord(record, field);
+    const key = `${call.source}:${call.name}:${call.durationMs ?? ""}:${call.errorType}:${stableRuntimeCallKey(record)}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      calls.push(call);
+    }
+  };
   const visit = (value: unknown, path: string) => {
     if (!value || typeof value !== "object") return;
     if (Array.isArray(value)) {
@@ -952,24 +1073,39 @@ function collectRuntimeCalls(result: RunPreviewResult): RuntimeCallRecord[] {
         value.forEach((item, index) => {
           const record = traceRecord(item);
           if (!record) return;
-          const call = runtimeCallFromRecord(record, `${path}[${index}]`);
-          const key = `${call.field}:${call.source}:${call.name}:${call.durationMs ?? ""}:${call.errorType}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            calls.push(call);
-          }
+          addCall(record, `${path}[${index}]`);
         });
       }
       value.forEach((item, index) => visit(item, `${path}[${index}]`));
       return;
     }
-    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    const record = value as Record<string, unknown>;
+    if (looksLikeRuntimeCall(record, path)) addCall(record, path);
+    for (const [key, nested] of Object.entries(record)) {
       visit(nested, path ? `${path}.${key}` : key);
     }
   };
   visit(result.outputState, "state");
   result.trace.forEach((item, index) => visit(item.outputDelta, `trace[${index}].outputDelta`));
   return calls;
+}
+
+function stableRuntimeCallKey(record: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(record).slice(0, 1200);
+  } catch {
+    return Object.keys(record).sort().join(",");
+  }
+}
+
+function looksLikeRuntimeCall(record: Record<string, unknown>, path: string): boolean {
+  if (path.endsWith("_tool_calls") || path.endsWith("_mcp_tool_calls") || path.endsWith("_agent_tool_calls")) return false;
+  const source = traceText(record.source).toLowerCase();
+  if (["tool", "mcp", "agent"].includes(source)) return true;
+  if (record.serverName && (record.tool || record.toolName || record.raw || record.content)) return true;
+  if (record.agentName && (record.projectId || record.finalAnswer || record.outputState)) return true;
+  if (record.toolName && (record.args || record.result || record.durationMs)) return true;
+  return false;
 }
 
 function runtimeCallFromRecord(record: Record<string, unknown>, field: string): RuntimeCallRecord {
@@ -991,6 +1127,67 @@ function inferRuntimeCallSource(record: Record<string, unknown>, field: string):
   if (source === "agent" || field.includes("_agent_tool_calls") || record.agentName || record.projectId) return "agent";
   if (source === "tool" || field.includes("_tool_calls")) return "tool";
   return "unknown";
+}
+
+function groupRuntimeCalls(calls: RuntimeCallRecord[]): RuntimeCallGroup[] {
+  const order: RuntimeCallRecord["source"][] = ["tool", "mcp", "agent", "unknown"];
+  const groups = new Map<RuntimeCallRecord["source"], RuntimeCallGroup>();
+  calls.forEach((call) => {
+    const group = groups.get(call.source) ?? {
+      source: call.source,
+      count: 0,
+      okCount: 0,
+      errorCount: 0,
+      totalDurationMs: 0,
+      errorTypes: [],
+    };
+    group.count += 1;
+    if (call.ok === false) group.errorCount += 1;
+    else if (call.ok === true) group.okCount += 1;
+    if (call.durationMs != null) group.totalDurationMs += call.durationMs;
+    if (call.errorType && !group.errorTypes.includes(call.errorType)) group.errorTypes.push(call.errorType);
+    groups.set(call.source, group);
+  });
+  return order.map((source) => groups.get(source)).filter((group): group is RuntimeCallGroup => Boolean(group));
+}
+
+function collectErrorGroups(trace: RunTraceItem[], calls: RuntimeCallRecord[]): ErrorGroup[] {
+  const groups = new Map<string, ErrorGroup>();
+  const add = (errorType: string, nodeLabel: string) => {
+    const key = errorType || "runtime_error";
+    const group = groups.get(key) ?? { errorType: key, count: 0, nodes: [] };
+    group.count += 1;
+    if (nodeLabel && !group.nodes.includes(nodeLabel)) group.nodes.push(nodeLabel);
+    groups.set(key, group);
+  };
+  trace.forEach((item) => {
+    const lastError = traceRecord(item.outputDelta.last_error);
+    if (item.status === "error" || lastError) add(traceText(lastError?.errorType) || "node_error", item.label);
+    (item.attempts ?? []).forEach((attempt) => {
+      if (traceText(attempt.status) === "error") add(traceText(attempt.errorType) || "attempt_error", item.label);
+    });
+  });
+  calls.forEach((call) => {
+    if (call.ok === false) add(call.errorType || "call_error", call.name);
+  });
+  return [...groups.values()].sort((a, b) => b.count - a.count).slice(0, 6);
+}
+
+function collectStateDeltaFields(trace: RunTraceItem[]): StateDeltaField[] {
+  const fields = new Map<string, StateDeltaField>();
+  trace.forEach((item) => {
+    outputDeltaFields(item.outputDelta).forEach((field) => {
+      const current = fields.get(field) ?? { field, count: 0, nodes: [] };
+      current.count += 1;
+      if (!current.nodes.includes(item.label)) current.nodes.push(item.label);
+      fields.set(field, current);
+    });
+  });
+  return [...fields.values()].sort((a, b) => b.count - a.count || a.field.localeCompare(b.field)).slice(0, 8);
+}
+
+function outputDeltaFields(delta: Record<string, unknown>): string[] {
+  return Object.keys(delta).filter((field) => field !== "_glg_error_from" && !field.startsWith("__"));
 }
 
 function traceDiagnosticBadges(item: RunTraceItem): string[] {
