@@ -36,11 +36,12 @@ import {
   saveWorkspaceTools,
   saveProject,
   saveProjectRunHistory,
+  resumeProjectRun,
   streamProjectPreview,
   validateProject,
 } from "../lib/api";
 import { createNode, defaultOutputs } from "../lib/nodeCatalog";
-import { applyTemplateToProject, PROJECT_TEMPLATES } from "../lib/templates";
+import { applyTemplateToProject, getProjectTemplateForProject, PROJECT_TEMPLATES } from "../lib/templates";
 import type {
   AgentLinkConfig,
   EdgeIR,
@@ -187,6 +188,7 @@ interface ProjectStore {
   clearRunHistory: () => Promise<void>;
   cancelRun: () => void;
   runPreview: () => Promise<void>;
+  resumePausedRun: (recordId: string, action: "approved" | "rejected", comment: string) => Promise<void>;
   openSplitAgent: (projectId: string) => Promise<void>;
   closeSplitAgent: () => void;
   setSplitRatio: (ratio: number) => void;
@@ -1036,6 +1038,8 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     const nextProject = syncAllParallelWorkers(applyTemplateToProject(project, template));
     const saved = await saveProject(nextProject);
     const historyRecords = recordProjectHistory(saved, `应用模板：${template.name}`);
+    const sampleHint = template.sampleInput ? "，已填入样例输入" : "";
+    const modelHint = template.requiresModel ? "，请选择模型后运行" : "，可直接真实运行";
     set({
       project: saved,
       runInput: template.sampleInput ? JSON.stringify(template.sampleInput, null, 2) : get().runInput,
@@ -1045,8 +1049,13 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       validationOpen: false,
       exportResult: null,
       historyRecords,
+      runResult: null,
+      runtimeNodes: {},
+      selectedRunHistoryId: null,
+      runHistoryReplayMode: "overlay",
+      runHistoryMismatch: null,
       templatesOpen: false,
-      status: `已应用模板：${template.name}`,
+      status: `已应用模板：${template.name}${sampleHint}${modelHint}`,
     });
   },
 
@@ -1064,13 +1073,17 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       set({ status: "请输入搭建需求" });
       return;
     }
-    const templateId = /客服|售后|订单|退款/.test(normalized)
-      ? "customer_support"
-      : /知识库|问答|文档|rag|检索/i.test(normalized)
-        ? "knowledge_qa"
-        : "knowledge_qa";
+    const templateId = /api|json|清洗|校验|订单接口|订单 API/i.test(normalized)
+      ? "api_json_cleanup"
+      : /并发|foreach|for each|任务处理|task plan|结构化任务|错误兜底|merge|worker/i.test(normalized)
+        ? "flow_control_task_processing"
+        : /客服|售后|订单|退款/.test(normalized)
+          ? "customer_support"
+          : /知识库|问答|文档|rag|检索/i.test(normalized)
+            ? "knowledge_qa"
+            : "knowledge_qa";
     await get().applyTemplate(templateId);
-    set({ assistantOpen: false, status: "搭建助手已根据需求生成初始画布" });
+    set({ assistantOpen: false });
   },
 
   toggleRunPanel() {
@@ -1285,10 +1298,12 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       return;
     }
     const runMode: RunMode = "live";
+    const template = getProjectTemplateForProject(project);
+    const requiresModel = template?.requiresModel ?? true;
     const workspaceModelConfigs = normalizeModelConfigs(get().workspaceModelConfigs);
     const selectedRunModelConfigId = pickModelConfigId(workspaceModelConfigs, get().selectedRunModelConfigId);
     const selectedModelConfig = workspaceModelConfigs.find((config) => config.id === selectedRunModelConfigId && config.enabled);
-    if (!selectedModelConfig) {
+    if (requiresModel && !selectedModelConfig) {
       set({ status: "请先在管理页添加并启用一个模型配置" });
       return;
     }
@@ -1365,6 +1380,61 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
         activeRunToken = null;
         activeRunAbortController = null;
       }
+    }
+  },
+
+  async resumePausedRun(recordId, action, comment) {
+    const project = get().project;
+    if (!project) return;
+    const record = get().runHistoryRecords.find((item) => item.id === recordId);
+    if (!record || record.result.status !== "paused") {
+      set({ status: "当前运行记录不是待审批状态" });
+      return;
+    }
+    const template = getProjectTemplateForProject(project);
+    const requiresModel = template?.requiresModel ?? true;
+    const workspaceModelConfigs = normalizeModelConfigs(get().workspaceModelConfigs);
+    const selectedRunModelConfigId = pickModelConfigId(workspaceModelConfigs, get().selectedRunModelConfigId);
+    const selectedModelConfig = workspaceModelConfigs.find((config) => config.id === selectedRunModelConfigId && config.enabled);
+    if (requiresModel && !selectedModelConfig) {
+      set({ status: "请先在管理页添加并启用一个模型配置" });
+      return;
+    }
+    const runtimeEnvironments = normalizeRuntimeEnvironments(get().workspaceRuntimeEnvironments);
+    const selectedRuntimeEnvironment = pickRuntimeEnvironment(runtimeEnvironments, project.project.runtimeEnvironmentId);
+    set({ runRunning: true, runOpen: true, runCollapsed: false, status: "正在恢复审批后的运行" });
+    try {
+      const result = await resumeProjectRun(
+        project.project.id,
+        recordId,
+        action,
+        comment,
+        selectedModelConfig,
+        selectedRuntimeEnvironment ?? undefined,
+      );
+      const runtimeNodes = runtimeNodesFromTrace(project, result.trace);
+      const nextRecord: RunHistoryRecord = {
+        ...record,
+        result: cloneRecord(result) as RunPreviewResult,
+        runtimeNodes,
+      };
+      const runHistoryRecords = get().runHistoryRecords.map((item) => (item.id === recordId ? nextRecord : item));
+      writeRunHistory(project.project.id, runHistoryRecords);
+      set({
+        runRunning: false,
+        runResult: result,
+        runtimeNodes,
+        runHistoryRecords,
+        selectedRunHistoryId: recordId,
+        runHistoryReplayMode: "overlay",
+        runHistoryMismatch: null,
+        status: result.status === "paused" ? "运行再次暂停，等待人工审批" : result.status === "failed" ? "审批后运行失败" : "审批后运行完成",
+      });
+    } catch (error) {
+      set({
+        runRunning: false,
+        status: error instanceof Error ? error.message : "恢复运行失败",
+      });
     }
   },
 
@@ -2577,6 +2647,35 @@ function finalizeRunHistory(state: ProjectStore, result: RunPreviewResult): Part
   };
 }
 
+function runtimeNodesFromTrace(project: ProjectIR, trace: RunTraceItem[]): Record<string, NodeRuntimeState> {
+  const nodes = initializeRuntimeNodes(project);
+  const now = new Date().toISOString();
+  for (const item of trace) {
+    nodes[item.nodeId] = {
+      status: item.status,
+      label: item.label,
+      detail: item.detail,
+      durationMs: item.durationMs,
+      inputState: item.inputState,
+      outputDelta: item.outputDelta,
+      updatedAt: now,
+      virtual: item.virtual,
+      parentNodeId: item.parentNodeId ?? null,
+      iterationIndex: item.iterationIndex ?? null,
+      iterationItem: item.iterationItem,
+      sourceNodeId: item.sourceNodeId ?? null,
+      attempts: item.attempts,
+      errorPolicy: item.errorPolicy ?? null,
+      timeoutSec: item.timeoutSec ?? null,
+      parallel: item.parallel ?? null,
+      itemFailurePolicy: item.itemFailurePolicy ?? null,
+      nodeType: item.type,
+      position: item.position ?? null,
+    };
+  }
+  return nodes;
+}
+
 function parseRecord(value: string): Record<string, unknown> {
   try {
     const parsed = JSON.parse(value || "{}");
@@ -2781,6 +2880,8 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
         issues: event.issues,
         trace: [],
         outputState: event.inputState,
+        status: "completed",
+        pendingApproval: null,
       },
       runRunning: event.valid,
       status: event.valid ? "真实运行开始" : "图校验未通过，未开始真实运行",
@@ -2807,7 +2908,7 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
       },
       runResult: state.runResult
         ? { ...state.runResult, valid: event.valid, issues: event.issues }
-        : { mode: event.mode, valid: event.valid, issues: event.issues, trace: [], outputState: event.inputState },
+        : { mode: event.mode, valid: event.valid, issues: event.issues, trace: [], outputState: event.inputState, status: "completed", pendingApproval: null },
       status: `正在运行：${event.label}`,
       selectedNodeId: event.nodeId,
     };
@@ -2844,6 +2945,8 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
         issues: event.issues,
         trace,
         outputState: event.outputState,
+        status: event.traceItem.pause ? "paused" : state.runResult?.status ?? "completed",
+        pendingApproval: event.traceItem.pause && event.traceItem.approval ? event.traceItem.approval as NonNullable<RunPreviewResult["pendingApproval"]> : state.runResult?.pendingApproval ?? null,
       },
       status: event.traceItem.status === "error" ? `运行失败：${event.traceItem.label}` : `节点完成：${event.traceItem.label}`,
       selectedNodeId: event.traceItem.nodeId,
@@ -2870,7 +2973,7 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
       },
       runResult: state.runResult
         ? { ...state.runResult, valid: event.valid, issues: event.issues }
-        : { mode: event.mode, valid: event.valid, issues: event.issues, trace: [], outputState: event.inputState },
+        : { mode: event.mode, valid: event.valid, issues: event.issues, trace: [], outputState: event.inputState, status: "completed", pendingApproval: null },
       status: `正在运行：${event.label}`,
       selectedNodeId: event.nodeId,
     };
@@ -2898,7 +3001,7 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
       },
       runResult: state.runResult
         ? { ...state.runResult, valid: event.valid, issues: event.issues, trace }
-        : { mode: event.mode, valid: event.valid, issues: event.issues, trace, outputState: {} },
+        : { mode: event.mode, valid: event.valid, issues: event.issues, trace, outputState: {}, status: "completed", pendingApproval: null },
       status: event.traceItem.status === "error" ? `Worker 失败：${event.traceItem.label}` : `Worker 完成：${event.traceItem.label}`,
       selectedNodeId: event.traceItem.nodeId,
     };
@@ -2910,9 +3013,11 @@ function applyRunStreamEvent(state: ProjectStore, event: RunStreamEvent): Partia
       issues: event.issues,
       trace: event.trace,
       outputState: event.outputState,
+      status: event.status ?? "completed",
+      pendingApproval: event.pendingApproval ?? null,
     }),
     runRunning: false,
-    status: event.valid ? "真实运行完成" : "运行预览完成，但图校验未通过",
+    status: event.status === "paused" ? "运行已暂停，等待人工审批" : event.status === "failed" ? "真实运行失败" : event.valid ? "真实运行完成" : "运行预览完成，但图校验未通过",
   };
 }
 

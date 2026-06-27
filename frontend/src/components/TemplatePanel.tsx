@@ -27,6 +27,14 @@ export function TemplatePanel() {
               <strong>{template.name}</strong>
               <p>{template.description}</p>
               <small>{template.nodes.length} 节点 · {template.edges.length} 连线{template.sampleInput ? " · 含样例输入" : ""}</small>
+              <div className="template-card__tags">
+                <span>{template.requiresModel ? "需要模型" : "无需模型"}</span>
+                <span>{template.requiresNetwork ? "需要网络" : "本地/mock"}</span>
+                <span>{template.recommendedRunMode === "live" ? "推荐真实运行" : "推荐 dry-run"}</span>
+              </div>
+              <div className="template-card__outputs">
+                {template.expectedOutputFields.slice(0, 4).map((field) => <span key={field}>{field}</span>)}
+              </div>
             </div>
             <button className="primary" onClick={() => void applyTemplate(template.id)} type="button">
               应用

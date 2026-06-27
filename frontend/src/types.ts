@@ -319,6 +319,8 @@ export interface ProjectIR {
     kind: "agent" | "agents";
     runtimeEnvironmentId: string;
     schemaVersion: string;
+    templateId?: string;
+    templateVersion?: string;
   };
   state: {
     base: string;
@@ -488,11 +490,36 @@ export interface RunTraceItem {
   parallel?: boolean | null;
   itemFailurePolicy?: string | null;
   dataShaping?: Record<string, unknown> | null;
+  pause?: boolean;
+  approval?: PendingApproval | Record<string, unknown> | null;
   position?: Position | null;
+}
+
+export interface TemplateAcceptanceResult {
+  ok: boolean;
+  templateId: string;
+  templateName: string;
+  missingFields: string[];
+  missingTraceTypes: NodeType[];
+  warnings: string[];
+  errorTraceCount: number;
+  finalAnswerPresent: boolean;
 }
 
 export type RunTraceStatus = "ok" | "skipped" | "error";
 export type NodeRuntimeStatus = "idle" | "queued" | "running" | RunTraceStatus;
+export type RunStatus = "completed" | "failed" | "paused";
+
+export interface PendingApproval {
+  nodeId: string;
+  nodeLabel?: string;
+  prompt?: string;
+  actions?: string[];
+  defaultAction?: "approved" | "rejected" | string;
+  actionField?: string;
+  outputField?: string;
+  state?: Record<string, unknown>;
+}
 
 export interface NodeRuntimeState {
   status: NodeRuntimeStatus;
@@ -522,6 +549,8 @@ export interface RunPreviewResult {
   issues: ValidationIssue[];
   trace: RunTraceItem[];
   outputState: Record<string, unknown>;
+  status?: RunStatus;
+  pendingApproval?: PendingApproval | null;
 }
 
 export type RunStreamEvent =
@@ -580,4 +609,6 @@ export type RunStreamEvent =
       issues: ValidationIssue[];
       trace: RunTraceItem[];
       outputState: Record<string, unknown>;
+      status?: RunStatus;
+      pendingApproval?: PendingApproval | null;
     };

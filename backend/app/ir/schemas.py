@@ -73,6 +73,8 @@ class ProjectMeta(BaseModel):
     kind: str = "agent"
     runtime_environment_id: str = Field("", alias="runtimeEnvironmentId")
     schema_version: str = Field("0.1.0", alias="schemaVersion")
+    template_id: str = Field("", alias="templateId")
+    template_version: str = Field("", alias="templateVersion")
 
 
 class NodeIR(BaseModel):

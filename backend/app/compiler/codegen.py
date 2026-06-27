@@ -367,6 +367,27 @@ Editing tools save patch sessions under `.glg_edit_sessions`. Direct writing, pa
 
 MCP nodes and MCP-enabled Agents use the generated MCP runtime. Remote HTTP MCP servers are controlled by `GLG_MCP_NETWORK_ENABLED` and `GLG_MCP_ALLOWED_HOSTS`; local stdio MCP commands are controlled by `GLG_MCP_ALLOWED_COMMANDS`. Secrets are read from environment variables only.
 """
+    human_approval_note = ""
+    if any(node.type == NodeType.HUMAN_APPROVAL for node in project.nodes):
+        human_approval_note = f"""
+## Human approval resume
+
+Human Approval nodes call LangGraph `interrupt(payload)` and the generated graph is compiled with an in-memory checkpointer. Use a stable `thread_id`, inspect the interrupted payload, then resume with `Command(resume={{...}})`.
+
+```bash
+python - <<'PY'
+from langgraph.types import Command
+from {package}.graph import graph
+
+config = {{"configurable": {{"thread_id": "approval-demo"}}}}
+first = graph.invoke({sample_input}, config=config)
+print(first)
+
+resumed = graph.invoke(Command(resume={{"action": "approved", "comment": "Looks good"}}), config=config)
+print(resumed)
+PY
+```
+"""
     embedded_note = ""
     if embedded_registry:
         names = ", ".join(str(item.get("name") or item.get("projectId")) for item in embedded_registry.values())
@@ -412,6 +433,7 @@ PY
 {file_tool_note}
 {edit_tool_note}
 {mcp_note}
+{human_approval_note}
 {embedded_note}
 """
 

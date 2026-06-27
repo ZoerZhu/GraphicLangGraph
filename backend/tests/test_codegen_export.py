@@ -779,10 +779,14 @@ def test_codegen_human_approval_uses_interrupt_and_checkpointer():
     files = generate_project_files(project)
     nodes_py = next(value for path, value in files.items() if path.endswith("/nodes.py"))
     graph_py = next(value for path, value in files.items() if path.endswith("/graph.py"))
+    readme = files["README.md"]
 
     assert "interrupt(payload)" in nodes_py
     assert "InMemorySaver" in graph_py
     assert "compile(checkpointer=checkpointer)" in graph_py
+    assert "Human approval resume" in readme
+    assert "Command(resume=" in readme
+    assert '"action": "approved"' in readme
 
 
 def test_codegen_sanitizes_flow_project_json():

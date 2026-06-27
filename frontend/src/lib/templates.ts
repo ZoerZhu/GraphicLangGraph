@@ -1,10 +1,20 @@
 import type { EdgeIR, NodeIR, ProjectIR, StateField } from "../types";
 
+export type ProjectTemplateCategory = "knowledge" | "coding" | "workflow" | "data" | "support";
+export type ProjectTemplateRunMode = "dry" | "live";
+
 export interface ProjectTemplate {
   id: string;
+  version: string;
   name: string;
   description: string;
   kind: "agent" | "agents";
+  category: ProjectTemplateCategory;
+  recommendedRunMode: ProjectTemplateRunMode;
+  requiresModel: boolean;
+  requiresNetwork: boolean;
+  expectedOutputFields: string[];
+  expectedTraceTypes: NodeIR["type"][];
   sampleInput?: Record<string, unknown>;
   fields: StateField[];
   nodes: NodeIR[];
@@ -14,9 +24,16 @@ export interface ProjectTemplate {
 export const PROJECT_TEMPLATES: ProjectTemplate[] = [
   {
     id: "knowledge_qa",
+    version: "1.0.0",
     name: "知识库问答 Agent",
     description: "改写问题、检索知识库、生成带上下文的回答。",
     kind: "agent",
+    category: "knowledge",
+    recommendedRunMode: "live",
+    requiresModel: true,
+    requiresNetwork: false,
+    expectedOutputFields: ["rewritten_query", "retrieved_context", "final_answer"],
+    expectedTraceTypes: ["llm", "retriever", "direct_reply"],
     fields: [
       { name: "rewritten_query", type: "str", description: "改写后的检索问题" },
       { name: "retrieved_context", type: "str", description: "检索上下文" },
@@ -60,9 +77,16 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
   },
   {
     id: "coder_editor",
+    version: "1.0.0",
     name: "Coder Editor Agent",
     description: "读取代码、生成修改计划、提出可审批 patch，并给出验证建议。",
     kind: "agent",
+    category: "coding",
+    recommendedRunMode: "live",
+    requiresModel: true,
+    requiresNetwork: false,
+    expectedOutputFields: ["code_context", "edit_plan", "patch_result", "final_answer"],
+    expectedTraceTypes: ["tool", "llm", "direct_reply"],
     fields: [
       { name: "code_context", type: "dict", description: "目录、搜索和代码定位结果" },
       { name: "edit_plan", type: "str", description: "修改计划和补丁生成指令" },
@@ -113,9 +137,16 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
   },
   {
     id: "task_plan_parallel",
+    version: "1.0.0",
     name: "结构化任务并行 Worker",
     description: "把用户目标抽取为 Task Plan JSON，校验后拆分并交给并行 Worker 处理。",
     kind: "agent",
+    category: "workflow",
+    recommendedRunMode: "live",
+    requiresModel: true,
+    requiresNetwork: false,
+    expectedOutputFields: ["task_plan", "task_plan_validation", "worker_tasks", "worker_results", "final_answer"],
+    expectedTraceTypes: ["json_extractor", "task_splitter", "parallel_tools", "direct_reply"],
     sampleInput: {
       messages: "请把这次代码审查拆成三个并行任务：检查后端运行逻辑、检查前端配置体验、汇总风险和验证建议。",
     },
@@ -184,9 +215,16 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
   },
   {
     id: "flow_control_task_processing",
+    version: "1.0.0",
     name: "并发任务处理 Flow Control v2",
     description: "校验 Task Plan，并发 ForEach 处理每个任务，收集单项错误，Merge 聚合结果后直接回复。",
     kind: "agent",
+    category: "workflow",
+    recommendedRunMode: "live",
+    requiresModel: true,
+    requiresNetwork: false,
+    expectedOutputFields: ["task_plan", "task_plan_validation", "worker_tasks", "merged_results", "final_answer"],
+    expectedTraceTypes: ["json_extractor", "json_validator", "task_splitter", "for_each", "merge", "direct_reply"],
     sampleInput: {
       messages: "请把这次验收拆成三个任务：检查数据输入、处理每个任务、汇总结果。",
     },
@@ -297,9 +335,16 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
   },
   {
     id: "api_json_cleanup",
+    version: "1.0.0",
     name: "API JSON 清洗与校验",
     description: "读取订单 API 返回，用 Template 统一字段结构，再用 JSON Validator 校验并回复。",
     kind: "agent",
+    category: "data",
+    recommendedRunMode: "live",
+    requiresModel: false,
+    requiresNetwork: false,
+    expectedOutputFields: ["order_info", "clean_order", "order_validation", "final_answer"],
+    expectedTraceTypes: ["http", "template", "json_validator", "direct_reply"],
     sampleInput: {
       messages: "查询订单 O-10086 的配送状态",
       order_id: "O-10086",
@@ -370,9 +415,16 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
   },
   {
     id: "customer_support",
+    version: "1.0.0",
     name: "客服工单 Agent",
     description: "识别订单/退款/其他问题，查询订单、审批退款并组织回复。",
     kind: "agent",
+    category: "support",
+    recommendedRunMode: "live",
+    requiresModel: true,
+    requiresNetwork: false,
+    expectedOutputFields: ["route_key", "route_reason", "agent_result", "final_answer"],
+    expectedTraceTypes: ["ai_router", "agent", "direct_reply"],
     fields: [
       { name: "route_key", type: "str", description: "意图路由" },
       { name: "route_reason", type: "str", description: "路由原因" },
@@ -457,6 +509,8 @@ export function applyTemplateToProject(project: ProjectIR, template: ProjectTemp
       name: template.name,
       description: template.description,
       kind: template.kind,
+      templateId: template.id,
+      templateVersion: template.version,
     },
     state: {
       ...project.state,
@@ -465,6 +519,15 @@ export function applyTemplateToProject(project: ProjectIR, template: ProjectTemp
     nodes: template.nodes,
     edges: template.edges,
   };
+}
+
+export function getProjectTemplate(templateId?: string | null): ProjectTemplate | null {
+  if (!templateId) return null;
+  return PROJECT_TEMPLATES.find((template) => template.id === templateId) ?? null;
+}
+
+export function getProjectTemplateForProject(project?: ProjectIR | null): ProjectTemplate | null {
+  return getProjectTemplate(project?.project.templateId);
 }
 
 function node(

@@ -369,6 +369,21 @@ export async function runProjectPreview(
   return RunPreviewResultSchema.parse(data) as RunPreviewResult;
 }
 
+export async function resumeProjectRun(
+  projectId: string,
+  runId: string,
+  action: "approved" | "rejected",
+  comment: string,
+  modelConfig?: ModelConfig,
+  runtimeEnvironment?: RuntimeEnvironmentConfig,
+): Promise<RunPreviewResult> {
+  const data = await request(`/api/projects/${projectId}/runs/${runId}/resume`, {
+    method: "POST",
+    body: JSON.stringify({ action, comment, modelConfig, runtimeEnvironment }),
+  });
+  return RunPreviewResultSchema.parse(data) as RunPreviewResult;
+}
+
 export async function listDataShapingPaths(
   projectId: string,
   state: Record<string, unknown> = {},

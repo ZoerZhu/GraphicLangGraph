@@ -45,6 +45,12 @@ export function AssistantPanel() {
           客服工单
         </button>
         <button onClick={() => {
+          setPrompt("帮我做一个 API JSON 清洗流程，读取订单接口返回，统一字段结构，校验 JSON 后回复用户。");
+          setPreviewTemplateId(null);
+        }} type="button">
+          API 清洗
+        </button>
+        <button onClick={() => {
           setPrompt("帮我做一个并发任务处理流程，先校验结构化任务 JSON，再并发处理每个任务并汇总结果。");
           setPreviewTemplateId(null);
         }} type="button">
@@ -63,6 +69,8 @@ export function AssistantPanel() {
             <small>{previewTemplate.nodes.length} 节点</small>
             <small>{previewTemplate.edges.length} 连线</small>
             <small>{previewTemplate.fields.length} State 字段</small>
+            <small>{previewTemplate.requiresModel ? "需要模型" : "无需模型"}</small>
+            <small>{previewTemplate.requiresNetwork ? "需要网络" : "本地/mock"}</small>
           </div>
           <ul>
             {previewTemplate.fields.slice(0, 6).map((field) => (
@@ -80,8 +88,9 @@ export function AssistantPanel() {
 
 function pickTemplateId(prompt: string) {
   const normalized = prompt.trim();
-  if (/客服|售后|订单|退款/.test(normalized)) return "customer_support";
+  if (/api|json|清洗|校验|订单接口|订单 API/i.test(normalized)) return "api_json_cleanup";
   if (/并发|foreach|for each|任务处理|task plan|结构化任务|错误兜底|merge/i.test(normalized)) return "flow_control_task_processing";
+  if (/客服|售后|订单|退款/.test(normalized)) return "customer_support";
   if (/知识库|问答|文档|rag|检索/i.test(normalized)) return "knowledge_qa";
   return "knowledge_qa";
 }

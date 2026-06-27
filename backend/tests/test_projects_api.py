@@ -221,6 +221,109 @@ def test_project_run_stream_emits_node_events():
     assert deleted.status_code == 204
 
 
+def test_project_run_human_approval_pauses_and_resumes(tmp_path, monkeypatch):
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setattr(app_config, "RUNS_DIR", runs_dir)
+    monkeypatch.setattr(run_store, "RUNS_DIR", runs_dir)
+    client = TestClient(app)
+
+    created = client.post("/api/projects", json={"name": "人工审批恢复 Agent"})
+    assert created.status_code == 200
+    project = created.json()
+    project_id = project["project"]["id"]
+    project["state"]["fields"].extend(
+        [
+            {"name": "approval_action", "type": "str", "description": ""},
+            {"name": "approval_result", "type": "dict", "description": ""},
+            {"name": "final_answer", "type": "str", "description": ""},
+        ]
+    )
+    project["nodes"].extend(
+        [
+            {
+                "id": "approval_1",
+                "type": "human_approval",
+                "label": "人工审批",
+                "position": {"x": 320, "y": 220},
+                "config": {
+                    "prompt": "请确认是否继续：{{ state.messages }}",
+                    "actionField": "approval_action",
+                    "outputField": "approval_result",
+                    "fallback": "rejected",
+                },
+                "inputs": [{"id": "in", "type": "control", "label": "输入"}],
+                "outputs": [
+                    {"id": "approved", "type": "control", "label": "通过"},
+                    {"id": "rejected", "type": "control", "label": "拒绝"},
+                ],
+            },
+            {
+                "id": "reply_ok",
+                "type": "direct_reply",
+                "label": "通过回复",
+                "position": {"x": 560, "y": 180},
+                "config": {"template": "approved: {{ state.approval_result.comment }}", "outputField": "final_answer"},
+                "inputs": [{"id": "in", "type": "control", "label": "输入"}],
+                "outputs": [],
+            },
+            {
+                "id": "reply_no",
+                "type": "direct_reply",
+                "label": "拒绝回复",
+                "position": {"x": 560, "y": 260},
+                "config": {"template": "rejected: {{ state.approval_result.comment }}", "outputField": "final_answer"},
+                "inputs": [{"id": "in", "type": "control", "label": "输入"}],
+                "outputs": [],
+            },
+        ]
+    )
+    project["edges"].extend(
+        [
+            {"id": "e_start_approval", "source": "start", "sourceHandle": "out", "target": "approval_1", "kind": "normal"},
+            {"id": "e_approved", "source": "approval_1", "sourceHandle": "approved", "target": "reply_ok", "kind": "conditional"},
+            {"id": "e_rejected", "source": "approval_1", "sourceHandle": "rejected", "target": "reply_no", "kind": "conditional"},
+        ]
+    )
+    assert client.put(f"/api/projects/{project_id}", json=project).status_code == 200
+
+    preview = client.post(f"/api/projects/{project_id}/run", json={"input": {"messages": "退款申请"}, "mode": "live"})
+    assert preview.status_code == 200
+    paused = preview.json()
+    assert paused["status"] == "paused"
+    assert paused["pendingApproval"]["nodeId"] == "approval_1"
+    assert paused["trace"][-1]["pause"] is True
+
+    record = {
+        "id": "history_pending_approval",
+        "projectId": project_id,
+        "projectName": "人工审批恢复 Agent",
+        "createdAt": "2026-06-27T00:00:00.000Z",
+        "modelConfigId": None,
+        "modelConfigName": "未选择模型",
+        "inputState": {"messages": "退款申请"},
+        "result": paused,
+        "runtimeNodes": {},
+    }
+    assert client.post(f"/api/projects/{project_id}/runs", json=record).status_code == 200
+
+    resumed = client.post(
+        f"/api/projects/{project_id}/runs/history_pending_approval/resume",
+        json={"action": "approved", "comment": "同意"},
+    )
+    assert resumed.status_code == 200
+    body = resumed.json()
+    assert body["status"] == "completed"
+    assert body["pendingApproval"] is None
+    assert body["outputState"]["approval_action"] == "approved"
+    assert body["outputState"]["approval_result"]["comment"] == "同意"
+    assert body["outputState"]["final_answer"] == "approved: 同意"
+
+    run_file = runs_dir / project_id / "history_pending_approval.json"
+    saved = json.loads(run_file.read_text(encoding="utf-8"))
+    assert saved["result"]["status"] == "completed"
+    assert saved["result"]["outputState"]["final_answer"] == "approved: 同意"
+
+
 def test_project_run_history_persists_to_runs_dir(tmp_path, monkeypatch):
     runs_dir = tmp_path / "runs"
     monkeypatch.setattr(app_config, "RUNS_DIR", runs_dir)
@@ -355,6 +458,30 @@ def test_project_save_and_read_preserves_skills():
     loaded = client.get(f"/api/projects/{project_id}")
     assert loaded.status_code == 200
     assert loaded.json()["skills"][0]["content"] == "请保持礼貌、简洁。"
+
+    deleted = client.delete(f"/api/projects/{project_id}")
+    assert deleted.status_code == 204
+
+
+def test_project_save_and_read_preserves_template_metadata():
+    client = TestClient(app)
+
+    created = client.post("/api/projects", json={"name": "模板来源保存测试 Agent"})
+    assert created.status_code == 200
+    project = created.json()
+    project_id = project["project"]["id"]
+    project["project"]["templateId"] = "api_json_cleanup"
+    project["project"]["templateVersion"] = "1.0.0"
+
+    saved = client.put(f"/api/projects/{project_id}", json=project)
+    assert saved.status_code == 200
+    assert saved.json()["project"]["templateId"] == "api_json_cleanup"
+    assert saved.json()["project"]["templateVersion"] == "1.0.0"
+
+    loaded = client.get(f"/api/projects/{project_id}")
+    assert loaded.status_code == 200
+    assert loaded.json()["project"]["templateId"] == "api_json_cleanup"
+    assert loaded.json()["project"]["templateVersion"] == "1.0.0"
 
     deleted = client.delete(f"/api/projects/{project_id}")
     assert deleted.status_code == 204

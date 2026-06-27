@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, ChevronDown, Eye, Layers, Maximize2, Minimize2, RotateCcw, ShieldCheck, Trash2, X } from "lucide-react";
 import { applyEditSession, discardEditSession, getEditSession, rollbackEditSession, runEditCommand } from "../lib/api";
+import { evaluateTemplateAcceptance } from "../lib/templateAcceptance";
+import { getProjectTemplateForProject } from "../lib/templates";
 import { useProjectStore } from "../store/projectStore";
-import type { CommandRunResult, EditSession, RunHistoryGraphMismatch, RunHistoryRecord, RunHistoryReplayMode, RunPreviewResult, RunTraceItem, RuntimeEnvironmentConfig, ValidationIssue } from "../types";
+import type { CommandRunResult, EditSession, RunHistoryGraphMismatch, RunHistoryRecord, RunHistoryReplayMode, RunPreviewResult, RunTraceItem, RuntimeEnvironmentConfig, TemplateAcceptanceResult, ValidationIssue } from "../types";
 import { FloatingPanel } from "./FloatingPanel";
 import { RunInputEditor, RunModelPicker, RunStartButton } from "./RunControls";
 import { RuntimeValueView } from "./RuntimeValueView";
@@ -33,7 +35,11 @@ export function RunPreviewPanel() {
   const setRunHistoryReplayMode = useProjectStore((state) => state.setRunHistoryReplayMode);
   const deleteRunHistoryRecord = useProjectStore((state) => state.deleteRunHistoryRecord);
   const clearRunHistory = useProjectStore((state) => state.clearRunHistory);
+  const resumePausedRun = useProjectStore((state) => state.resumePausedRun);
   const enabledModels = workspaceModelConfigs.filter((config) => config.enabled);
+  const projectTemplate = getProjectTemplateForProject(project);
+  const requiresModel = projectTemplate?.requiresModel ?? true;
+  const templateAcceptance = useMemo(() => evaluateTemplateAcceptance(project, runResult), [project, runResult]);
   const selectableNodeIds = runHistoryMismatch && runHistoryReplayMode === "details"
     ? new Set<string>()
     : new Set(project?.nodes.map((node) => node.id) ?? []);
@@ -100,7 +106,7 @@ export function RunPreviewPanel() {
               onChange={setSelectedRunModelConfigId}
             />
             <RunStartButton
-              disabled={enabledModels.length === 0}
+              disabled={requiresModel && enabledModels.length === 0}
               running={runRunning}
               onRun={() => void runPreview()}
               onStop={cancelRun}
@@ -127,7 +133,13 @@ export function RunPreviewPanel() {
         {runResult ? (
           <>
             <PatchApplicationPanel result={runResult} />
-            <RunResultView result={runResult} selectableNodeIds={selectableNodeIds} onSelectNode={selectNode} />
+            <PendingApprovalPanel
+              result={runResult}
+              recordId={selectedRunHistoryId}
+              running={runRunning}
+              onResume={resumePausedRun}
+            />
+            <RunResultView result={runResult} templateAcceptance={templateAcceptance} selectableNodeIds={selectableNodeIds} onSelectNode={selectNode} />
           </>
         ) : (
           <div className="run-empty">
@@ -136,6 +148,59 @@ export function RunPreviewPanel() {
         )}
       </div>
     </FloatingPanel>
+  );
+}
+
+function PendingApprovalPanel({
+  result,
+  recordId,
+  running,
+  onResume,
+}: {
+  result: RunPreviewResult;
+  recordId: string | null;
+  running: boolean;
+  onResume: (recordId: string, action: "approved" | "rejected", comment: string) => Promise<void>;
+}) {
+  const [comment, setComment] = useState("");
+  const approval = result.pendingApproval;
+  if (result.status !== "paused" || !approval) return null;
+  const disabled = running || !recordId;
+  return (
+    <section className="approval-panel">
+      <div className="run-section-title">
+        <strong>等待人工审批</strong>
+        <span>{approval.nodeLabel ?? approval.nodeId}</span>
+      </div>
+      {approval.prompt ? <p className="approval-panel__prompt">{approval.prompt}</p> : null}
+      <label className="field">
+        <span>审批备注</span>
+        <textarea
+          value={comment}
+          onChange={(event) => setComment(event.target.value)}
+          placeholder="可填写拒绝原因、审批依据或处理说明"
+          rows={3}
+        />
+      </label>
+      <div className="approval-panel__actions">
+        <button disabled={disabled} onClick={() => recordId && void onResume(recordId, "approved", comment)} type="button">
+          <ShieldCheck size={14} />
+          通过并继续
+        </button>
+        <button disabled={disabled} onClick={() => recordId && void onResume(recordId, "rejected", comment)} type="button">
+          <X size={14} />
+          拒绝并继续
+        </button>
+      </div>
+      {approval.state ? (
+        <details className="runtime-value__fold">
+          <summary>
+            <span>当前 State 摘要</span>
+          </summary>
+          <RuntimeValueView value={approval.state} />
+        </details>
+      ) : null}
+    </section>
   );
 }
 
@@ -329,6 +394,7 @@ function RunHistoryList({
                 <strong>{formatTime(record.createdAt)}</strong>
                 <span>{record.modelConfigName}</span>
                 <small>
+                  {record.result.status === "paused" ? "已暂停 · " : record.result.status === "failed" ? "失败 · " : ""}
                   {record.result.trace.length} 节点 · {record.result.valid ? "校验通过" : `${record.result.issues.length} 个问题`}
                 </small>
               </button>
@@ -393,10 +459,12 @@ function RunHistoryMismatchNotice({
 
 function RunResultView({
   result,
+  templateAcceptance,
   selectableNodeIds,
   onSelectNode,
 }: {
   result: RunPreviewResult;
+  templateAcceptance: TemplateAcceptanceResult | null;
   selectableNodeIds: Set<string>;
   onSelectNode: (nodeId: string | null) => void;
 }) {
@@ -420,6 +488,8 @@ function RunResultView({
           ))}
         </div>
       ) : null}
+
+      {templateAcceptance ? <TemplateAcceptanceSummary result={templateAcceptance} /> : null}
 
       <section className="run-trace-section">
         <div className="run-section-title">
@@ -449,6 +519,28 @@ function RunResultView({
         </div>
       </section>
     </div>
+  );
+}
+
+function TemplateAcceptanceSummary({ result }: { result: TemplateAcceptanceResult }) {
+  return (
+    <section className={`template-acceptance ${result.ok ? "is-ok" : "is-warning"}`}>
+      <div className="run-section-title">
+        <strong>模板验收</strong>
+        <span>{result.templateName}</span>
+      </div>
+      <div className="template-acceptance__status">
+        {result.ok ? "通过" : "需检查"}
+        <small>{result.finalAnswerPresent ? "final_answer 已生成" : "缺少 final_answer"}</small>
+      </div>
+      {result.warnings.length ? (
+        <div className="template-acceptance__warnings">
+          {result.warnings.map((warning) => <span key={warning}>{warning}</span>)}
+        </div>
+      ) : (
+        <p>关键输出字段和 trace 类型均已命中。</p>
+      )}
+    </section>
   );
 }
 

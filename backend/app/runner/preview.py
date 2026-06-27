@@ -11,6 +11,7 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from queue import Empty, Queue
@@ -93,6 +94,14 @@ class NodePolicyError(RuntimeError):
 
 class NodeTimeoutError(RuntimeError):
     pass
+
+
+class HumanApprovalPause(RuntimeError):
+    def __init__(self, node: NodeIR, state: dict[str, Any], approval: dict[str, Any]):
+        super().__init__("Human Approval 等待人工审批。")
+        self.node = node
+        self.state = state
+        self.approval = approval
 PROVIDER_ALIASES = {
     "google": "google_genai",
 }
@@ -113,6 +122,30 @@ def run_project_preview(
     return _walk_project(
         project,
         _normalize_input(input_state),
+        mode,
+        _normalize_model_config(model_config),
+        _normalize_runtime_environment(runtime_environment),
+        agent_depth,
+    )
+
+
+def resume_project_preview(
+    project: ProjectIR,
+    current_state: dict[str, Any],
+    approval_node_id: str,
+    action: str,
+    comment: str = "",
+    mode: RunMode = "live",
+    model_config: ModelRuntimeConfig = None,
+    runtime_environment: RuntimeEnvironment = None,
+    agent_depth: int = 0,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    return _resume_project(
+        project,
+        _normalize_input(current_state),
+        approval_node_id,
+        action,
+        comment,
         mode,
         _normalize_model_config(model_config),
         _normalize_runtime_environment(runtime_environment),
@@ -270,6 +303,24 @@ def _walk_project(
             delta, detail, trace_meta = _execute_node_with_policy(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             state.update(delta)
             status = "ok"
+        except HumanApprovalPause as pause:
+            approval = dict(pause.approval)
+            trace_item = {
+                "nodeId": node.id,
+                "type": str(node.type),
+                "label": node.label,
+                "status": "ok",
+                "detail": "等待人工审批",
+                "durationMs": round((time.perf_counter() - started) * 1000, 2),
+                "inputState": _compact_state(before),
+                "outputDelta": {},
+                "pause": True,
+                "approval": approval,
+            }
+            trace.append(trace_item)
+            state["_glg_run_status"] = "paused"
+            state["_glg_pending_approval"] = approval
+            return trace, state
         except Exception as exc:  # Keep the preview response structured instead of surfacing a 500.
             handled_error_target = _error_execution_target(node, outgoing)
             trace_meta = _trace_meta_from_exception(exc)
@@ -307,6 +358,136 @@ def _walk_project(
                 "nodeId": "__runtime__",
                 "type": "custom_function",
                 "label": "运行预览",
+                "status": "error",
+                "detail": f"路径超过 {MAX_STEPS} 步，可能存在循环。",
+                "durationMs": 0,
+                "inputState": _compact_state(state),
+                "outputDelta": {},
+            }
+        )
+    return trace, state
+
+
+def _resume_project(
+    project: ProjectIR,
+    state: dict[str, Any],
+    approval_node_id: str,
+    action: str,
+    comment: str,
+    mode: RunMode,
+    model_config: ModelRuntimeConfig,
+    runtime_environment: RuntimeEnvironment,
+    agent_depth: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    nodes = {node.id: node for node in project.nodes}
+    node = nodes.get(approval_node_id)
+    if node is None or node.type != NodeType.HUMAN_APPROVAL:
+        raise RuntimeError("待恢复节点不是 Human Approval。")
+    normalized_action = action if action in {"approved", "rejected"} else "rejected"
+    action_field = str(node.config.get("actionField", "approval_action"))
+    output_field = str(node.config.get("outputField", "approval_result"))
+    approval_result = {
+        "action": normalized_action,
+        "comment": comment,
+        "approved": normalized_action == "approved",
+        "resumedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    before = dict(state)
+    state[action_field] = normalized_action
+    state[output_field] = approval_result
+    state.pop("_glg_run_status", None)
+    state.pop("_glg_pending_approval", None)
+    trace: list[dict[str, Any]] = [
+        {
+            "nodeId": node.id,
+            "type": str(node.type),
+            "label": node.label,
+            "status": "ok",
+            "detail": f"人工审批已提交：{normalized_action}",
+            "durationMs": 0,
+            "inputState": _compact_state(before),
+            "outputDelta": _compact_state({action_field: normalized_action, output_field: approval_result}),
+            "approval": {
+                "nodeId": node.id,
+                "nodeLabel": node.label,
+                "action": normalized_action,
+                "comment": comment,
+            },
+        }
+    ]
+    skills = _enabled_skills_by_id(project)
+    tools = _tool_configs_by_id(project)
+    mcp_servers = _mcp_configs_by_id(project)
+    agents = _agent_configs_by_id(project)
+    outgoing: dict[str, list] = {}
+    for edge in project.edges:
+        outgoing.setdefault(edge.source, []).append(edge)
+    current = _next_execution_target(node, nodes, outgoing, state)
+    visited = 0
+    while current and current in nodes and visited < MAX_STEPS:
+        visited += 1
+        current_node = nodes[current]
+        before = dict(state)
+        started = time.perf_counter()
+        handled_error_target: str | None = None
+        trace_meta: dict[str, Any] = {}
+        try:
+            delta, detail, trace_meta = _execute_node_with_policy(current_node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+            state.update(delta)
+            status = "ok"
+        except HumanApprovalPause as pause:
+            approval = dict(pause.approval)
+            trace.append(
+                {
+                    "nodeId": current_node.id,
+                    "type": str(current_node.type),
+                    "label": current_node.label,
+                    "status": "ok",
+                    "detail": "等待人工审批",
+                    "durationMs": round((time.perf_counter() - started) * 1000, 2),
+                    "inputState": _compact_state(before),
+                    "outputDelta": {},
+                    "pause": True,
+                    "approval": approval,
+                }
+            )
+            state["_glg_run_status"] = "paused"
+            state["_glg_pending_approval"] = approval
+            return trace, state
+        except Exception as exc:
+            handled_error_target = _error_execution_target(current_node, outgoing)
+            trace_meta = _trace_meta_from_exception(exc)
+            if handled_error_target:
+                delta = {"last_error": _runtime_error_payload(current_node, exc)}
+                state.update(delta)
+                detail = f"{_format_error(exc)}；已转入 error 分支。"
+                status = "ok"
+            else:
+                delta = {}
+                detail = _format_error(exc)
+                status = "error"
+        trace.append(
+            {
+                "nodeId": current_node.id,
+                "type": str(current_node.type),
+                "label": current_node.label,
+                "status": status,
+                "detail": detail,
+                "durationMs": round((time.perf_counter() - started) * 1000, 2),
+                "inputState": _compact_state(before),
+                "outputDelta": _compact_state(delta),
+                **trace_meta,
+            }
+        )
+        if status == "error" or current_node.type == NodeType.DIRECT_REPLY:
+            break
+        current = handled_error_target or _next_execution_target(current_node, nodes, outgoing, state)
+    if visited >= MAX_STEPS:
+        trace.append(
+            {
+                "nodeId": "__runtime__",
+                "type": "custom_function",
+                "label": "运行恢复",
                 "status": "error",
                 "detail": f"路径超过 {MAX_STEPS} 步，可能存在循环。",
                 "durationMs": 0,
@@ -378,6 +559,34 @@ def _walk_project_events(
                 delta, detail, trace_meta = _execute_node_with_policy(node, project, state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
             state.update(delta)
             status = "ok"
+        except HumanApprovalPause as pause:
+            approval = dict(pause.approval)
+            trace_item = {
+                "nodeId": node.id,
+                "type": str(node.type),
+                "label": node.label,
+                "status": "ok",
+                "detail": "等待人工审批",
+                "durationMs": round((time.perf_counter() - started) * 1000, 2),
+                "inputState": _compact_state(before),
+                "outputDelta": {},
+                "pause": True,
+                "approval": approval,
+            }
+            trace.append(trace_item)
+            yield {
+                "event": "node_end",
+                "traceItem": trace_item,
+                "outputState": _compact_state(state),
+            }
+            yield {
+                "event": "run_end",
+                "status": "paused",
+                "trace": trace,
+                "outputState": _compact_state(state),
+                "pendingApproval": approval,
+            }
+            return
         except Exception as exc:  # Keep streamed events structured instead of surfacing a 500.
             handled_error_target = _error_execution_target(node, outgoing)
             trace_meta = _trace_meta_from_exception(exc)
@@ -494,6 +703,8 @@ def _execute_node_with_policy(
             trace_meta.update(_data_shaping_trace_meta(node, state, delta))
             return delta, detail, trace_meta
         except Exception as exc:
+            if isinstance(exc, HumanApprovalPause):
+                raise
             last_exc = exc
             error_type = _policy_error_type(exc)
             attempts.append(
@@ -565,6 +776,8 @@ def _execute_stream_node_with_policy(
                 detail = f"{detail}；重试第 {attempt_index} 次后成功。"
             return delta, detail, child_trace_items or [], _successful_policy_trace_meta(node, attempts)
         except Exception as exc:
+            if isinstance(exc, HumanApprovalPause):
+                raise
             last_exc = exc
             error_type = _policy_error_type(exc)
             attempts.append(
@@ -1339,14 +1552,29 @@ def _execute_live_human_approval(node: NodeIR, state: dict[str, Any]) -> tuple[d
     config = node.config
     action_field = str(config.get("actionField", "approval_action"))
     output_field = str(config.get("outputField", "approval_result"))
-    action = str(state.get(action_field) or config.get("previewAction") or config.get("defaultAction", "approved"))
+    provided_action = str(state.get(action_field) or "").strip()
+    if provided_action:
+        fallback = str(config.get("fallback", "rejected") or "rejected")
+        normalized_action = provided_action if provided_action in {"approved", "rejected", "edit"} else fallback
+        approval_result = {
+            "action": normalized_action,
+            "approved": normalized_action == "approved",
+            "status": "auto",
+            "submittedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        return {action_field: normalized_action, output_field: approval_result}, f"使用运行输入自动审批：{normalized_action}"
     prompt = render_template(str(config.get("prompt", "")), state)
-    result = {
-        "action": action,
+    approval = {
+        "nodeId": node.id,
+        "nodeLabel": node.label,
         "prompt": prompt,
-        "status": "live-preview",
+        "actions": ["approved", "rejected"],
+        "defaultAction": str(config.get("defaultAction", "approved") or "approved"),
+        "actionField": action_field,
+        "outputField": output_field,
+        "state": _compact_state(state),
     }
-    return {action_field: action, output_field: result}, f"使用预览审批动作 {action}，继续流程"
+    raise HumanApprovalPause(node, state, approval)
 
 
 def _execute_live_http(node: NodeIR, state: dict[str, Any]) -> tuple[dict[str, Any], str]:

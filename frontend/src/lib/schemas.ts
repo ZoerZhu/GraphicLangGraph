@@ -35,6 +35,8 @@ export const ProjectSchema = z.object({
       kind: z.enum(["agent", "agents"]).default("agent"),
       runtimeEnvironmentId: z.string().default(""),
       schemaVersion: z.string(),
+      templateId: z.string().optional().default(""),
+      templateVersion: z.string().optional().default(""),
   }),
   state: z.object({
     base: z.string(),
@@ -426,10 +428,14 @@ export const RunPreviewResultSchema = z.object({
       outputDelta: z.record(z.unknown()),
       virtual: z.boolean().optional().default(false),
       parentNodeId: z.string().nullable().optional(),
+      pause: z.boolean().optional(),
+      approval: z.record(z.unknown()).nullable().optional(),
       position: z.object({ x: z.number(), y: z.number() }).nullable().optional(),
     }).passthrough(),
   ),
   outputState: z.record(z.unknown()),
+  status: z.enum(["completed", "failed", "paused"]).optional().default("completed"),
+  pendingApproval: z.record(z.unknown()).nullable().optional(),
 });
 
 export const RunHistoryRecordSchema = z.object({

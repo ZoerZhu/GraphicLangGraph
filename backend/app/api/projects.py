@@ -20,6 +20,7 @@ from app.runner import (
     collect_data_shaping_paths,
     iter_project_preview_events,
     preview_data_shaping_node,
+    resume_project_preview,
     run_project_preview as run_project_preview_engine,
 )
 
@@ -101,6 +102,8 @@ class RunTraceItem(BaseModel):
     inputState: dict[str, Any] = Field(default_factory=dict)
     outputDelta: dict[str, Any] = Field(default_factory=dict)
     virtual: bool = False
+    pause: bool = False
+    approval: dict[str, Any] | None = None
     parentNodeId: str | None = None
     position: dict[str, float] | None = None
 
@@ -111,6 +114,15 @@ class RunPreviewResponse(BaseModel):
     issues: list[dict[str, Any]]
     trace: list[RunTraceItem]
     outputState: dict[str, Any]
+    status: str = "completed"
+    pendingApproval: dict[str, Any] | None = None
+
+
+class ResumeRunRequest(BaseModel):
+    action: Literal["approved", "rejected"]
+    comment: str = ""
+    modelConfig: RunModelConfig | None = None
+    runtimeEnvironment: RuntimeEnvironmentConfig | None = None
 
 
 class RunHistoryRecordPayload(BaseModel):
@@ -227,12 +239,15 @@ def run_project_preview(project_id: str, payload: RunPreviewRequest | None = Non
             request.modelConfig.model_dump(by_alias=True) if request.modelConfig else None,
             runtime_environment,
         )
+    status, pending_approval = _run_status_from_state(trace, output_state)
     return RunPreviewResponse(
         mode=request.mode,
         valid=result.valid,
         issues=[issue.model_dump() for issue in result.issues],
         trace=trace,
         outputState=output_state,
+        status=status,
+        pendingApproval=pending_approval,
     )
 
 
@@ -271,6 +286,56 @@ def list_project_runs(project_id: str) -> list[dict[str, Any]]:
 def save_project_run(project_id: str, record: RunHistoryRecordPayload) -> dict[str, Any]:
     read_project(project_id)
     return save_run_record(project_id, record.model_dump(mode="json"))
+
+
+@router.post("/projects/{project_id}/runs/{run_id}/resume", response_model=RunPreviewResponse)
+def resume_project_run(project_id: str, run_id: str, payload: ResumeRunRequest) -> RunPreviewResponse:
+    project = read_project(project_id)
+    record = _find_run_record(project_id, run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Run history record not found")
+    result_payload = record.get("result") if isinstance(record.get("result"), dict) else {}
+    if result_payload.get("status") != "paused":
+        raise HTTPException(status_code=409, detail="Run is not paused")
+    output_state = result_payload.get("outputState") if isinstance(result_payload.get("outputState"), dict) else {}
+    pending_approval = result_payload.get("pendingApproval")
+    if not isinstance(pending_approval, dict):
+        pending_approval = output_state.get("_glg_pending_approval") if isinstance(output_state, dict) else None
+    if not isinstance(pending_approval, dict) or not pending_approval.get("nodeId"):
+        raise HTTPException(status_code=409, detail="Paused run is missing pending approval data")
+
+    validation = validate_project(project)
+    if not validation.valid:
+        raise HTTPException(status_code=422, detail=[issue.model_dump() for issue in validation.issues])
+
+    runtime_environment = resolve_runtime_environment(payload.runtimeEnvironment, project.project.runtime_environment_id)
+    trace, resumed_state = resume_project_preview(
+        project,
+        dict(output_state),
+        str(pending_approval["nodeId"]),
+        payload.action,
+        payload.comment,
+        "live",
+        payload.modelConfig.model_dump(by_alias=True) if payload.modelConfig else None,
+        runtime_environment,
+    )
+    previous_trace = result_payload.get("trace") if isinstance(result_payload.get("trace"), list) else []
+    combined_trace = [*previous_trace, *trace]
+    status, next_pending_approval = _run_status_from_state(combined_trace, resumed_state)
+    response = RunPreviewResponse(
+        mode="live",
+        valid=validation.valid,
+        issues=[issue.model_dump() for issue in validation.issues],
+        trace=combined_trace,
+        outputState=resumed_state,
+        status=status,
+        pendingApproval=next_pending_approval,
+    )
+    updated_record = dict(record)
+    updated_record["result"] = response.model_dump(mode="json")
+    updated_record["resumedAt"] = datetime.now(timezone.utc).isoformat()
+    save_run_record(project_id, updated_record)
+    return response
 
 
 @router.delete("/projects/{project_id}/runs/{run_id}", status_code=204)
@@ -329,6 +394,7 @@ def stream_project_preview(project_id: str, payload: RunPreviewRequest | None = 
                     "issues": issues,
                     "trace": [],
                     "outputState": dict(request.input),
+                    "status": "failed",
                 }
             )
             return
@@ -342,6 +408,14 @@ def stream_project_preview(project_id: str, payload: RunPreviewRequest | None = 
             event["mode"] = request.mode
             event["valid"] = result.valid
             event["issues"] = issues
+            if event.get("event") == "run_end":
+                status, pending_approval = _run_status_from_state(
+                    event.get("trace") if isinstance(event.get("trace"), list) else [],
+                    event.get("outputState") if isinstance(event.get("outputState"), dict) else {},
+                )
+                event.setdefault("status", status)
+                if pending_approval is not None:
+                    event.setdefault("pendingApproval", pending_approval)
             yield _json_line(event)
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
@@ -381,6 +455,18 @@ def download_export(export_id: str):
 
 def _json_line(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def _run_status_from_state(
+    trace: list[dict[str, Any]] | list[RunTraceItem],
+    output_state: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    pending_approval = output_state.get("_glg_pending_approval") if isinstance(output_state, dict) else None
+    if output_state.get("_glg_run_status") == "paused" and isinstance(pending_approval, dict):
+        return "paused", pending_approval
+    if any((item.get("status") if isinstance(item, dict) else item.status) == "error" for item in trace):
+        return "failed", None
+    return "completed", None
 
 
 def _smoke_response(result: SmokeTestResult) -> SmokeTestResponse:

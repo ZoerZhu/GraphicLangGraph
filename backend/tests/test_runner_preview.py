@@ -3417,16 +3417,32 @@ def test_live_preview_runs_customer_support_order_and_refund_paths(monkeypatch):
 
     refund_trace, refund_state = preview.run_project_preview(
         project,
-        {"messages": "我要申请退款", "approval_action": "approved"},
+        {"messages": "我要申请退款"},
         "live",
         {"provider": "openai", "model": "gpt-4.1-mini", "enabled": True},
     )
 
-    assert [item["nodeId"] for item in refund_trace] == ["route_intent", "refund_approval", "support_agent", "reply_support"]
+    assert [item["nodeId"] for item in refund_trace] == ["route_intent", "refund_approval"]
     assert {item["status"] for item in refund_trace} == {"ok"}
     assert refund_state["route_key"] == "refund"
-    assert refund_state["approval_action"] == "approved"
-    assert "退款申请" in refund_state["final_answer"]
+    assert refund_state["_glg_run_status"] == "paused"
+    assert refund_trace[-1]["pause"] is True
+    assert refund_trace[-1]["approval"]["nodeId"] == "refund_approval"
+
+    resumed_trace, resumed_state = preview.resume_project_preview(
+        project,
+        refund_state,
+        "refund_approval",
+        "approved",
+        "同意退款",
+        "live",
+        {"provider": "openai", "model": "gpt-4.1-mini", "enabled": True},
+    )
+
+    assert [item["nodeId"] for item in resumed_trace] == ["refund_approval", "support_agent", "reply_support"]
+    assert resumed_state["approval_action"] == "approved"
+    assert resumed_state["approval_result"]["comment"] == "同意退款"
+    assert "退款申请" in resumed_state["final_answer"]
     assert len(calls) == 2
 
 
