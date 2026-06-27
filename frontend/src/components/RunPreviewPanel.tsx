@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ChevronDown, Eye, Layers, Maximize2, Minimize2, RotateCcw, ShieldCheck, Trash2, X } from "lucide-react";
+import { AlertTriangle, ChevronDown, Copy, Eye, Layers, Maximize2, Minimize2, RotateCcw, ShieldCheck, Trash2, X } from "lucide-react";
 import { applyEditSession, discardEditSession, getEditSession, rollbackEditSession, runEditCommand } from "../lib/api";
 import { evaluateTemplateAcceptance } from "../lib/templateAcceptance";
 import { getProjectTemplateForProject } from "../lib/templates";
@@ -163,9 +163,20 @@ function PendingApprovalPanel({
   onResume: (recordId: string, action: "approved" | "rejected", comment: string) => Promise<void>;
 }) {
   const [comment, setComment] = useState("");
+  const [copyMessage, setCopyMessage] = useState("");
   const approval = result.pendingApproval;
   if (result.status !== "paused" || !approval) return null;
   const disabled = running || !recordId;
+  const stateText = approval.state ? JSON.stringify(approval.state, null, 2) : "";
+  async function copyApprovalText(label: string, value: string) {
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopyMessage(`${label}已复制`);
+    } catch {
+      setCopyMessage("当前浏览器不允许写入剪贴板");
+    }
+  }
   return (
     <section className="approval-panel">
       <div className="run-section-title">
@@ -173,6 +184,17 @@ function PendingApprovalPanel({
         <span>{approval.nodeLabel ?? approval.nodeId}</span>
       </div>
       {approval.prompt ? <p className="approval-panel__prompt">{approval.prompt}</p> : null}
+      <div className="approval-panel__tools">
+        <button disabled={!approval.prompt} onClick={() => void copyApprovalText("审批提示", approval.prompt ?? "")} type="button">
+          <Copy size={13} />
+          复制提示
+        </button>
+        <button disabled={!stateText} onClick={() => void copyApprovalText("State 摘要", stateText)} type="button">
+          <Copy size={13} />
+          复制 State
+        </button>
+        {copyMessage ? <small>{copyMessage}</small> : null}
+      </div>
       <label className="field">
         <span>审批备注</span>
         <textarea
@@ -391,10 +413,14 @@ function RunHistoryList({
           {records.map((record) => (
             <div key={record.id} className={`run-history-record ${record.id === selectedId ? "is-selected" : ""}`}>
               <button className="run-history-record__main" onClick={() => onSelect(record.id)} type="button">
-                <strong>{formatTime(record.createdAt)}</strong>
+                <span className="run-history-record__top">
+                  <strong>{formatTime(record.createdAt)}</strong>
+                  <span className={`run-history-status is-${record.result.status ?? "completed"}`}>
+                    {runStatusLabel(record.result.status)}
+                  </span>
+                </span>
                 <span>{record.modelConfigName}</span>
                 <small>
-                  {record.result.status === "paused" ? "已暂停 · " : record.result.status === "failed" ? "失败 · " : ""}
                   {record.result.trace.length} 节点 · {record.result.valid ? "校验通过" : `${record.result.issues.length} 个问题`}
                 </small>
               </button>
@@ -557,6 +583,7 @@ function RunTraceCard({
 }) {
   const outputs = Object.entries(item.outputDelta);
   const dataShaping = traceRecord(item.dataShaping);
+  const approval = traceRecord(item.approval);
   return (
     <article className={`run-trace-item is-${item.status}`}>
       <button
@@ -570,6 +597,7 @@ function RunTraceCard({
         <span>{item.type} · {statusLabel(item.status)} · {item.durationMs}ms</span>
       </button>
       {item.detail ? <p>{item.detail}</p> : null}
+      {approval ? <ApprovalTraceSummary data={approval} paused={item.pause === true} /> : null}
       {dataShaping ? <DataShapingTraceSummary data={dataShaping} /> : null}
       {outputs.length ? (
         <div className="run-output-vars">
@@ -582,6 +610,25 @@ function RunTraceCard({
         </div>
       ) : null}
     </article>
+  );
+}
+
+function ApprovalTraceSummary({ data, paused }: { data: Record<string, unknown>; paused: boolean }) {
+  const action = traceText(data.action);
+  const comment = traceText(data.comment);
+  const prompt = traceText(data.prompt);
+  const resumedAt = traceText(data.resumedAt);
+  const details = [
+    paused ? "状态 等待审批" : action ? `动作 ${action}` : "",
+    comment ? `备注 ${comment}` : "",
+    resumedAt ? `恢复 ${formatTime(resumedAt)}` : "",
+    prompt ? `提示 ${prompt}` : "",
+  ].filter(Boolean);
+  return (
+    <div className={`run-trace-meta approval-trace-meta ${paused ? "is-paused" : "is-resumed"}`}>
+      <div className="run-trace-meta__title">{paused ? "Human Approval · Paused" : "Human Approval · Resumed"}</div>
+      {details.length ? <div className="run-trace-meta__body">{details.join(" · ")}</div> : null}
+    </div>
   );
 }
 
@@ -655,6 +702,18 @@ function statusLabel(status: RunTraceItem["status"]) {
       return "跳过";
     default:
       return status;
+  }
+}
+
+function runStatusLabel(status: RunPreviewResult["status"]) {
+  switch (status) {
+    case "paused":
+      return "待审批";
+    case "failed":
+      return "失败";
+    case "completed":
+    default:
+      return "完成";
   }
 }
 

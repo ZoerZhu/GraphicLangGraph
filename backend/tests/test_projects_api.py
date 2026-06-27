@@ -323,6 +323,13 @@ def test_project_run_human_approval_pauses_and_resumes(tmp_path, monkeypatch):
     assert saved["result"]["status"] == "completed"
     assert saved["result"]["outputState"]["final_answer"] == "approved: 同意"
 
+    repeated = client.post(
+        f"/api/projects/{project_id}/runs/history_pending_approval/resume",
+        json={"action": "rejected", "comment": "重复提交"},
+    )
+    assert repeated.status_code == 409
+    assert "not paused" in repeated.json()["detail"]
+
 
 def test_project_run_history_persists_to_runs_dir(tmp_path, monkeypatch):
     runs_dir = tmp_path / "runs"
