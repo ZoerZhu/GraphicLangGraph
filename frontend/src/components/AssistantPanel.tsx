@@ -1,6 +1,6 @@
 import { Send, WandSparkles, X } from "lucide-react";
 import { useState } from "react";
-import { PROJECT_TEMPLATES } from "../lib/templates";
+import { getProjectTemplateDependencyLabels, getProjectTemplateScene, PROJECT_TEMPLATES } from "../lib/templates";
 import { useProjectStore } from "../store/projectStore";
 
 export function AssistantPanel() {
@@ -10,6 +10,8 @@ export function AssistantPanel() {
   const [prompt, setPrompt] = useState("帮我做一个客服 Agent，先识别订单/退款/其他问题，再处理并回复用户。");
   const [previewTemplateId, setPreviewTemplateId] = useState<string | null>(null);
   const previewTemplate = PROJECT_TEMPLATES.find((template) => template.id === previewTemplateId) ?? null;
+  const previewScene = previewTemplate ? getProjectTemplateScene(previewTemplate) : null;
+  const previewDependencies = previewTemplate ? getProjectTemplateDependencyLabels(previewTemplate) : [];
 
   if (!open) return null;
 
@@ -23,7 +25,7 @@ export function AssistantPanel() {
       </div>
       <div className="assistant-intro">
         <WandSparkles size={18} />
-        <p>第一版助手会根据中文需求选择合适模板并生成初始画布，后续再接入多轮澄清和局部修复。</p>
+        <p>助手会根据中文需求匹配场景方案，并生成带样例输入、依赖提示和验收口径的初始画布。</p>
       </div>
       <textarea
         rows={7}
@@ -70,19 +72,38 @@ export function AssistantPanel() {
         </button>
         <button className="primary" onClick={() => setPreviewTemplateId(pickTemplateId(prompt))} type="button">
           <Send size={15} />
-          <span>生成预览</span>
+          <span>匹配场景</span>
         </button>
       </div>
       {previewTemplate ? (
         <div className="assistant-preview">
           <strong>{previewTemplate.name}</strong>
           <span>{previewTemplate.description}</span>
+          {previewScene ? (
+            <div className="assistant-preview__scene">
+              <small>{previewScene.name}</small>
+              <span>{previewTemplate.useCase}</span>
+            </div>
+          ) : null}
           <div>
             <small>{previewTemplate.nodes.length} 节点</small>
             <small>{previewTemplate.edges.length} 连线</small>
             <small>{previewTemplate.fields.length} State 字段</small>
-            <small>{previewTemplate.requiresModel ? "需要模型" : "无需模型"}</small>
-            <small>{previewTemplate.requiresNetwork ? "需要网络" : "本地/mock"}</small>
+            {previewDependencies.map((label) => <small key={label}>{label}</small>)}
+          </div>
+          <div className="assistant-preview__recommend">
+            {previewTemplate.recommendedFor.map((item) => <span key={item}>{item}</span>)}
+          </div>
+          <div className="assistant-preview__acceptance">
+            验收：{previewTemplate.acceptanceSummary}
+          </div>
+          {previewTemplate.setupNotes?.length ? (
+            <ul className="assistant-preview__notes">
+              {previewTemplate.setupNotes.map((note) => <li key={note}>{note}</li>)}
+            </ul>
+          ) : null}
+          <div className="assistant-preview__outputs">
+            {previewTemplate.expectedOutputFields.slice(0, 5).map((field) => <span key={field}>{field}</span>)}
           </div>
           {previewTemplate.sampleInput ? (
             <pre className="assistant-preview__sample">{JSON.stringify(previewTemplate.sampleInput, null, 2)}</pre>

@@ -2,6 +2,20 @@ import type { EdgeIR, MCPServerConfig, NodeIR, ProjectIR, StateField } from "../
 
 export type ProjectTemplateCategory = "knowledge" | "coding" | "workflow" | "data" | "support";
 export type ProjectTemplateRunMode = "dry" | "live";
+export type ProjectTemplateSceneId =
+  | "knowledge_search"
+  | "web_research"
+  | "workflow_automation"
+  | "data_api"
+  | "code_work"
+  | "support_ops"
+  | "agent_collaboration";
+
+export interface ProjectTemplateSceneGroup {
+  id: ProjectTemplateSceneId;
+  name: string;
+  description: string;
+}
 
 export interface ProjectTemplate {
   id: string;
@@ -10,6 +24,10 @@ export interface ProjectTemplate {
   description: string;
   kind: "agent" | "agents";
   category: ProjectTemplateCategory;
+  sceneId: ProjectTemplateSceneId;
+  useCase: string;
+  recommendedFor: string[];
+  acceptanceSummary: string;
   recommendedRunMode: ProjectTemplateRunMode;
   requiresModel: boolean;
   requiresNetwork: boolean;
@@ -18,11 +36,50 @@ export interface ProjectTemplate {
   requiredMcpServers?: MCPServerConfig[];
   requiredRuntimeHosts?: string[];
   requiredEnvVars?: string[];
+  setupNotes?: string[];
   sampleInput?: Record<string, unknown>;
   fields: StateField[];
   nodes: NodeIR[];
   edges: EdgeIR[];
 }
+
+export const PROJECT_TEMPLATE_SCENES: ProjectTemplateSceneGroup[] = [
+  {
+    id: "knowledge_search",
+    name: "知识检索",
+    description: "面向 RAG、文档问答和企业知识库的检索增强流程。",
+  },
+  {
+    id: "web_research",
+    name: "联网研究",
+    description: "通过 MCP 或网络工具获取外部信息，再汇总成可追踪回答。",
+  },
+  {
+    id: "workflow_automation",
+    name: "流程自动化",
+    description: "结构化任务、并发执行、分支校验和结果聚合。",
+  },
+  {
+    id: "data_api",
+    name: "API 与数据",
+    description: "API 调用、JSON 清洗、结构校验和数据回复。",
+  },
+  {
+    id: "code_work",
+    name: "代码工作",
+    description: "代码读取、修改规划、补丁生成和验证建议。",
+  },
+  {
+    id: "support_ops",
+    name: "客服运营",
+    description: "意图路由、订单查询、人工审批和客服回复。",
+  },
+  {
+    id: "agent_collaboration",
+    name: "多 Agent",
+    description: "接入历史 Agent 作为子能力，完成主控编排与协作。",
+  },
+];
 
 export const EXA_WEBSEARCH_MCP_SERVER: MCPServerConfig = {
   id: "exa_search_mcp",
@@ -61,6 +118,10 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     description: "改写问题、检索知识库、生成带上下文的回答。",
     kind: "agent",
     category: "knowledge",
+    sceneId: "knowledge_search",
+    useCase: "把用户问题改写成检索查询，读取知识库上下文，再生成有依据的回答。",
+    recommendedFor: ["RAG 问答", "文档助手", "内部知识库检索"],
+    acceptanceSummary: "运行后应产出 rewritten_query、retrieved_context 和 final_answer，并包含 LLM、Retriever、Reply trace。",
     recommendedRunMode: "live",
     requiresModel: true,
     requiresNetwork: false,
@@ -114,6 +175,10 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     description: "读取代码、生成修改计划、提出可审批 patch，并给出验证建议。",
     kind: "agent",
     category: "coding",
+    sceneId: "code_work",
+    useCase: "先读取最小代码上下文，再生成修改计划和待审批补丁。",
+    recommendedFor: ["代码审查", "改动规划", "补丁草案"],
+    acceptanceSummary: "运行后应产出 code_context、edit_plan、patch_result 和 final_answer，并保留 Tool、LLM trace。",
     recommendedRunMode: "live",
     requiresModel: true,
     requiresNetwork: false,
@@ -174,6 +239,10 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     description: "通过 Exa remote MCP 搜索网页，再由 LLM 汇总为带来源意识的回答。",
     kind: "agent",
     category: "knowledge",
+    sceneId: "web_research",
+    useCase: "用 Exa MCP 搜索外部网页信息，再由 LLM 汇总为中文回答。",
+    recommendedFor: ["联网问答", "趋势调研", "资料搜索"],
+    acceptanceSummary: "运行后应产出 exa_search_result、search_answer 和 final_answer，并看到 MCP、LLM、Reply trace。",
     recommendedRunMode: "live",
     requiresModel: true,
     requiresNetwork: true,
@@ -182,6 +251,7 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     requiredMcpServers: [EXA_WEBSEARCH_MCP_SERVER],
     requiredRuntimeHosts: ["mcp.exa.ai"],
     requiredEnvVars: ["EXA_API_KEY"],
+    setupNotes: ["需要配置 Exa MCP API Key。", "运行环境需允许访问 mcp.exa.ai。"],
     sampleInput: {
       messages: "请搜索 2026 年 AI Agent 工作流编排工具的最新趋势，并用中文总结三点。",
     },
@@ -237,6 +307,10 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     description: "主 Agent 可接入历史 Agent 作为工具调用，再用 Template 归一化协作结果并回复。",
     kind: "agent",
     category: "workflow",
+    sceneId: "agent_collaboration",
+    useCase: "把当前项目已完成的 Agent 接入为子 Agent 工具，由主 Agent 协调完成任务。",
+    recommendedFor: ["子 Agent 调用", "专家协作", "历史 Agent 复用"],
+    acceptanceSummary: "运行后应产出 orchestration_result、collaboration_summary 和 final_answer，并包含 Agent、Template trace。",
     recommendedRunMode: "live",
     requiresModel: true,
     requiresNetwork: false,
@@ -288,6 +362,10 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     description: "把用户目标抽取为 Task Plan JSON，校验后拆分并交给并行 Worker 处理。",
     kind: "agent",
     category: "workflow",
+    sceneId: "workflow_automation",
+    useCase: "让模型先产出结构化任务 JSON，再拆分给多个 Worker 并发处理。",
+    recommendedFor: ["任务拆分", "并行 Worker", "结构化计划验收"],
+    acceptanceSummary: "运行后应产出 task_plan、task_plan_validation、worker_tasks、worker_results 和 final_answer。",
     recommendedRunMode: "live",
     requiresModel: true,
     requiresNetwork: false,
@@ -366,6 +444,10 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     description: "校验 Task Plan，并发 ForEach 处理每个任务，收集单项错误，Merge 聚合结果后直接回复。",
     kind: "agent",
     category: "workflow",
+    sceneId: "workflow_automation",
+    useCase: "用 ForEach/Merge 表达并发任务处理、错误收集和结果聚合。",
+    recommendedFor: ["并发处理", "Flow Control", "回放排障"],
+    acceptanceSummary: "运行后应产出 task_plan、task_plan_validation、worker_tasks、merged_results 和 final_answer，并能回放 ForEach/Merge trace。",
     recommendedRunMode: "live",
     requiresModel: true,
     requiresNetwork: false,
@@ -486,9 +568,14 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     description: "读取订单 API 返回，用 Template 统一字段结构，再用 JSON Validator 校验并回复。",
     kind: "agent",
     category: "data",
+    sceneId: "data_api",
+    useCase: "使用 HTTP mock 模拟订单 API，清洗字段并用 JSON Validator 验证结构。",
+    recommendedFor: ["API 数据清洗", "JSON 校验", "订单查询 mock"],
+    acceptanceSummary: "运行后应产出 order_info、clean_order、order_validation 和 final_answer，且 order_validation.valid 为 true。",
     recommendedRunMode: "live",
     requiresModel: false,
     requiresNetwork: false,
+    setupNotes: ["默认启用 HTTP mock，无需真实网络和模型。"],
     expectedOutputFields: ["order_info", "clean_order", "order_validation", "final_answer"],
     expectedTraceTypes: ["http", "template", "json_validator", "direct_reply"],
     sampleInput: {
@@ -566,11 +653,15 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     description: "识别订单/退款/其他问题，查询订单、审批退款并组织回复。",
     kind: "agent",
     category: "support",
+    sceneId: "support_ops",
+    useCase: "把售后问题路由到订单查询、退款审批或通用客服回复。",
+    recommendedFor: ["售后客服", "人工审批", "订单/退款工单"],
+    acceptanceSummary: "运行后应产出 route_key、route_reason、approval_result 或 order_info，并生成 final_answer。",
     recommendedRunMode: "live",
     requiresModel: true,
     requiresNetwork: false,
-    expectedOutputFields: ["route_key", "route_reason"],
-    expectedTraceTypes: ["ai_router", "human_approval"],
+    expectedOutputFields: ["route_key", "route_reason", "order_info", "approval_result", "agent_result", "final_answer"],
+    expectedTraceTypes: ["ai_router", "http", "human_approval", "agent", "direct_reply"],
     sampleInput: {
       messages: "我要申请退款，订单号是 A20260614001，原因是商品不符合预期。",
       order_id: "A20260614001",
@@ -678,6 +769,21 @@ export function getProjectTemplate(templateId?: string | null): ProjectTemplate 
 
 export function getProjectTemplateForProject(project?: ProjectIR | null): ProjectTemplate | null {
   return getProjectTemplate(project?.project.templateId);
+}
+
+export function getProjectTemplateScene(template: ProjectTemplate): ProjectTemplateSceneGroup {
+  return PROJECT_TEMPLATE_SCENES.find((scene) => scene.id === template.sceneId) ?? PROJECT_TEMPLATE_SCENES[0];
+}
+
+export function getProjectTemplateDependencyLabels(template: ProjectTemplate): string[] {
+  return [
+    template.requiresModel ? "需要模型" : "无需模型",
+    template.requiresNetwork ? "需要网络" : "本地/mock",
+    template.recommendedRunMode === "live" ? "推荐真实运行" : "推荐 dry-run",
+    ...(template.requiredMcpServers?.length ? [`${template.requiredMcpServers.length} MCP`] : []),
+    ...(template.requiredRuntimeHosts?.length ? [`Host: ${template.requiredRuntimeHosts.join(", ")}`] : []),
+    ...(template.requiredEnvVars?.length ? [`Env: ${template.requiredEnvVars.join(", ")}`] : []),
+  ];
 }
 
 function node(
