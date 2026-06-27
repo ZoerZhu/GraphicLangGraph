@@ -698,6 +698,96 @@ def test_codegen_converts_direct_mcp_api_key_to_env_placeholder():
     assert '"apiKeyHeader": "x-api-key"' in mcp_servers_py
 
 
+def test_codegen_sanitizes_mcp_snapshot_json_in_export_graph():
+    project = create_default_project("MCP Snapshot Secret Export")
+    snapshot = MCPServerConfig(
+        id="exa",
+        name="Exa MCP",
+        transport="http",
+        url="https://mcp.exa.ai/mcp",
+        apiKeyMode="direct",
+        apiKey="snapshot-secret",
+        apiKeyHeader="x-api-key",
+        apiKeyPrefix="",
+        httpHeadersJson='{"x-api-key":"header-secret","X-Figma-Region":"us-east-1"}',
+    ).model_dump(by_alias=True)
+    project.nodes.append(
+        NodeIR(
+            id="mcp_snapshot",
+            type=NodeType.MCP_NODE,
+            label="Exa Snapshot",
+            config={
+                "serverId": "exa",
+                "serverName": "Exa MCP",
+                "mcpServerSnapshotJson": json.dumps([snapshot]),
+                "toolName": "web_search_exa",
+            },
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="mcp_snapshot"))
+
+    files = generate_project_files(project)
+    mcp_servers_py = next(value for path, value in files.items() if path.endswith("/mcp_servers.py"))
+    flow_json = files["flow/project.graph.json"]
+
+    assert "snapshot-secret" not in mcp_servers_py
+    assert "snapshot-secret" not in flow_json
+    assert "header-secret" not in mcp_servers_py
+    assert "header-secret" not in flow_json
+    assert "EXA_MCP_API_KEY=replace_me" in files[".env.example"]
+    assert "EXA_MCP_X_API_KEY=replace_me" in files[".env.example"]
+    assert '"apiKeyMode": "env"' in mcp_servers_py
+    assert '"envHttpHeadersJson": "{\\"x-api-key\\": \\"EXA_MCP_X_API_KEY\\"}"' in mcp_servers_py
+    assert "us-east-1" in mcp_servers_py
+
+
+def test_codegen_converts_sensitive_mcp_static_headers_to_env():
+    project = create_default_project("MCP Header Secret Export")
+    project.mcpServers.append(
+        MCPServerConfig(
+            id="exa",
+            name="Exa MCP",
+            transport="http",
+            url="https://mcp.exa.ai/mcp",
+            httpHeadersJson='{"x-api-key":"direct-header-secret","X-Figma-Region":"us-east-1"}',
+        )
+    )
+
+    files = generate_project_files(project)
+    mcp_servers_py = next(value for path, value in files.items() if path.endswith("/mcp_servers.py"))
+    flow_json = files["flow/project.graph.json"]
+
+    assert "direct-header-secret" not in mcp_servers_py
+    assert "direct-header-secret" not in flow_json
+    assert "EXA_MCP_X_API_KEY=replace_me" in files[".env.example"]
+    assert '"httpHeadersJson": "{\\"X-Figma-Region\\": \\"us-east-1\\"}"' in mcp_servers_py
+    assert '"envHttpHeadersJson": "{\\"x-api-key\\": \\"EXA_MCP_X_API_KEY\\"}"' in mcp_servers_py
+
+
+def test_codegen_converts_sensitive_mcp_stdio_env_to_env_vars():
+    project = create_default_project("MCP Stdio Env Secret Export")
+    project.mcpServers.append(
+        MCPServerConfig(
+            id="local_exa",
+            name="Local Exa MCP",
+            transport="stdio",
+            command="npx",
+            argsJson='["-y","exa-mcp-server"]',
+            envJson='{"EXA_API_KEY":"stdio-secret","LOG_LEVEL":"debug"}',
+        )
+    )
+
+    files = generate_project_files(project)
+    mcp_servers_py = next(value for path, value in files.items() if path.endswith("/mcp_servers.py"))
+    flow_json = files["flow/project.graph.json"]
+
+    assert "stdio-secret" not in mcp_servers_py
+    assert "stdio-secret" not in flow_json
+    assert "EXA_API_KEY=replace_me" in files[".env.example"]
+    assert '"envJson": "{\\"LOG_LEVEL\\": \\"debug\\"}"' in mcp_servers_py
+    assert '"envVarsJson": "[\\"EXA_API_KEY\\"]"' in mcp_servers_py
+
+
 def test_codegen_supports_mvp_nodes():
     project = create_default_project("MVP Agent")
     project.state.fields.extend(

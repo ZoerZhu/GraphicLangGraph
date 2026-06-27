@@ -761,7 +761,7 @@ def _normalize_mcp_server_export_dict(value: Any) -> dict[str, Any]:
             normalized["apiKeyEnv"] = normalized["bearerTokenEnvVar"]
             normalized["apiKeyHeader"] = normalized["apiKeyHeader"] or "Authorization"
             normalized["apiKeyPrefix"] = normalized["apiKeyPrefix"] or "Bearer"
-    return normalized
+    return _sanitize_mcp_export_secret_sources(normalized)
 
 
 def _json_text_for_export(*values: Any, fallback: Any) -> str:
@@ -798,6 +798,84 @@ def _mcp_server_env_keys(server: dict[str, Any]) -> set[str]:
         if safe_key:
             keys.add(safe_key)
     return keys
+
+
+def _sanitize_mcp_export_secret_sources(server: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(server)
+    http_headers, env_http_headers = _mcp_export_http_headers_to_env(
+        sanitized,
+        _parse_json_object(str(sanitized.get("httpHeadersJson") or "{}")),
+        _parse_json_object(str(sanitized.get("envHttpHeadersJson") or "{}")),
+    )
+    sanitized["httpHeadersJson"] = json.dumps(http_headers, ensure_ascii=False)
+    sanitized["envHttpHeadersJson"] = json.dumps(env_http_headers, ensure_ascii=False)
+    env_json, env_vars = _mcp_export_stdio_env_to_env_vars(
+        _parse_json_object(str(sanitized.get("envJson") or "{}")),
+        _json_string_list(sanitized.get("envVarsJson")),
+    )
+    sanitized["envJson"] = json.dumps(env_json, ensure_ascii=False)
+    sanitized["envVarsJson"] = json.dumps(env_vars, ensure_ascii=False)
+    return sanitized
+
+
+def _mcp_export_http_headers_to_env(
+    server: dict[str, Any],
+    http_headers: dict[str, Any],
+    env_http_headers: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    safe_headers: dict[str, Any] = {}
+    env_headers = dict(env_http_headers)
+    for header, value in http_headers.items():
+        header_name = str(header).strip()
+        if not header_name:
+            continue
+        value_text = str(value or "").strip()
+        if value_text and _is_sensitive_http_header(header_name):
+            env_headers.setdefault(header_name, _env_key_or_generated(value_text, _mcp_header_env_name(server, header_name)))
+        else:
+            safe_headers[header_name] = value
+    return safe_headers, env_headers
+
+
+def _mcp_export_stdio_env_to_env_vars(env_json: dict[str, Any], env_vars: list[str]) -> tuple[dict[str, Any], list[str]]:
+    safe_env: dict[str, Any] = {}
+    merged_vars = list(env_vars)
+    seen = set(merged_vars)
+    for key, value in env_json.items():
+        env_key = _safe_env_key(str(key or "").strip())
+        if env_key and str(value or "").strip() and _is_sensitive_env_name(env_key):
+            if env_key not in seen:
+                merged_vars.append(env_key)
+                seen.add(env_key)
+        else:
+            safe_env[str(key)] = value
+    return safe_env, merged_vars
+
+
+def _env_key_or_generated(value: str, generated: str) -> str:
+    text = value.strip()
+    if _safe_env_key(text) and text.upper() == text and ("_" in text or text.endswith(("KEY", "TOKEN", "SECRET", "PASSWORD"))):
+        return text
+    return generated
+
+
+def _is_sensitive_http_header(header: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", header.lower())
+    return normalized in {"authorization", "cookie", "setcookie"} or any(marker in normalized for marker in ("apikey", "token", "secret", "password"))
+
+
+def _is_sensitive_env_name(name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", name.lower())
+    return any(marker in normalized for marker in ("apikey", "token", "secret", "password", "authorization"))
+
+
+def _mcp_header_env_name(server: dict[str, Any], header: str) -> str:
+    source = str(server.get("id") or server.get("name") or "MCP").upper()
+    base = re.sub(r"[^A-Z0-9]+", "_", source).strip("_") or "MCP"
+    if not base.endswith("_MCP"):
+        base = f"{base}_MCP"
+    header_part = re.sub(r"[^A-Z0-9]+", "_", header.upper()).strip("_") or "HEADER"
+    return f"{base}_{header_part}"
 
 
 def _mcp_server_host(server: dict[str, Any]) -> str:
