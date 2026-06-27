@@ -35,6 +35,15 @@ export function TemplatePanel() {
               <div className="template-card__outputs">
                 {template.expectedOutputFields.slice(0, 4).map((field) => <span key={field}>{field}</span>)}
               </div>
+              <div className="template-card__trace">
+                {template.expectedTraceTypes.slice(0, 6).map((type) => <span key={type}>{type}</span>)}
+              </div>
+              {template.sampleInput ? (
+                <details className="template-card__sample">
+                  <summary>样例输入</summary>
+                  <pre>{JSON.stringify(template.sampleInput, null, 2)}</pre>
+                </details>
+              ) : null}
             </div>
             <button className="primary" onClick={() => void applyTemplate(template.id)} type="button">
               应用

@@ -1742,7 +1742,8 @@ button.icon-only {
 }
 
 .template-card__tags,
-.template-card__outputs {
+.template-card__outputs,
+.template-card__trace {
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
@@ -1750,7 +1751,8 @@ button.icon-only {
 }
 
 .template-card__tags span,
-.template-card__outputs span {
+.template-card__outputs span,
+.template-card__trace span {
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1767,6 +1769,37 @@ button.icon-only {
 .template-card__outputs span {
   color: #17663b;
   background: rgba(244, 255, 248, 0.72);
+}
+
+.template-card__trace span {
+  color: #244f91;
+  background: rgba(244, 248, 255, 0.72);
+}
+
+.template-card__sample {
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.template-card__sample summary {
+  cursor: pointer;
+  font-weight: 720;
+}
+
+.template-card__sample pre,
+.assistant-preview__sample {
+  max-height: 120px;
+  overflow: auto;
+  margin: 6px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--ink);
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: pre-wrap;
 }
 
 .assistant-intro {

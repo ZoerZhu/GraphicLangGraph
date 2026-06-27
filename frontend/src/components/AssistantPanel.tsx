@@ -51,6 +51,18 @@ export function AssistantPanel() {
           API 清洗
         </button>
         <button onClick={() => {
+          setPrompt("帮我做一个 Exa WebSearch Agent，使用 MCP 搜索网页，再汇总回答。");
+          setPreviewTemplateId(null);
+        }} type="button">
+          联网搜索
+        </button>
+        <button onClick={() => {
+          setPrompt("帮我做一个多 Agent 协作流程，主 Agent 可以接入历史 Agent 作为子 Agent 工具调用。");
+          setPreviewTemplateId(null);
+        }} type="button">
+          多 Agent
+        </button>
+        <button onClick={() => {
           setPrompt("帮我做一个并发任务处理流程，先校验结构化任务 JSON，再并发处理每个任务并汇总结果。");
           setPreviewTemplateId(null);
         }} type="button">
@@ -72,6 +84,9 @@ export function AssistantPanel() {
             <small>{previewTemplate.requiresModel ? "需要模型" : "无需模型"}</small>
             <small>{previewTemplate.requiresNetwork ? "需要网络" : "本地/mock"}</small>
           </div>
+          {previewTemplate.sampleInput ? (
+            <pre className="assistant-preview__sample">{JSON.stringify(previewTemplate.sampleInput, null, 2)}</pre>
+          ) : null}
           <ul>
             {previewTemplate.fields.slice(0, 6).map((field) => (
               <li key={field.name}>{field.name}: {field.type}</li>
@@ -88,6 +103,8 @@ export function AssistantPanel() {
 
 function pickTemplateId(prompt: string) {
   const normalized = prompt.trim();
+  if (/exa|websearch|web search|联网|搜索|网页|mcp/i.test(normalized)) return "websearch_exa_mcp";
+  if (/多.?agent|子.?agent|协作|编排|handoff|agent tool|历史 Agent/i.test(normalized)) return "multi_agent_orchestration";
   if (/api|json|清洗|校验|订单接口|订单 API/i.test(normalized)) return "api_json_cleanup";
   if (/并发|foreach|for each|任务处理|task plan|结构化任务|错误兜底|merge/i.test(normalized)) return "flow_control_task_processing";
   if (/客服|售后|订单|退款/.test(normalized)) return "customer_support";

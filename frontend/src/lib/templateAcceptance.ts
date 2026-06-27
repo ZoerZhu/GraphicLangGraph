@@ -9,9 +9,10 @@ export function evaluateTemplateAcceptance(project: ProjectIR | null, result: Ru
   const missingTraceTypes = template.expectedTraceTypes.filter((type) => !traceTypes.has(type));
   const errorTraceCount = result.trace.filter((item) => item.status === "error").length;
   const finalAnswerPresent = hasMeaningfulValue(result.outputState, "final_answer");
-  const warnings = templateAcceptanceWarnings(template, result, missingFields, missingTraceTypes, errorTraceCount, finalAnswerPresent);
+  const pausedForApproval = result.status === "paused" && result.trace.some((item) => item.type === "human_approval" && item.pause === true);
+  const warnings = templateAcceptanceWarnings(template, result, missingFields, missingTraceTypes, errorTraceCount, finalAnswerPresent, pausedForApproval);
   return {
-    ok: warnings.length === 0,
+    ok: warnings.length === 0 || (pausedForApproval && errorTraceCount === 0 && !missingTraceTypes.length),
     templateId: template.id,
     templateName: template.name,
     missingFields,
@@ -29,13 +30,15 @@ function templateAcceptanceWarnings(
   missingTraceTypes: NodeType[],
   errorTraceCount: number,
   finalAnswerPresent: boolean,
+  pausedForApproval: boolean,
 ) {
   const warnings: string[] = [];
   if (!result.valid) warnings.push("图校验未通过");
-  if (!finalAnswerPresent) warnings.push("缺少 final_answer");
+  if (!finalAnswerPresent && !pausedForApproval) warnings.push("缺少 final_answer");
   if (missingFields.length) warnings.push(`缺少输出字段：${missingFields.join(", ")}`);
   if (missingTraceTypes.length) warnings.push(`缺少 trace 类型：${missingTraceTypes.join(", ")}`);
   if (errorTraceCount > 0) warnings.push(`存在 ${errorTraceCount} 个错误 trace`);
+  if (pausedForApproval) warnings.push("运行已在 Human Approval 暂停，审批后继续验收 final_answer");
   if (template.id === "api_json_cleanup" && getPath(result.outputState, "order_validation.valid") !== true) {
     warnings.push("order_validation.valid 未通过");
   }
