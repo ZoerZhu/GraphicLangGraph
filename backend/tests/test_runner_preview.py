@@ -1754,6 +1754,8 @@ def test_parallel_for_each_stream_collect_errors_preserves_failed_child_trace():
     final_child = [item for item in run_end["trace"] if item.get("parentNodeId") == "each" and item["nodeId"] == "template"]
     status, pending = run_status_from_state(run_end["trace"], run_end["outputState"])
 
+    stream_child = sorted(stream_child, key=lambda item: int(item["iterationIndex"]))
+    final_child = sorted(final_child, key=lambda item: int(item["iterationIndex"]))
     assert [(item["status"], item["iterationIndex"]) for item in stream_child] == [("ok", 0), ("error", 1)]
     assert [(item["status"], item["iterationIndex"]) for item in final_child] == [("ok", 0), ("error", 1)]
     failed_child = final_child[1]
@@ -1793,6 +1795,305 @@ def test_parallel_for_each_stream_fail_fast_preserves_failed_child_trace():
     assert any(item["status"] == "error" for item in stream_child)
     assert any(item["status"] == "error" for item in final_child)
     assert status == "failed"
+    assert pending is None
+
+
+def test_sequential_for_each_stream_collect_errors_preserves_child_error_payload():
+    project = create_default_project("Sequential ForEach Collect Errors Stream")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="merged_results", type="list"), StateField(name="merge_result", type="dict")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index", "itemFailurePolicy": "collect_errors"}),
+            NodeIR(id="template", type=NodeType.TEMPLATE, label="Template", config={"template": '{"value":"{{ state.current_item }}"}', "outputType": "json", "outputField": "item_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="template", sourceHandle="item"),
+            EdgeIR(id="e3", source="template", target="merge"),
+        ]
+    )
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ['bad " json']}, "live"))
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    final_child = [item for item in run_end["trace"] if item.get("parentNodeId") == "each" and item["nodeId"] == "template"]
+    status, pending = run_status_from_state(run_end["trace"], run_end["outputState"])
+
+    assert final_child[0]["status"] == "error"
+    assert final_child[0]["nonFatal"] is True
+    assert run_end["outputState"]["merged_results"][0]["error"]["nodeId"] == "template"
+    assert status == "completed"
+    assert pending is None
+
+
+def test_sequential_for_each_stream_collect_errors_ignores_stale_last_error_before_child_trace():
+    project = create_default_project("Sequential ForEach Stale Last Error")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="merged_results", type="list"), StateField(name="merge_result", type="dict")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index", "itemFailurePolicy": "collect_errors"}),
+            NodeIR(id="nested_each", type=NodeType.FOR_EACH, label="Nested ForEach", config={"itemsField": "nested_items"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="nested_each", sourceHandle="item"),
+            EdgeIR(id="e3", source="nested_each", target="merge"),
+        ]
+    )
+    stale_error = {"ok": False, "nodeId": "old_node", "nodeType": "old", "message": "stale"}
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ["a"], "last_error": stale_error}, "live"))
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    error_payload = run_end["outputState"]["merged_results"][0]["error"]
+    status, pending = run_status_from_state(run_end["trace"], run_end["outputState"])
+
+    assert error_payload["nodeId"] == "each"
+    assert "ForEach v1 不支持嵌套" in error_payload["message"]
+    assert status == "completed"
+    assert pending is None
+
+
+def test_sequential_for_each_stream_collect_errors_isolates_error_payload_per_item():
+    project = create_default_project("Sequential ForEach Isolates Item Error Payload")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="merged_results", type="list"), StateField(name="merge_result", type="dict")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index", "itemFailurePolicy": "collect_errors"}),
+            NodeIR(id="route", type=NodeType.CONDITION, label="Route", config={"field": "current_item", "operator": "contains", "value": "bad", "trueBranch": "bad", "falseBranch": "nested"}),
+            NodeIR(id="bad_template", type=NodeType.TEMPLATE, label="Bad Template", config={"template": '{"value":"{{ state.current_item }}"}', "outputType": "json", "outputField": "item_result"}),
+            NodeIR(id="nested_each", type=NodeType.FOR_EACH, label="Nested ForEach", config={"itemsField": "nested_items"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="route", sourceHandle="item"),
+            EdgeIR(id="e3", source="route", target="bad_template", kind=EdgeKind.CONDITIONAL, sourceHandle="bad"),
+            EdgeIR(id="e4", source="route", target="nested_each", kind=EdgeKind.CONDITIONAL, sourceHandle="nested"),
+            EdgeIR(id="e5", source="bad_template", target="merge"),
+            EdgeIR(id="e6", source="nested_each", target="merge"),
+        ]
+    )
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ['bad " json', "nested"]}, "live"))
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    errors = [item["error"] for item in run_end["outputState"]["merged_results"]]
+    status, pending = run_status_from_state(run_end["trace"], run_end["outputState"])
+
+    assert errors[0]["nodeId"] == "bad_template"
+    assert errors[1]["nodeId"] == "each"
+    assert "ForEach v1 不支持嵌套" in errors[1]["message"]
+    assert status == "completed"
+    assert pending is None
+
+
+def test_parallel_for_each_stream_collect_errors_ignores_stale_last_error_before_child_trace():
+    project = create_default_project("Parallel ForEach Stale Last Error")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="merged_results", type="list"), StateField(name="merge_result", type="dict")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index", "executionMode": "parallel", "maxConcurrency": 2, "preserveOrder": True, "itemFailurePolicy": "collect_errors"}),
+            NodeIR(id="nested_each", type=NodeType.FOR_EACH, label="Nested ForEach", config={"itemsField": "nested_items"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="nested_each", sourceHandle="item"),
+            EdgeIR(id="e3", source="nested_each", target="merge"),
+        ]
+    )
+    stale_error = {"ok": False, "nodeId": "old_node", "nodeType": "old", "message": "stale"}
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ["a", "b"], "last_error": stale_error}, "live"))
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    errors = [item["error"] for item in run_end["outputState"]["merged_results"]]
+    status, pending = run_status_from_state(run_end["trace"], run_end["outputState"])
+
+    assert [error["nodeId"] for error in errors] == ["each", "each"]
+    assert all("ForEach v1 不支持嵌套" in error["message"] for error in errors)
+    assert status == "completed"
+    assert pending is None
+
+
+def test_sequential_for_each_stream_fail_fast_preserves_failed_child_trace():
+    project = create_default_project("Sequential ForEach Fail Fast Stream")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="merged_results", type="list"), StateField(name="merge_result", type="dict")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index"}),
+            NodeIR(id="template", type=NodeType.TEMPLATE, label="Template", config={"template": '{"value":"{{ state.current_item }}"}', "outputType": "json", "outputField": "item_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="template", sourceHandle="item"),
+            EdgeIR(id="e3", source="template", target="merge"),
+        ]
+    )
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ['bad " json']}, "live"))
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    stream_child = [event["traceItem"] for event in events if event.get("event") == "node_end" and event.get("traceItem", {}).get("parentNodeId") == "each"]
+    final_child = [item for item in run_end["trace"] if item.get("parentNodeId") == "each" and item["nodeId"] == "template"]
+    status, pending = run_status_from_state(run_end["trace"], run_end["outputState"])
+
+    assert any(item["status"] == "error" for item in stream_child)
+    assert any(item["status"] == "error" for item in final_child)
+    assert status == "failed"
+    assert pending is None
+
+
+def test_sequential_for_each_stream_missing_merge_preserves_child_trace():
+    project = create_default_project("Sequential ForEach Missing Merge Stream")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="merged_results", type="list"), StateField(name="merge_result", type="dict"), StateField(name="item_result", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index"}),
+            NodeIR(id="reply_item", type=NodeType.DIRECT_REPLY, label="Reply Item", config={"template": "{{ state.current_item }}", "outputField": "item_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="reply_item", sourceHandle="item"),
+            EdgeIR(id="e3", source="reply_item", target="merge"),
+        ]
+    )
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ["a"]}, "live"))
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    stream_child = [event["traceItem"] for event in events if event.get("event") == "node_end" and event.get("traceItem", {}).get("parentNodeId") == "each"]
+    final_child = [item for item in run_end["trace"] if item.get("parentNodeId") == "each" and item["nodeId"] == "reply_item"]
+    status, pending = run_status_from_state(run_end["trace"], run_end["outputState"])
+
+    assert [item["nodeId"] for item in stream_child] == ["reply_item"]
+    assert [item["nodeId"] for item in final_child] == ["reply_item"]
+    assert status == "failed"
+    assert pending is None
+
+
+def test_parallel_for_each_stream_missing_merge_preserves_child_trace():
+    project = create_default_project("Parallel ForEach Missing Merge Stream")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="merged_results", type="list"), StateField(name="merge_result", type="dict"), StateField(name="item_result", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index", "executionMode": "parallel", "maxConcurrency": 2, "preserveOrder": True}),
+            NodeIR(id="reply_item", type=NodeType.DIRECT_REPLY, label="Reply Item", config={"template": "{{ state.current_item }}", "outputField": "item_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="reply_item", sourceHandle="item"),
+            EdgeIR(id="e3", source="reply_item", target="merge"),
+        ]
+    )
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ["a", "b"]}, "live"))
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    stream_child = [event["traceItem"] for event in events if event.get("event") == "node_end" and event.get("traceItem", {}).get("parentNodeId") == "each"]
+    final_child = [item for item in run_end["trace"] if item.get("parentNodeId") == "each" and item["nodeId"] == "reply_item"]
+    status, pending = run_status_from_state(run_end["trace"], run_end["outputState"])
+
+    assert sorted(item["iterationIndex"] for item in stream_child) == [0, 1]
+    assert sorted(item["iterationIndex"] for item in final_child) == [0, 1]
+    assert status == "failed"
+    assert pending is None
+
+
+def test_for_each_collect_errors_missing_merge_live_preview_continues():
+    project = create_default_project("ForEach Collect Missing Merge Live")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="merged_results", type="list"), StateField(name="merge_result", type="dict"), StateField(name="item_result", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index", "itemFailurePolicy": "collect_errors"}),
+            NodeIR(id="reply_item", type=NodeType.DIRECT_REPLY, label="Reply Item", config={"template": "{{ state.current_item }}", "outputField": "item_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="reply_item", sourceHandle="item"),
+            EdgeIR(id="e3", source="reply_item", target="merge"),
+        ]
+    )
+
+    trace, state = preview.run_project_preview(project, {"messages": "run", "items": ["a"]}, "live")
+    status, pending = run_status_from_state(trace, state)
+
+    assert state["merged_results"][0]["ok"] is False
+    assert state["merged_results"][0]["error"]["nodeId"] == "each"
+    assert "没有到达 Merge" in state["merged_results"][0]["error"]["message"]
+    assert status == "completed"
+    assert pending is None
+
+
+def test_sequential_for_each_stream_collect_errors_missing_merge_continues():
+    project = create_default_project("Sequential ForEach Collect Missing Merge Stream")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="merged_results", type="list"), StateField(name="merge_result", type="dict"), StateField(name="item_result", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index", "itemFailurePolicy": "collect_errors"}),
+            NodeIR(id="reply_item", type=NodeType.DIRECT_REPLY, label="Reply Item", config={"template": "{{ state.current_item }}", "outputField": "item_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="reply_item", sourceHandle="item"),
+            EdgeIR(id="e3", source="reply_item", target="merge"),
+        ]
+    )
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ["a"]}, "live"))
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    status, pending = run_status_from_state(run_end["trace"], run_end["outputState"])
+
+    assert run_end["outputState"]["merged_results"][0]["ok"] is False
+    assert run_end["outputState"]["merged_results"][0]["error"]["nodeId"] == "each"
+    assert status == "completed"
+    assert pending is None
+
+
+def test_parallel_for_each_stream_collect_errors_missing_merge_continues():
+    project = create_default_project("Parallel ForEach Collect Missing Merge Stream")
+    project.state.fields.extend([StateField(name="items", type="list"), StateField(name="merged_results", type="list"), StateField(name="merge_result", type="dict"), StateField(name="item_result", type="str")])
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index", "executionMode": "parallel", "maxConcurrency": 2, "preserveOrder": True, "itemFailurePolicy": "collect_errors"}),
+            NodeIR(id="reply_item", type=NodeType.DIRECT_REPLY, label="Reply Item", config={"template": "{{ state.current_item }}", "outputField": "item_result"}),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="reply_item", sourceHandle="item"),
+            EdgeIR(id="e3", source="reply_item", target="merge"),
+        ]
+    )
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ["a", "b"]}, "live"))
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    status, pending = run_status_from_state(run_end["trace"], run_end["outputState"])
+
+    assert [item["ok"] for item in run_end["outputState"]["merged_results"]] == [False, False]
+    assert [item["error"]["nodeId"] for item in run_end["outputState"]["merged_results"]] == ["each", "each"]
+    assert status == "completed"
     assert pending is None
 
 

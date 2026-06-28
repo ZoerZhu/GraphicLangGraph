@@ -136,7 +136,11 @@ def execute_for_each_node(node: NodeIR, state: dict[str, Any], ctx: ExecutionCon
             results.sort(key=lambda item: int(item["index"]))
         for result in results:
             if not result.get("reachedMerge"):
-                raise RuntimeError(f"ForEach 第 {int(result['index']) + 1} 项没有到达 Merge 节点。")
+                if item_failure_policy != "collect_errors":
+                    raise _missing_merge_exception(int(result["index"]))
+                error_payload = _missing_merge_error_payload(node, int(result["index"]))
+                _mark_item_failure(result["itemState"], error_payload, overwrite_item_result=True)
+                result["error"] = error_payload
             item_state = result["itemState"]
             item_states.append(item_state)
             iteration = {"index": result["index"], "item": compact_value(result["item"]), "output": compact_state(item_state)}
@@ -166,9 +170,15 @@ def execute_for_each_node(node: NodeIR, state: dict[str, Any], ctx: ExecutionCon
                 item_state.setdefault("item_result", {"ok": False, "error": error_payload})
                 reached_merge = True
             if not reached_merge:
-                raise RuntimeError(f"ForEach 第 {index + 1} 项没有到达 Merge 节点。")
+                if item_failure_policy != "collect_errors":
+                    raise _missing_merge_exception(index)
+                error_payload = _missing_merge_error_payload(node, index)
+                _mark_item_failure(item_state, error_payload, overwrite_item_result=True)
             item_states.append(item_state)
-            iterations.append({"index": index, "item": compact_value(item), "output": compact_state(item_state)})
+            iteration = {"index": index, "item": compact_value(item), "output": compact_state(item_state)}
+            if not reached_merge:
+                iteration["error"] = compact_value(error_payload)
+            iterations.append(iteration)
 
     from app.runner.nodes.merge import execute_merge
 
@@ -282,7 +292,11 @@ def execute_for_each_node_events(node: NodeIR, state: dict[str, Any], ctx: Execu
             results.sort(key=lambda item: int(item["index"]))
         for result in results:
             if not result.get("reachedMerge"):
-                raise RuntimeError(f"ForEach 第 {int(result['index']) + 1} 项没有到达 Merge 节点。")
+                if item_failure_policy != "collect_errors":
+                    _raise_missing_merge(node, int(result["index"]), result["itemState"], child_trace_items)
+                error_payload = _missing_merge_error_payload(node, int(result["index"]))
+                _mark_item_failure(result["itemState"], error_payload, overwrite_item_result=True)
+                result["error"] = error_payload
             item_state = result["itemState"]
             item_states.append(item_state)
             iteration = {"index": result["index"], "item": compact_value(result["item"]), "output": compact_state(item_state)}
@@ -294,6 +308,7 @@ def execute_for_each_node_events(node: NodeIR, state: dict[str, Any], ctx: Execu
             item_state = dict(state)
             item_state[item_field] = item
             item_state[index_field] = index
+            item_child_trace_items: list[dict[str, Any]] = []
             try:
                 reached_merge = yield from run_for_each_item_chain_events(
                     item_start,
@@ -305,19 +320,27 @@ def execute_for_each_node_events(node: NodeIR, state: dict[str, Any], ctx: Execu
                     node,
                     index,
                     item,
-                    child_trace_items,
+                    item_child_trace_items,
                 )
             except Exception as exc:
                 if item_failure_policy != "collect_errors":
-                    raise
-                error_payload = runtime_error_payload(node, exc)
+                    error_payload = _collected_item_error_payload(node, exc, item_state, item_child_trace_items)
+                    raise _ForEachItemError(exc, item_state, [*child_trace_items, *item_child_trace_items], [], error_payload) from exc
+                error_payload = _collected_item_error_payload(node, exc, item_state, item_child_trace_items)
                 item_state["last_error"] = error_payload
                 item_state.setdefault("item_result", {"ok": False, "error": error_payload})
                 reached_merge = True
+            child_trace_items.extend(item_child_trace_items)
             if not reached_merge:
-                raise RuntimeError(f"ForEach 第 {index + 1} 项没有到达 Merge 节点。")
+                if item_failure_policy != "collect_errors":
+                    _raise_missing_merge(node, index, item_state, child_trace_items)
+                error_payload = _missing_merge_error_payload(node, index)
+                _mark_item_failure(item_state, error_payload, overwrite_item_result=True)
             item_states.append(item_state)
-            iterations.append({"index": index, "item": compact_value(item), "output": compact_state(item_state)})
+            iteration = {"index": index, "item": compact_value(item), "output": compact_state(item_state)}
+            if not reached_merge:
+                iteration["error"] = compact_value(error_payload)
+            iterations.append(iteration)
 
     merge_before = dict(state)
     merge_event_meta = {"forEachNodeId": node.id, "sourceNodeId": merge_node.id}
@@ -443,15 +466,31 @@ def collect_for_each_item_events(
     return {"index": index, "item": item, "itemState": item_state, "reachedMerge": reached_merge, "events": events, "childTrace": child_trace}
 
 
-def _collected_item_error_payload(parent_node: NodeIR, exc: Exception, item_state: dict[str, Any], child_trace: list[dict[str, Any]]) -> dict[str, Any]:
-    state_error = item_state.get("last_error")
-    if isinstance(state_error, dict):
-        return dict(state_error)
+def _collected_item_error_payload(parent_node: NodeIR, exc: Exception, _item_state: dict[str, Any], child_trace: list[dict[str, Any]]) -> dict[str, Any]:
     for trace_item in reversed(child_trace):
         output_delta = trace_item.get("outputDelta") if isinstance(trace_item, dict) else None
         if isinstance(output_delta, dict) and isinstance(output_delta.get("last_error"), dict):
             return dict(output_delta["last_error"])
     return runtime_error_payload(parent_node, exc)
+
+
+def _mark_item_failure(item_state: dict[str, Any], error_payload: dict[str, Any], *, overwrite_item_result: bool = False) -> None:
+    item_state["last_error"] = error_payload
+    if overwrite_item_result or "item_result" not in item_state:
+        item_state["item_result"] = {"ok": False, "error": error_payload}
+
+
+def _missing_merge_exception(index: int) -> RuntimeError:
+    return RuntimeError(f"ForEach 第 {index + 1} 项没有到达 Merge 节点。")
+
+
+def _missing_merge_error_payload(parent_node: NodeIR, index: int) -> dict[str, Any]:
+    return runtime_error_payload(parent_node, _missing_merge_exception(index))
+
+
+def _raise_missing_merge(parent_node: NodeIR, index: int, item_state: dict[str, Any], child_trace: list[dict[str, Any]]):
+    exc = _missing_merge_exception(index)
+    raise _ForEachItemError(exc, item_state, list(child_trace), [], runtime_error_payload(parent_node, exc)) from exc
 
 
 def _for_each_event_identity(event: dict[str, Any]) -> tuple[Any, ...]:
