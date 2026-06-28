@@ -1,13 +1,27 @@
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
+import app.api.projects as projects_api
 import app.config as app_config
 import app.api.workspace as workspace_api
+import app.project_store as project_store
 import app.runtime_environment as runtime_environment
 import app.runner.run_history as run_history
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def isolate_project_api_storage(tmp_path, monkeypatch):
+    projects_dir = tmp_path / "projects"
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setattr(app_config, "STORAGE_DIR", projects_dir)
+    monkeypatch.setattr(projects_api, "STORAGE_DIR", projects_dir)
+    monkeypatch.setattr(project_store, "STORAGE_DIR", projects_dir)
+    monkeypatch.setattr(app_config, "RUNS_DIR", runs_dir)
+    monkeypatch.setattr(run_history, "RUNS_DIR", runs_dir)
 
 
 def test_project_list_create_and_delete():
