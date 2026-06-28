@@ -4,10 +4,11 @@ from typing import Any
 
 from app.ir.schemas import NodeIR
 
-from .. import engine
-from ..common import json_object_list, json_string_list, positive_int, render_template
+from .. import model_runtime
+from ..common import agent_state_prompt, json_object_list, json_string_list, positive_int, render_template
 from ..context import ExecutionContext
-from ..model_runtime import call_chat_model, effective_model_config, resolve_node_model
+from ..resources import agent_tool_configs, mcp_agent_tool_configs, selected_agent_configs, selected_mcp_server_configs, selected_skill_configs
+from ..skills_runtime import append_selected_skills
 from ..tool_runtime.registry import run_tools_agent_session, selected_tool_configs
 
 
@@ -22,23 +23,23 @@ def execute_dry(node: NodeIR, state: dict[str, Any], ctx: ExecutionContext):
 
 def execute_agent(node: NodeIR, state: dict[str, Any], ctx: ExecutionContext):
     config = node.config
-    effective_config = effective_model_config(config, ctx.model_config)
-    provider, model = resolve_node_model(config, ctx.model_config, "openai", "gpt-4.1-mini")
+    effective_config = model_runtime.effective_model_config(config, ctx.model_config)
+    provider, model = model_runtime.resolve_node_model(config, ctx.model_config, "openai", "gpt-4.1-mini")
     system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip()
-    selected_skills = engine._selected_skill_configs(config, ctx.skills)
-    system_prompt = engine._append_selected_skills(system_prompt, selected_skills)
+    selected_skills = selected_skill_configs(config, ctx.skills)
+    system_prompt = append_selected_skills(system_prompt, selected_skills)
     user_prompt = str(config.get("userPrompt", "")).strip()
     if user_prompt:
         user_text = render_template(user_prompt, state)
     else:
-        user_text = engine._agent_state_prompt(state)
+        user_text = agent_state_prompt(state)
     selected_tools = selected_tool_configs(config, ctx.tools)
-    selected_mcp_servers = engine._selected_mcp_server_configs(config, ctx.mcp_servers)
-    selected_agents = engine._selected_agent_configs(config, ctx.agents)
+    selected_mcp_servers = selected_mcp_server_configs(config, ctx.mcp_servers)
+    selected_agents = selected_agent_configs(config, ctx.agents)
     if selected_tools or selected_mcp_servers or selected_agents:
         max_iterations = min(positive_int(config.get("maxIterations", 4), 4), 12)
-        mcp_tools = engine._mcp_agent_tool_configs(selected_mcp_servers, ctx.runtime_environment)
-        agent_tools = engine._agent_tool_configs(selected_agents, ctx.project)
+        mcp_tools = mcp_agent_tool_configs(selected_mcp_servers, ctx.runtime_environment)
+        agent_tools = agent_tool_configs(selected_agents, ctx.project)
         registered_tools = [*selected_tools, *mcp_tools, *agent_tools]
         if (json_string_list(config.get("toolIdsJson")) or json_object_list(config.get("toolRegistryJson"))) and not selected_tools:
             raise RuntimeError("Agent 已选择 Tool，但没有可用 Tool。")
@@ -61,6 +62,7 @@ def execute_agent(node: NodeIR, state: dict[str, Any], ctx: ExecutionContext):
                 "state": state,
                 "agentDepth": ctx.agent_depth,
                 "modelConfig": effective_config,
+                "runProject": ctx.services.run_project if ctx.services else None,
             },
         )
         output_field = str(config.get("outputField", f"{node.id}_result"))
@@ -76,7 +78,7 @@ def execute_agent(node: NodeIR, state: dict[str, Any], ctx: ExecutionContext):
     if system_prompt:
         messages.append(("system", system_prompt))
     messages.append(("user", user_text))
-    response = call_chat_model(provider, model, messages, effective_config)
+    response = model_runtime.call_chat_model(provider, model, messages, effective_config)
     content = getattr(response, "content", str(response))
     output_field = str(config.get("outputField", f"{node.id}_result"))
     tools = str(config.get("tools", "")).strip()

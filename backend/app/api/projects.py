@@ -14,7 +14,6 @@ from app.ir.sanitization import sanitized_project
 from app.ir.schemas import ProjectIR, create_default_project
 from app.ir.validation import validate_project
 from app.project_store import project_path, read_project, write_project
-from app.run_store import clear_run_records, delete_run_record, list_run_records, save_run_record
 from app.runtime_environment import RuntimeEnvironmentConfig, resolve_runtime_environment
 from app.runner import (
     collect_data_shaping_paths,
@@ -23,6 +22,16 @@ from app.runner import (
     resume_project_preview,
     run_project_preview as run_project_preview_engine,
 )
+from app.runner.events import run_start_event, validation_failed_run_end_event
+from app.runner.run_history import (
+    clear_run_records,
+    delete_run_record,
+    find_run_record,
+    list_run_records,
+    output_state_from_run_record,
+    save_run_record,
+)
+from app.runner.trace import run_status_from_state
 
 
 router = APIRouter(prefix="/api", tags=["projects"])
@@ -239,7 +248,7 @@ def run_project_preview(project_id: str, payload: RunPreviewRequest | None = Non
             request.modelConfig.model_dump(by_alias=True) if request.modelConfig else None,
             runtime_environment,
         )
-    status, pending_approval = _run_status_from_state(trace, output_state)
+    status, pending_approval = run_status_from_state(trace, output_state)
     return RunPreviewResponse(
         mode=request.mode,
         valid=result.valid,
@@ -255,7 +264,7 @@ def run_project_preview(project_id: str, payload: RunPreviewRequest | None = Non
 def list_project_data_shaping_paths(project_id: str, payload: DataShapingPathsRequest | None = None) -> dict[str, Any]:
     project = read_project(project_id)
     request = payload or DataShapingPathsRequest()
-    run_record = _find_run_record(project_id, request.runId)
+    run_record = find_run_record(project_id, request.runId)
     return {
         "paths": collect_data_shaping_paths(project, request.state, run_record),
     }
@@ -264,8 +273,8 @@ def list_project_data_shaping_paths(project_id: str, payload: DataShapingPathsRe
 @router.post("/projects/{project_id}/data-shaping/preview")
 def preview_project_data_shaping(project_id: str, payload: DataShapingPreviewRequest) -> dict[str, Any]:
     project = read_project(project_id)
-    run_record = _find_run_record(project_id, payload.runId)
-    state = payload.state or _output_state_from_run_record(run_record)
+    run_record = find_run_record(project_id, payload.runId)
+    state = payload.state or output_state_from_run_record(run_record)
     result = preview_data_shaping_node(
         project,
         payload.nodeId,
@@ -291,7 +300,7 @@ def save_project_run(project_id: str, record: RunHistoryRecordPayload) -> dict[s
 @router.post("/projects/{project_id}/runs/{run_id}/resume", response_model=RunPreviewResponse)
 def resume_project_run(project_id: str, run_id: str, payload: ResumeRunRequest) -> RunPreviewResponse:
     project = read_project(project_id)
-    record = _find_run_record(project_id, run_id)
+    record = find_run_record(project_id, run_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Run history record not found")
     result_payload = record.get("result") if isinstance(record.get("result"), dict) else {}
@@ -321,7 +330,7 @@ def resume_project_run(project_id: str, run_id: str, payload: ResumeRunRequest) 
     )
     previous_trace = result_payload.get("trace") if isinstance(result_payload.get("trace"), list) else []
     combined_trace = [*previous_trace, *trace]
-    status, next_pending_approval = _run_status_from_state(combined_trace, resumed_state)
+    status, next_pending_approval = run_status_from_state(combined_trace, resumed_state)
     response = RunPreviewResponse(
         mode="live",
         valid=validation.valid,
@@ -350,23 +359,6 @@ def clear_project_runs(project_id: str) -> None:
     clear_run_records(project_id)
 
 
-def _find_run_record(project_id: str, run_id: str) -> dict[str, Any] | None:
-    if not run_id:
-        return None
-    for record in list_run_records(project_id):
-        if str(record.get("id") or "") == run_id:
-            return record
-    return None
-
-
-def _output_state_from_run_record(record: dict[str, Any] | None) -> dict[str, Any]:
-    if not isinstance(record, dict):
-        return {}
-    result = record.get("result") if isinstance(record.get("result"), dict) else {}
-    output_state = result.get("outputState") if isinstance(result.get("outputState"), dict) else {}
-    return dict(output_state)
-
-
 @router.post("/projects/{project_id}/run/stream")
 def stream_project_preview(project_id: str, payload: RunPreviewRequest | None = None) -> StreamingResponse:
     project = read_project(project_id)
@@ -376,27 +368,9 @@ def stream_project_preview(project_id: str, payload: RunPreviewRequest | None = 
     def events():
         result = validate_project(project)
         issues = [issue.model_dump() for issue in result.issues]
-        yield _json_line(
-            {
-                "event": "run_start",
-                "mode": request.mode,
-                "valid": result.valid,
-                "issues": issues,
-                "inputState": request.input,
-            }
-        )
+        yield _json_line(run_start_event(request.mode, result.valid, issues, request.input))
         if request.mode == "live" and not result.valid:
-            yield _json_line(
-                {
-                    "event": "run_end",
-                    "mode": request.mode,
-                    "valid": result.valid,
-                    "issues": issues,
-                    "trace": [],
-                    "outputState": dict(request.input),
-                    "status": "failed",
-                }
-            )
+            yield _json_line(validation_failed_run_end_event(request.mode, result.valid, issues, request.input))
             return
         for event in iter_project_preview_events(
             project,
@@ -409,7 +383,7 @@ def stream_project_preview(project_id: str, payload: RunPreviewRequest | None = 
             event["valid"] = result.valid
             event["issues"] = issues
             if event.get("event") == "run_end":
-                status, pending_approval = _run_status_from_state(
+                status, pending_approval = run_status_from_state(
                     event.get("trace") if isinstance(event.get("trace"), list) else [],
                     event.get("outputState") if isinstance(event.get("outputState"), dict) else {},
                 )
@@ -455,18 +429,6 @@ def download_export(export_id: str):
 
 def _json_line(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False) + "\n"
-
-
-def _run_status_from_state(
-    trace: list[dict[str, Any]] | list[RunTraceItem],
-    output_state: dict[str, Any],
-) -> tuple[str, dict[str, Any] | None]:
-    pending_approval = output_state.get("_glg_pending_approval") if isinstance(output_state, dict) else None
-    if output_state.get("_glg_run_status") == "paused" and isinstance(pending_approval, dict):
-        return "paused", pending_approval
-    if any((item.get("status") if isinstance(item, dict) else item.status) == "error" for item in trace):
-        return "failed", None
-    return "completed", None
 
 
 def _smoke_response(result: SmokeTestResult) -> SmokeTestResponse:

@@ -5,8 +5,8 @@ from fastapi.testclient import TestClient
 
 import app.config as app_config
 import app.api.workspace as workspace_api
-import app.run_store as run_store
 import app.runtime_environment as runtime_environment
+import app.runner.run_history as run_history
 from app.main import app
 
 
@@ -224,7 +224,7 @@ def test_project_run_stream_emits_node_events():
 def test_project_run_human_approval_pauses_and_resumes(tmp_path, monkeypatch):
     runs_dir = tmp_path / "runs"
     monkeypatch.setattr(app_config, "RUNS_DIR", runs_dir)
-    monkeypatch.setattr(run_store, "RUNS_DIR", runs_dir)
+    monkeypatch.setattr(run_history, "RUNS_DIR", runs_dir)
     client = TestClient(app)
 
     created = client.post("/api/projects", json={"name": "人工审批恢复 Agent"})
@@ -349,7 +349,7 @@ def test_project_run_human_approval_pauses_and_resumes(tmp_path, monkeypatch):
 def test_project_run_history_persists_to_runs_dir(tmp_path, monkeypatch):
     runs_dir = tmp_path / "runs"
     monkeypatch.setattr(app_config, "RUNS_DIR", runs_dir)
-    monkeypatch.setattr(run_store, "RUNS_DIR", runs_dir)
+    monkeypatch.setattr(run_history, "RUNS_DIR", runs_dir)
     client = TestClient(app)
 
     created = client.post("/api/projects", json={"name": "运行历史落盘 Agent"})
@@ -393,7 +393,7 @@ def test_project_run_history_persists_to_runs_dir(tmp_path, monkeypatch):
 def test_data_shaping_paths_and_preview_use_run_history(tmp_path, monkeypatch):
     runs_dir = tmp_path / "runs"
     monkeypatch.setattr(app_config, "RUNS_DIR", runs_dir)
-    monkeypatch.setattr(run_store, "RUNS_DIR", runs_dir)
+    monkeypatch.setattr(run_history, "RUNS_DIR", runs_dir)
     client = TestClient(app)
 
     created = client.post("/api/projects", json={"name": "数据塑形预览 Agent"})

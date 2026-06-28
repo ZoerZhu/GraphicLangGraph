@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import importlib.util
+import inspect
 import re
 import time
+from pathlib import Path
 from typing import Any
 
-from .. import engine
-from ..common import compact_state, json_object_list, json_string_list, parse_json_object, state_value_to_text
+from app import mcp_runtime
+from app.config import ROOT_DIR
+
+from .. import model_runtime
+from ..common import compact_state, first_config_value, json_object_list, json_string_list, parse_json_object, state_value_to_text
 from ..context import ModelRuntimeConfig, RuntimeEnvironment, ToolRuntimeConfig
-from ..model_runtime import call_chat_model, normalize_model_config
+from ..resources import fresh_builtin_tool_config as _fresh_builtin_tool_config
+from ..trace import compact_value
 from . import builtin as _builtin  # noqa: F401 - keep builtin runtime importable from the package.
 
 
@@ -31,12 +39,12 @@ def run_tools_agent_session(
     final_answer = ""
     latest_task_plan_payload: dict[str, Any] | None = None
     for iteration in range(max_iterations):
-        response = call_chat_model(provider, model, messages, effective_model_config)
+        response = model_runtime.call_chat_model(provider, model, messages, effective_model_config)
         content = getattr(response, "content", str(response))
         decision = parse_tool_agent_decision(content)
         tool_calls = normalize_tool_calls(decision.get("tool_calls"))
         if not tool_calls:
-            final_answer = engine._first_config_value(decision.get("final_answer"), content)
+            final_answer = first_config_value(decision.get("final_answer"), content)
             break
 
         observations: list[dict[str, Any]] = []
@@ -53,7 +61,7 @@ def run_tools_agent_session(
             task_plan_payload = task_plan_payload_from_observation(tool_name, observation)
             if task_plan_payload:
                 latest_task_plan_payload = task_plan_payload
-            recommended_next_tools = engine._recommended_next_tools(tool_name, args, observation)
+            recommended_next_tools = recommended_next_tools_for_observation(tool_name, args, observation)
             if recommended_next_tools:
                 observation["recommendedNextTools"] = recommended_next_tools
             calls.append(
@@ -113,12 +121,12 @@ def finalize_tools_agent_answer(
         )
     )
     try:
-        response = call_chat_model(provider, model, messages, model_config)
+        response = model_runtime.call_chat_model(provider, model, messages, model_config)
     except Exception as exc:
         return f"达到最大工具调用轮次 {max_iterations}，已停止。最终总结失败：{exc.__class__.__name__}: {exc}"
     content = getattr(response, "content", str(response))
     decision = parse_tool_agent_decision(content)
-    final_answer = engine._first_config_value(decision.get("final_answer"))
+    final_answer = first_config_value(decision.get("final_answer"))
     return final_answer or content or f"达到最大工具调用轮次 {max_iterations}，已停止。"
 
 
@@ -267,18 +275,18 @@ def invoke_registered_tool(
     try:
         if source == "builtin" or kind == "builtin_tool":
             result = _builtin.invoke_builtin_tool(metadata, args, runtime_environment)
-            return {"ok": True, "result": engine._compact_tool_result(result)}
+            return {"ok": True, "result": compact_tool_result(result)}
         if source == "python" or kind == "python_function":
-            result = engine._invoke_python_tool(metadata, args)
-            return {"ok": True, "result": engine._compact_tool_result(result)}
+            result = invoke_python_tool(metadata, args)
+            return {"ok": True, "result": compact_tool_result(result)}
         if source == "mcp" or kind == "mcp_tool":
             server = metadata.get("server") if isinstance(metadata.get("server"), dict) else {}
             tool_name = str(metadata.get("toolName") or tool_config.get("name") or "").strip()
-            result = engine.invoke_mcp_tool(server, tool_name, args, runtime_environment)
-            return {"ok": True, "result": engine._compact_tool_result(result)}
+            result = mcp_runtime.invoke_mcp_tool(server, tool_name, args, runtime_environment)
+            return {"ok": True, "result": compact_tool_result(result)}
         if source == "agent" or kind == "agent_tool":
             result = invoke_agent_tool(metadata, args, model_config, runtime_environment, agent_context)
-            return {"ok": bool(result.get("ok", True)), "result": engine._compact_tool_result(result), "errorType": result.get("errorType")}
+            return {"ok": bool(result.get("ok", True)), "result": compact_tool_result(result), "errorType": result.get("errorType")}
         if source in {"openapi", "http"} or kind == "openapi_operation":
             return {
                 "ok": True,
@@ -299,7 +307,7 @@ def invoke_registered_tool(
         }
     except Exception as exc:
         error = f"{exc.__class__.__name__}: {exc}"
-        return {"ok": False, "error": error, "errorType": engine._classify_tool_error(error)}
+        return {"ok": False, "error": error, "errorType": classify_tool_error(error)}
 
 
 def invoke_agent_tool(
@@ -311,8 +319,9 @@ def invoke_agent_tool(
 ) -> dict[str, Any]:
     context = agent_context or {}
     depth = int(context.get("agentDepth") or 0)
-    if depth >= engine.MAX_AGENT_CALL_DEPTH:
-        raise RuntimeError(f"子 Agent 调用深度超过限制：{engine.MAX_AGENT_CALL_DEPTH}")
+    max_depth = 3
+    if depth >= max_depth:
+        raise RuntimeError(f"子 Agent 调用深度超过限制：{max_depth}")
     current_project_id = str(context.get("projectId") or "").strip()
     project_id = str(metadata.get("projectId") or "").strip()
     if not project_id:
@@ -330,15 +339,10 @@ def invoke_agent_tool(
         "parent_state": compact_state(parent_state),
     }
     started = time.perf_counter()
-    child_project = engine.read_project(project_id)
-    trace, output_state = engine._walk_project(
-        child_project,
-        engine._normalize_input(child_input),
-        "live",
-        normalize_model_config(model_config),
-        engine._normalize_runtime_environment(runtime_environment),
-        depth + 1,
-    )
+    run_project = context.get("runProject")
+    if not callable(run_project):
+        raise RuntimeError("Agent Tool 缺少项目运行服务。")
+    child_project, trace, output_state = run_project(project_id, child_input, model_config, runtime_environment, depth + 1)
     error_item = next((item for item in trace if item.get("status") == "error"), None)
     final_answer = agent_child_final_answer(output_state)
     result = {
@@ -361,7 +365,212 @@ def agent_child_final_answer(output_state: dict[str, Any]) -> str:
         text = state_value_to_text(output_state.get(key)).strip()
         if text:
             return text
-    return engine._fallback_reply_content(output_state)
+    from app.runner.common import fallback_reply_content
+
+    return fallback_reply_content(output_state)
+
+
+TOOL_OBSERVATION_STRING_LIMIT = 12_000
+
+
+def compact_tool_result(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value if not isinstance(value, str) or len(value) <= TOOL_OBSERVATION_STRING_LIMIT else value[:TOOL_OBSERVATION_STRING_LIMIT] + "...[truncated]"
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return compact_value(value, string_limit=TOOL_OBSERVATION_STRING_LIMIT, list_limit=20)
+    except TypeError:
+        return str(value)
+
+
+def invoke_python_tool(metadata: dict[str, Any], args: dict[str, Any]) -> Any:
+    source_path = str(metadata.get("sourcePath") or "").strip()
+    function_name = str(metadata.get("function") or "").strip()
+    if not source_path or not function_name:
+        raise RuntimeError("Python Tool 缺少 sourcePath 或 function 元数据。")
+    path = Path(source_path).expanduser()
+    if not path.is_absolute():
+        path = ROOT_DIR / path
+    if not path.is_file():
+        raise RuntimeError(f"Python Tool 文件不存在：{path}")
+    module_name = f"graphic_tool_{abs(hash(path))}_{path.stem}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载 Python Tool 文件：{path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    function = getattr(module, function_name, None)
+    if function is None:
+        raise RuntimeError(f"Python Tool 函数不存在：{function_name}")
+    if hasattr(function, "invoke") and callable(function.invoke):
+        result = function.invoke(args)
+    elif callable(function):
+        result = function(**args)
+    else:
+        raise RuntimeError(f"Python Tool 不可调用：{function_name}")
+    if inspect.isawaitable(result):
+        result = run_awaitable(result)
+    return result
+
+
+def run_awaitable(value: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(value)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(value)
+    finally:
+        loop.close()
+
+
+def recommended_next_tools_for_observation(tool_name: str, args: dict[str, Any], observation: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(observation, dict):
+        return []
+    recommendations: list[dict[str, Any]] = []
+    result = observation.get("result") if isinstance(observation.get("result"), dict) else {}
+    path = first_text(args.get("path"), args.get("file"), result.get("path") if isinstance(result, dict) else "")
+    language = language_from_path(path)
+    truncated = has_truthy_key(result, "truncated") or bool(observation.get("truncated"))
+    ambiguous = has_truthy_key(result, "ambiguous")
+    tool_key = str(tool_name or "").strip()
+
+    if truncated:
+        if tool_key == "read_file" and path:
+            recommendations.extend(
+                [
+                    next_tool("read_file_chunk", "read_file 返回已截断，改用 offset 或行号继续读取。", {"path": path, "offset": content_length(result), "max_chars": 6000}),
+                    next_tool("search_code", "先用关键词定位需要的片段，避免再次读取整文件。", {"root": path_parent(path), "query": "<关键词>", "file_glob": path_name(path)}),
+                ]
+            )
+            if language in {"python", "javascript", "typescript", "html", "css", "scss", "less", "vue", "svelte", "json", "yaml", "markdown"}:
+                recommendations.append(next_tool("chunk_code_semantic", "按语义片段拆分大文件后再选择具体片段。", {"path": path, "max_chunks": 40}))
+        elif path:
+            recommendations.append(next_tool("read_file_chunk", "结果被截断，可缩小范围或按片段继续读取。", {"path": path, "max_chars": 6000}))
+
+    if path and language in {"html", "vue", "svelte"} and tool_key in {"read_file", "read_file_chunk", "list_code_symbols"}:
+        recommendations.extend(
+            [
+                next_tool("summarize_page_structure", "HTML 页面先摘要结构，再选择局部 selector。", {"path": path}),
+                next_tool("extract_html", "按 CSS selector 抽取局部 HTML，避免读取整页。", {"path": path, "selector": "body", "mode": "html"}),
+            ]
+        )
+    if path and language in {"css", "scss", "less"} and tool_key in {"read_file", "read_file_chunk", "list_code_symbols"}:
+        recommendations.append(next_tool("extract_css_rules", "样式文件优先按 selector、property 或 query 抽取规则。", {"path": path, "query": "<样式关键词>"}))
+
+    if ambiguous and path:
+        alternatives = result.get("alternatives") if isinstance(result.get("alternatives"), list) else []
+        first = next((item for item in alternatives if isinstance(item, dict)), None)
+        if first:
+            recommendations.append(
+                next_tool(
+                    "extract_code_symbol",
+                    "当前符号有歧义，使用 alternatives 中更明确的 name/kind 重新抽取。",
+                    {"path": path, "symbol": first.get("name", ""), "kind": first.get("kind", "any")},
+                )
+            )
+
+    if not observation.get("ok"):
+        error_type = str(observation.get("errorType") or classify_tool_error(str(observation.get("error") or "")))
+        if error_type == "tool_args":
+            recommendations.append(next_tool(tool_key or "<tool>", "检查必填参数和参数名后重试。", args))
+        elif error_type == "parse_error" and path:
+            recommendations.append(next_tool("read_file_chunk", "解析失败时先读取相关片段确认语法或内容格式。", {"path": path, "max_chars": 4000}))
+
+    return dedupe_recommendations(recommendations)
+
+
+def classify_tool_error(message: str) -> str:
+    text = str(message or "")
+    lower = text.lower()
+    if "mcp" in lower and ("json" in lower or "参数" in text or "arguments" in lower):
+        return "tool_args"
+    if "白名单" in text or "黑名单" in text or "审批" in text or "approval" in lower or "命令不在" in text:
+        return "permission"
+    if "允许目录" in text or "路径不在" in text:
+        return "path_permission"
+    if "网络访问" in text or "不允许访问域名" in text or "只允许访问 http/https" in text or "domain" in lower:
+        return "network_permission"
+    if "超过当前运行环境" in text or "文件太大" in text or "max file" in lower:
+        return "file_too_large"
+    if "解析失败" in text or "正则表达式无效" in text or "jsondecode" in lower or "syntaxerror" in lower or "parse" in lower:
+        return "parse_error"
+    if ("需要" in text and "参数" in text) or "missing" in lower or "required" in lower or "未知 Tool" in text:
+        return "tool_args"
+    return "tool_error"
+
+
+def next_tool(tool: str, reason: str, args: dict[str, Any]) -> dict[str, Any]:
+    return {"tool": tool, "reason": reason, "args": args}
+
+
+def dedupe_recommendations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        key = f"{item.get('tool')}:{json.dumps(item.get('args', {}), ensure_ascii=False, sort_keys=True, default=str)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+        if len(result) >= 5:
+            break
+    return result
+
+
+def has_truthy_key(value: Any, key: str) -> bool:
+    if isinstance(value, dict):
+        if bool(value.get(key)):
+            return True
+        return any(has_truthy_key(item, key) for item in value.values())
+    if isinstance(value, list):
+        return any(has_truthy_key(item, key) for item in value[:20])
+    return False
+
+
+def content_length(value: dict[str, Any]) -> int:
+    content = value.get("content")
+    return len(content) if isinstance(content, str) else 0
+
+
+def path_name(path: str) -> str:
+    return Path(path).name if path else "*"
+
+
+def path_parent(path: str) -> str:
+    if not path:
+        return "."
+    parent = Path(path).parent.as_posix()
+    return parent if parent and parent != "." else "."
+
+
+def language_from_path(path: str) -> str:
+    if not path:
+        return "unknown"
+    suffix = Path(path).suffix.lower().lstrip(".")
+    aliases = {
+        "py": "python",
+        "html": "html",
+        "htm": "html",
+        "js": "javascript",
+        "jsx": "javascript",
+        "ts": "typescript",
+        "tsx": "typescript",
+        "css": "css",
+        "scss": "scss",
+        "sass": "scss",
+        "less": "less",
+        "vue": "vue",
+        "svelte": "svelte",
+        "json": "json",
+        "jsonc": "json",
+        "yaml": "yaml",
+        "yml": "yaml",
+        "md": "markdown",
+        "markdown": "markdown",
+    }
+    return aliases.get(suffix, suffix or "unknown")
 
 
 def first_text(*values: Any) -> str:
@@ -409,4 +618,4 @@ def selected_tool_configs(config: dict[str, Any], tools: ToolRuntimeConfig) -> l
 
 
 def fresh_builtin_tool_config(tool: dict[str, Any]) -> dict[str, Any] | None:
-    return engine._fresh_builtin_tool_config(tool)
+    return _fresh_builtin_tool_config(tool)

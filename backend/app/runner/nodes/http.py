@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 from typing import Any
 
+import httpx
+
 from app.ir.schemas import NodeIR
 
-from .. import engine
-from ..common import positive_float, render_template, truthy
+from ..common import positive_float, render_mock_response, render_template, truthy
 from ..context import ExecutionContext
 
 
@@ -14,7 +15,7 @@ def execute_http_node(node: NodeIR, state: dict[str, Any]):
     config = node.config
     output_field = str(config.get("outputField", f"{node.id}_response"))
     if truthy(config.get("mockEnabled")) or str(config.get("mockResponseJson", "")).strip():
-        value = engine._render_mock_response(str(config.get("mockResponseJson", "")), state)
+        value = render_mock_response(str(config.get("mockResponseJson", "")), state)
         return {output_field: value}, f"使用 HTTP mock 响应写入 state.{output_field}"
 
     method = str(config.get("method", "GET")).upper()
@@ -29,7 +30,7 @@ def execute_http_node(node: NodeIR, state: dict[str, Any]):
             raise RuntimeError(f"HTTP 节点引用的环境变量 {auth_secret} 未设置。")
         headers["Authorization"] = f"Bearer {token}"
     body = str(config.get("body", ""))
-    response = engine.httpx.request(
+    response = httpx.request(
         method,
         url,
         headers=headers,

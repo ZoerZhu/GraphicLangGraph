@@ -23,11 +23,15 @@ class NodeExecutionResult:
 @dataclass
 class ExecutionServices:
     execute_node: Callable[..., tuple[dict[str, Any], str]] | None = None
+    execute_node_with_policy: Callable[[NodeIR, dict[str, Any], RunMode], tuple[dict[str, Any], str, dict[str, Any]]] | None = None
     execute_node_events: Callable[..., Iterator[dict[str, Any]]] | None = None
+    run_project: Callable[..., Any] | None = None
     next_execution_target: Callable[..., str | None] | None = None
     error_execution_target: Callable[..., str | None] | None = None
+    trace_meta_from_exception: Callable[[Exception], dict[str, Any]] | None = None
     compact_state: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     compact_value: Callable[[Any], Any] | None = None
+    max_steps: int = 80
 
 
 @dataclass

@@ -12,7 +12,16 @@ from app.code_intelligence import (
     glg_summarize_page_structure,
 )
 
-from .. import engine
+from ..common import positive_int, truthy
+from .runtime import (
+    detect_code_language,
+    is_binary_file,
+    is_relative_to,
+    read_text_limited,
+    resolve_runtime_path,
+    runtime_allowed_roots,
+    runtime_max_file_bytes,
+)
 
 
 def extract_html(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
@@ -22,18 +31,18 @@ def extract_html(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any
         raise RuntimeError("extract_html 需要 path 参数。")
     if not selector:
         raise RuntimeError("extract_html 需要 selector 参数。")
-    path = engine._resolve_runtime_path(raw_path, runtime)
+    path = resolve_runtime_path(raw_path, runtime)
     if not path.is_file():
         raise RuntimeError(f"不是可抽取 HTML 的文件：{path}")
-    if engine._is_binary_file(path):
+    if is_binary_file(path):
         raise RuntimeError(f"extract_html 只读取文本 HTML 文件，疑似二进制文件：{path}")
     encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
     mode = str(args.get("mode") or "html").strip().lower()
     if mode not in {"html", "text", "attributes"}:
         mode = "html"
-    max_results = min(engine._positive_int(args.get("max_results", args.get("limit")), 20), 100)
-    max_chars = min(engine._positive_int(args.get("max_chars"), 4000), engine._runtime_max_file_bytes(runtime))
-    text, source_truncated = engine._read_text_limited(path, runtime, encoding)
+    max_results = min(positive_int(args.get("max_results", args.get("limit")), 20), 100)
+    max_chars = min(positive_int(args.get("max_chars"), 4000), runtime_max_file_bytes(runtime))
+    text, source_truncated = read_text_limited(path, runtime, encoding)
     try:
         from bs4 import BeautifulSoup
     except ImportError as exc:
@@ -103,14 +112,14 @@ def extract_css_rules(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str
         raise RuntimeError("extract_css_rules 需要 path 参数。")
     if not selector and not property_name and not query:
         raise RuntimeError("extract_css_rules 需要 selector、property 或 query 至少一个参数。")
-    path = engine._resolve_runtime_path(raw_path, runtime)
+    path = resolve_runtime_path(raw_path, runtime)
     if not path.is_file():
         raise RuntimeError(f"不是可抽取 CSS 的文件：{path}")
-    if engine._is_binary_file(path):
+    if is_binary_file(path):
         raise RuntimeError(f"extract_css_rules 只读取文本 CSS 文件，疑似二进制文件：{path}")
     encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
-    max_results = min(engine._positive_int(args.get("max_results", args.get("limit")), 50), 200)
-    text, source_truncated = engine._read_text_limited(path, runtime, encoding)
+    max_results = min(positive_int(args.get("max_results", args.get("limit")), 50), 200)
+    text, source_truncated = read_text_limited(path, runtime, encoding)
     rules, parse_warnings = _parse_css_rules(text)
     matched: list[dict[str, Any]] = []
     total_matched = 0
@@ -150,23 +159,23 @@ def extract_html_by_text(args: dict[str, Any], runtime: dict[str, Any]) -> dict[
         raise RuntimeError("extract_html_by_text 需要 path 参数。")
     if not query:
         raise RuntimeError("extract_html_by_text 需要 query 参数。")
-    path = engine._resolve_runtime_path(raw_path, runtime)
+    path = resolve_runtime_path(raw_path, runtime)
     if not path.is_file():
         raise RuntimeError(f"不是可抽取 HTML 的文件：{path}")
-    if engine._is_binary_file(path):
+    if is_binary_file(path):
         raise RuntimeError(f"extract_html_by_text 只读取文本 HTML 文件，疑似二进制文件：{path}")
     encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
-    max_results = min(engine._positive_int(args.get("max_results", args.get("limit")), 20), 100)
-    max_chars = min(engine._positive_int(args.get("max_chars"), 4000), engine._runtime_max_file_bytes(runtime))
-    text, source_truncated = engine._read_text_limited(path, runtime, encoding)
+    max_results = min(positive_int(args.get("max_results", args.get("limit")), 20), 100)
+    max_chars = min(positive_int(args.get("max_chars"), 4000), runtime_max_file_bytes(runtime))
+    text, source_truncated = read_text_limited(path, runtime, encoding)
     result = glg_extract_html_by_text(
         text=text,
         query=query,
-        regex=engine._truthy(args.get("regex")),
+        regex=truthy(args.get("regex")),
         mode=str(args.get("mode") or "html"),
         max_results=max_results,
         max_chars=max_chars,
-        case_sensitive=engine._truthy(args.get("case_sensitive", args.get("caseSensitive"))),
+        case_sensitive=truthy(args.get("case_sensitive", args.get("caseSensitive"))),
     )
     warnings = list(result.get("warnings") or [])
     if source_truncated:
@@ -185,25 +194,25 @@ def extract_css_for_html(args: dict[str, Any], runtime: dict[str, Any]) -> dict[
         raise RuntimeError("extract_css_for_html 需要 path 参数。")
     if not selector:
         raise RuntimeError("extract_css_for_html 需要 selector 参数。")
-    path = engine._resolve_runtime_path(raw_path, runtime)
+    path = resolve_runtime_path(raw_path, runtime)
     if not path.is_file():
         raise RuntimeError(f"不是可抽取 CSS 的文件：{path}")
-    if engine._is_binary_file(path):
+    if is_binary_file(path):
         raise RuntimeError(f"extract_css_for_html 只读取文本 CSS 文件，疑似二进制文件：{path}")
     encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
-    max_results = min(engine._positive_int(args.get("max_results", args.get("limit")), 50), 200)
-    css_text, css_truncated = engine._read_text_limited(path, runtime, encoding)
+    max_results = min(positive_int(args.get("max_results", args.get("limit")), 50), 200)
+    css_text, css_truncated = read_text_limited(path, runtime, encoding)
     html_text = ""
     html_path_text = str(args.get("html_path") or args.get("htmlPath") or "").strip()
     html_path: Path | None = None
     html_truncated = False
     if html_path_text:
-        html_path = engine._resolve_runtime_path(html_path_text, runtime)
+        html_path = resolve_runtime_path(html_path_text, runtime)
         if not html_path.is_file():
             raise RuntimeError(f"不是可分析 HTML 的文件：{html_path}")
-        if engine._is_binary_file(html_path):
+        if is_binary_file(html_path):
             raise RuntimeError(f"extract_css_for_html 只读取文本 HTML 文件，疑似二进制文件：{html_path}")
-        html_text, html_truncated = engine._read_text_limited(html_path, runtime, encoding)
+        html_text, html_truncated = read_text_limited(html_path, runtime, encoding)
     result = glg_extract_css_for_html(css_text=css_text, selector=selector, html_text=html_text, max_results=max_results)
     warnings = list(result.get("warnings") or [])
     if css_truncated:
@@ -222,14 +231,14 @@ def summarize_page_structure(args: dict[str, Any], runtime: dict[str, Any]) -> d
     raw_path = str(args.get("path") or args.get("file") or "").strip()
     if not raw_path:
         raise RuntimeError("summarize_page_structure 需要 path 参数。")
-    path = engine._resolve_runtime_path(raw_path, runtime)
+    path = resolve_runtime_path(raw_path, runtime)
     if not path.is_file():
         raise RuntimeError(f"不是可分析 HTML 的文件：{path}")
-    if engine._is_binary_file(path):
+    if is_binary_file(path):
         raise RuntimeError(f"summarize_page_structure 只读取文本 HTML 文件，疑似二进制文件：{path}")
     encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
-    max_items = min(engine._positive_int(args.get("max_items", args.get("limit")), 50), 200)
-    text, source_truncated = engine._read_text_limited(path, runtime, encoding)
+    max_items = min(positive_int(args.get("max_items", args.get("limit")), 50), 200)
+    text, source_truncated = read_text_limited(path, runtime, encoding)
     result = glg_summarize_page_structure(text, max_items)
     warnings = list(result.get("warnings") or [])
     if source_truncated:
@@ -245,15 +254,15 @@ def resolve_asset_references(args: dict[str, Any], runtime: dict[str, Any]) -> d
     raw_path = str(args.get("path") or args.get("file") or "").strip()
     if not raw_path:
         raise RuntimeError("resolve_asset_references 需要 path 参数。")
-    path = engine._resolve_runtime_path(raw_path, runtime)
+    path = resolve_runtime_path(raw_path, runtime)
     if not path.is_file():
         raise RuntimeError(f"不是可扫描资源引用的文件：{path}")
-    if engine._is_binary_file(path):
+    if is_binary_file(path):
         raise RuntimeError(f"resolve_asset_references 只读取文本 HTML/CSS 文件，疑似二进制文件：{path}")
     encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
-    language = engine._detect_code_language(path, str(args.get("language") or ""))
-    max_results = min(engine._positive_int(args.get("max_results", args.get("limit")), 200), 500)
-    text, source_truncated = engine._read_text_limited(path, runtime, encoding)
+    language = detect_code_language(path, str(args.get("language") or ""))
+    max_results = min(positive_int(args.get("max_results", args.get("limit")), 200), 500)
+    text, source_truncated = read_text_limited(path, runtime, encoding)
     result = glg_asset_references(text, language, max_results)
     references = [_enrich_asset_reference(item, path, runtime) for item in result.get("references", []) if isinstance(item, dict)]
     warnings = list(result.get("warnings") or [])
@@ -357,7 +366,7 @@ def _enrich_asset_reference(reference: dict[str, Any], base_file: Path, runtime:
         item.update({"external": False, "allowed": False, "exists": False, "resolvedPath": ""})
         return item
     candidate = (base_file.parent / relative_part).resolve()
-    allowed = any(engine._is_relative_to(candidate, root) for root in engine._runtime_allowed_roots(runtime))
+    allowed = any(is_relative_to(candidate, root) for root in runtime_allowed_roots(runtime))
     item.update(
         {
             "external": False,

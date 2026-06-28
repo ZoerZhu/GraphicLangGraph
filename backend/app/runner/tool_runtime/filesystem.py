@@ -4,8 +4,20 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .. import engine
+from app.code_intelligence import glg_chunk_code_semantic, glg_extract_code_symbol, glg_semantic_symbols
+
 from ..common import non_negative_int, optional_positive_int, positive_int, truthy
+from .runtime import (
+    count_file_lines,
+    detect_code_language,
+    is_binary_file,
+    is_relative_to,
+    iter_search_files,
+    read_text_limited,
+    resolve_runtime_path,
+    runtime_max_file_bytes,
+    safe_relative_path,
+)
 
 
 def read_file(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
@@ -15,7 +27,7 @@ def read_file(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
     path = resolve_runtime_path(raw_path, runtime)
     if not path.is_file():
         raise RuntimeError(f"不是可读取文件：{path}")
-    max_bytes = min(positive_int(args.get("max_bytes", runtime.get("maxFileBytes")), engine._runtime_max_file_bytes(runtime)), engine._runtime_max_file_bytes(runtime))
+    max_bytes = min(positive_int(args.get("max_bytes", runtime.get("maxFileBytes")), runtime_max_file_bytes(runtime)), runtime_max_file_bytes(runtime))
     encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
     with path.open("rb") as handle:
         content = handle.read(max_bytes + 1)
@@ -51,7 +63,7 @@ def list_directory(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, A
             resolved = item.resolve()
         except OSError:
             continue
-        if not engine._is_relative_to(resolved, directory):
+        if not is_relative_to(resolved, directory):
             continue
         stat = resolved.stat()
         entries.append(
@@ -96,10 +108,10 @@ def read_file_chunk(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, 
     path = resolve_runtime_path(raw_path, runtime)
     if not path.is_file():
         raise RuntimeError(f"不是可读取文件：{path}")
-    if engine._is_binary_file(path):
+    if is_binary_file(path):
         raise RuntimeError(f"read_file_chunk 只读取文本文件，疑似二进制文件：{path}")
     encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
-    max_chars = min(positive_int(args.get("max_chars"), 4000), engine._runtime_max_file_bytes(runtime))
+    max_chars = min(positive_int(args.get("max_chars"), 4000), runtime_max_file_bytes(runtime))
     start_line = optional_positive_int(args.get("start_line", args.get("startLine")))
     end_line = optional_positive_int(args.get("end_line", args.get("endLine")))
 
@@ -108,7 +120,7 @@ def read_file_chunk(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, 
 
     offset = non_negative_int(args.get("offset"), 0)
     text, source_truncated = read_text_limited(path, runtime, encoding)
-    total_lines = engine._count_file_lines(path, encoding)
+    total_lines = count_file_lines(path, encoding)
     end = min(len(text), offset + max_chars)
     content = text[offset:end] if offset < len(text) else ""
     truncated = source_truncated or end < len(text)
@@ -196,10 +208,10 @@ def search_code(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]
     matches: list[dict[str, Any]] = []
     scanned_files = 0
     skipped_binary = 0
-    for file_path in engine._iter_search_files(root, file_glob):
+    for file_path in iter_search_files(root, file_glob):
         if len(matches) >= max_results:
             break
-        if engine._is_binary_file(file_path):
+        if is_binary_file(file_path):
             skipped_binary += 1
             continue
         scanned_files += 1
@@ -224,7 +236,7 @@ def search_code(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]
             matches.append(
                 {
                     "path": str(file_path),
-                    "relativePath": engine._safe_relative_path(file_path, root),
+                    "relativePath": safe_relative_path(file_path, root),
                     "line": index + 1,
                     "column": column,
                     "text": line,
@@ -254,13 +266,13 @@ def list_code_symbols(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str
     path = resolve_runtime_path(raw_path, runtime)
     if not path.is_file():
         raise RuntimeError(f"不是可分析文件：{path}")
-    if engine._is_binary_file(path):
+    if is_binary_file(path):
         return {"path": str(path), "language": "binary", "symbols": [], "warnings": ["疑似二进制文件，已跳过。"]}
     encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
     max_symbols = min(positive_int(args.get("max_symbols", args.get("limit")), 100), 500)
-    language = engine._detect_code_language(path, str(args.get("language") or ""))
+    language = detect_code_language(path, str(args.get("language") or ""))
     text, truncated = read_text_limited(path, runtime, encoding)
-    symbols, warnings = engine.glg_semantic_symbols(text, language, max_symbols)
+    symbols, warnings = glg_semantic_symbols(text, language, max_symbols)
     if truncated:
         warnings.append("文件内容超过当前运行环境单次读取大小，符号列表可能不完整。")
     return {
@@ -282,14 +294,14 @@ def extract_code_symbol(args: dict[str, Any], runtime: dict[str, Any]) -> dict[s
     path = resolve_runtime_path(raw_path, runtime)
     if not path.is_file():
         raise RuntimeError(f"不是可分析文件：{path}")
-    if engine._is_binary_file(path):
+    if is_binary_file(path):
         raise RuntimeError(f"extract_code_symbol 只读取文本代码文件，疑似二进制文件：{path}")
     encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
-    language = engine._detect_code_language(path, str(args.get("language") or ""))
-    max_chars = min(positive_int(args.get("max_chars"), 4000), engine._runtime_max_file_bytes(runtime))
+    language = detect_code_language(path, str(args.get("language") or ""))
+    max_chars = min(positive_int(args.get("max_chars"), 4000), runtime_max_file_bytes(runtime))
     include_context = truthy(args.get("include_context", args.get("includeContext")))
     text, source_truncated = read_text_limited(path, runtime, encoding)
-    result = engine.glg_extract_code_symbol(
+    result = glg_extract_code_symbol(
         text=text,
         language=language,
         symbol=symbol,
@@ -322,15 +334,15 @@ def chunk_code_semantic(args: dict[str, Any], runtime: dict[str, Any]) -> dict[s
     path = resolve_runtime_path(raw_path, runtime)
     if not path.is_file():
         raise RuntimeError(f"不是可分析文件：{path}")
-    if engine._is_binary_file(path):
+    if is_binary_file(path):
         raise RuntimeError(f"chunk_code_semantic 只读取文本代码文件，疑似二进制文件：{path}")
     encoding = str(args.get("encoding") or "utf-8").strip() or "utf-8"
-    language = engine._detect_code_language(path, str(args.get("language") or ""))
-    max_chars = min(positive_int(args.get("max_chars"), 4000), engine._runtime_max_file_bytes(runtime))
+    language = detect_code_language(path, str(args.get("language") or ""))
+    max_chars = min(positive_int(args.get("max_chars"), 4000), runtime_max_file_bytes(runtime))
     max_chunks = min(positive_int(args.get("max_chunks", args.get("limit")), 80), 500)
     include_content = truthy(args.get("include_content", args.get("includeContent")))
     text, source_truncated = read_text_limited(path, runtime, encoding)
-    result = engine.glg_chunk_code_semantic(
+    result = glg_chunk_code_semantic(
         text=text,
         language=language,
         max_chars=max_chars,
@@ -345,11 +357,3 @@ def chunk_code_semantic(args: dict[str, Any], runtime: dict[str, Any]) -> dict[s
     result["truncated"] = bool(result.get("truncated") or source_truncated)
     result["warnings"] = warnings
     return result
-
-
-def resolve_runtime_path(value: str, runtime: dict[str, Any]) -> Path:
-    return engine._resolve_runtime_path(value, runtime)
-
-
-def read_text_limited(path: Path, runtime: dict[str, Any], encoding: str = "utf-8") -> tuple[str, bool]:
-    return engine._read_text_limited(path, runtime, encoding)

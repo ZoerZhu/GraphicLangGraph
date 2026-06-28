@@ -4,8 +4,7 @@ from typing import Any
 
 from app.ir.schemas import NodeIR
 
-from .. import engine
-from ..common import json_object_list, json_string_list, positive_int, render_template
+from ..common import agent_state_prompt, json_object_list, json_string_list, positive_int, render_template
 from ..context import ExecutionContext
 from ..model_runtime import effective_model_config, resolve_node_model
 from ..tool_runtime.registry import run_tools_agent_session, selected_tool_configs
@@ -58,7 +57,7 @@ def execute_tool_node(
     provider, model = resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
     max_iterations = min(positive_int(config.get("maxIterations", 4), 4), 12)
     system_prompt = render_template(str(config.get("systemPrompt", "")), state).strip()
-    user_prompt = render_template(str(config.get("userPrompt") or engine._agent_state_prompt(state)), state)
+    user_prompt = render_template(str(config.get("userPrompt") or agent_state_prompt(state)), state)
     final_answer, calls = run_tools_agent_session(
         provider,
         model,

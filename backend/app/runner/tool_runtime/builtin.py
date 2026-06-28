@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from .. import engine
 from . import edit, filesystem, html_css, web
+from .runtime import normalize_runtime_environment, resolve_runtime_path, runtime_allowed_roots
 
 
 def invoke_builtin_tool(metadata: dict[str, Any], args: dict[str, Any], runtime_environment: dict[str, Any] | None) -> Any:
@@ -54,15 +54,3 @@ def invoke_builtin_tool(metadata: dict[str, Any], args: dict[str, Any], runtime_
     if builtin_id == "run_whitelisted_command":
         return edit.run_whitelisted_command(args, runtime)
     raise RuntimeError(f"未知内置 Tool：{builtin_id or '未配置 builtinId'}")
-
-
-def normalize_runtime_environment(runtime_environment: dict[str, Any] | None) -> dict[str, Any]:
-    return engine._normalize_runtime_environment(runtime_environment)
-
-
-def runtime_allowed_roots(runtime: dict[str, Any]):
-    return engine._runtime_allowed_roots(runtime)
-
-
-def resolve_runtime_path(value: str, runtime: dict[str, Any]):
-    return engine._resolve_runtime_path(value, runtime)

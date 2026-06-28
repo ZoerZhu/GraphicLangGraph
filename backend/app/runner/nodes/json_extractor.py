@@ -4,6 +4,7 @@ from typing import Any
 
 from app.ir.schemas import NodeIR
 
+from .. import model_runtime
 from ..common import render_template, state_value_to_text, truthy
 from ..context import ExecutionContext
 from ..data_runtime import (
@@ -15,7 +16,6 @@ from ..data_runtime import (
     sample_json_from_schema,
     validation_result,
 )
-from ..model_runtime import call_chat_model, effective_model_config, resolve_node_model
 
 
 def execute_live(node: NodeIR, state: dict[str, Any], ctx: ExecutionContext):
@@ -47,9 +47,9 @@ def execute_json_extractor(node: NodeIR, state: dict[str, Any], model_config: di
         source_text = render_template(input_text, {**state, **inputs})
     else:
         source_text = state_value_to_text(inputs.get("input") if "input" in inputs else state.get("messages", ""))
-    effective_config = effective_model_config(config, model_config)
-    provider, model = resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
-    response = call_chat_model(
+    effective_config = model_runtime.effective_model_config(config, model_config)
+    provider, model = model_runtime.resolve_node_model(config, model_config, "openai", "gpt-4.1-mini")
+    response = model_runtime.call_chat_model(
         provider,
         model,
         [

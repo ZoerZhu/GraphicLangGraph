@@ -3,9 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 from app.ir.schemas import NodeIR
+from app import mcp_runtime
 
-from .. import engine
+from ..common import render_json_object, truthy
 from ..context import ExecutionContext
+from ..mcp_selection import ensure_mcp_default_args, mcp_tool_selection_mode, mcp_tool_summary, select_default_mcp_tool, select_mcp_tool_with_model
+from ..resources import mcp_server_for_node
 
 
 def execute_live(node: NodeIR, state: dict[str, Any], ctx: ExecutionContext):
@@ -26,25 +29,25 @@ def execute_mcp_node(
 ):
     config = node.config
     output_field = str(config.get("outputField", "mcp_result")).strip() or "mcp_result"
-    server = engine._mcp_server_for_node(config, mcp_servers)
+    server = mcp_server_for_node(config, mcp_servers)
     if not server:
         raise RuntimeError("MCP Node 未绑定有效 MCP Server。")
     tool_name = str(config.get("toolName") or "").strip()
-    args = engine._render_json_object(str(config.get("toolArgsJson") or "{}"), state, "toolArgsJson")
+    args = render_json_object(str(config.get("toolArgsJson") or "{}"), state, "toolArgsJson")
     available_tools: list[dict[str, Any]] = []
     auto_selected = False
     selected_by_model = False
     selection_reason = ""
-    selection_mode = engine._mcp_tool_selection_mode(config, bool(tool_name))
+    selection_mode = mcp_tool_selection_mode(config, bool(tool_name))
     selected_tool: dict[str, Any] | None = None
     if not tool_name:
-        available_tools = engine.list_mcp_tools(server, runtime_environment)
+        available_tools = mcp_runtime.list_mcp_tools(server, runtime_environment)
         if selection_mode == "manual":
             candidates = ", ".join(str(tool.get("name") or "") for tool in available_tools if str(tool.get("name") or "").strip())
             raise RuntimeError(f"MCP Node 未选择 MCP Tool。可选工具：{candidates}" if candidates else "MCP Node 未选择 MCP Tool。")
         if selection_mode == "model":
             try:
-                selection = engine._select_mcp_tool_with_model(config, available_tools, args, state, model_config)
+                selection = select_mcp_tool_with_model(config, available_tools, args, state, model_config)
                 tool_name = str(selection.get("tool") or "").strip()
                 selected_tool = next((tool for tool in available_tools if str(tool.get("name") or "").strip() == tool_name), None)
                 selected_args = selection.get("args")
@@ -56,13 +59,13 @@ def execute_mcp_node(
                 selected_by_model = True
                 selection_reason = str(selection.get("reason") or "").strip()
             except Exception:
-                if not engine._truthy(config.get("fallbackToHeuristic")):
+                if not truthy(config.get("fallbackToHeuristic")):
                     raise
-                selected_tool = engine._select_default_mcp_tool(available_tools, args, state)
+                selected_tool = select_default_mcp_tool(available_tools, args, state)
                 tool_name = str(selected_tool.get("name") or "").strip()
                 selection_reason = "model_selection_failed_fallback_to_heuristic"
         else:
-            selected_tool = engine._select_default_mcp_tool(available_tools, args, state)
+            selected_tool = select_default_mcp_tool(available_tools, args, state)
             tool_name = str(selected_tool.get("name") or "").strip()
         tool_name = str(selected_tool.get("name") or "").strip()
         auto_selected = True
@@ -70,14 +73,14 @@ def execute_mcp_node(
         raise RuntimeError("MCP Node 未选择 MCP Tool，且无法自动选择。")
     if selected_tool is None and available_tools:
         selected_tool = next((tool for tool in available_tools if str(tool.get("name") or "") == tool_name), None)
-    args = engine._ensure_mcp_default_args(args, selected_tool, state)
-    result = engine.invoke_mcp_tool(server, tool_name, args, runtime_environment)
+    args = ensure_mcp_default_args(args, selected_tool, state)
+    result = mcp_runtime.invoke_mcp_tool(server, tool_name, args, runtime_environment)
     if isinstance(result, dict):
         result["autoSelectedTool"] = auto_selected
         result["selectionMode"] = selection_mode
         result["selectedByModel"] = selected_by_model
         result["selectionReason"] = selection_reason
         if available_tools:
-            result["availableTools"] = [engine._mcp_tool_summary(tool) for tool in available_tools]
+            result["availableTools"] = [mcp_tool_summary(tool) for tool in available_tools]
     server_name = str(result.get("serverName") or server.get("name") or "未命名 MCP")
     return {output_field: result}, f"真实调用 MCP「{server_name}」工具 {tool_name}，输出到 state.{output_field}"

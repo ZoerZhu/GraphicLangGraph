@@ -4,8 +4,7 @@ from typing import Any
 
 from app.ir.schemas import NodeIR
 
-from .. import engine
-from ..common import render_template, state_value_to_text
+from ..common import agent_state_prompt, render_template, state_value_to_text
 from ..context import ExecutionContext
 from ..tool_runtime.registry import invoke_agent_tool
 
@@ -19,7 +18,7 @@ def execute_live(node: NodeIR, state: dict[str, Any], ctx: ExecutionContext):
     if project_id == ctx.project.project.id:
         raise RuntimeError("禁止 Agent Ref 调用当前项目自身。")
     instruction = render_template(str(config.get("instruction") or ""), state).strip()
-    input_text = instruction or state_value_to_text(state.get("messages") or state.get("chat")) or engine._agent_state_prompt(state)
+    input_text = instruction or state_value_to_text(state.get("messages") or state.get("chat")) or agent_state_prompt(state)
     result = invoke_agent_tool(
         {
             "agentId": str(config.get("agentId") or project_id),
@@ -29,7 +28,13 @@ def execute_live(node: NodeIR, state: dict[str, Any], ctx: ExecutionContext):
         {"input": input_text, "statePatch": {}},
         ctx.model_config,
         ctx.runtime_environment,
-        {"projectId": ctx.project.project.id, "projectName": ctx.project.project.name, "state": state, "agentDepth": ctx.agent_depth},
+        {
+            "projectId": ctx.project.project.id,
+            "projectName": ctx.project.project.name,
+            "state": state,
+            "agentDepth": ctx.agent_depth,
+            "runProject": ctx.services.run_project if ctx.services else None,
+        },
     )
     detail = f"真实调用 Agent Ref「{result.get('agentName')}」({config.get('protocol', 'handoff')})，输出到 state.{output_field}"
     return {output_field: result}, detail

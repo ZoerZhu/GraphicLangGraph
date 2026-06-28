@@ -7,9 +7,25 @@ from typing import Any
 
 from app.ir.schemas import EdgeKind, NodeIR, NodeType
 
-from .. import engine
 from ..common import bool_config, compact_state, compact_value, error_execution_target, format_error, get_path, next_execution_target, positive_int, runtime_error_payload, target_for_handle
 from ..context import ExecutionContext
+
+
+class _ForEachItemError(RuntimeError):
+    def __init__(
+        self,
+        original: Exception,
+        item_state: dict[str, Any],
+        child_trace: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+        error_payload: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(str(original))
+        self.original = original
+        self.item_state = item_state
+        self.child_trace = child_trace
+        self.events = events
+        self.error_payload = error_payload
 
 
 def execute_live(node: NodeIR, state: dict[str, Any], ctx: ExecutionContext):
@@ -54,6 +70,22 @@ def _for_each_items(node: NodeIR, state: dict[str, Any]) -> tuple[str, str, str,
     return items_field, item_field, index_field, list(items)[:max_items]
 
 
+def _execute_child_with_policy(ctx: ExecutionContext, child: NodeIR, item_state: dict[str, Any], mode: str):
+    if not ctx.services or not ctx.services.execute_node_with_policy:
+        raise RuntimeError("ForEach 缺少子节点执行服务。")
+    return ctx.services.execute_node_with_policy(child, item_state, mode)  # type: ignore[arg-type]
+
+
+def _trace_meta_from_exception(ctx: ExecutionContext, exc: Exception) -> dict[str, Any]:
+    if ctx.services and ctx.services.trace_meta_from_exception:
+        return ctx.services.trace_meta_from_exception(exc)
+    return {}
+
+
+def _max_steps(ctx: ExecutionContext) -> int:
+    return int(ctx.services.max_steps) if ctx.services else 80
+
+
 def execute_for_each_node(node: NodeIR, state: dict[str, Any], ctx: ExecutionContext, mode: str):
     config = node.config
     nodes, outgoing, item_start, merge_node = _for_each_setup(node, ctx)
@@ -79,17 +111,10 @@ def execute_for_each_node(node: NodeIR, state: dict[str, Any], ctx: ExecutionCon
                         index_field,
                         item_start,
                         merge_node.id,
-                        ctx.project,
+                        ctx,
                         nodes,
                         outgoing,
                         mode,
-                        ctx.model_config,
-                        ctx.runtime_environment,
-                        ctx.skills,
-                        ctx.tools,
-                        ctx.mcp_servers,
-                        ctx.agents,
-                        ctx.agent_depth,
                     )
                 ] = (index, item)
             results: list[dict[str, Any]] = []
@@ -128,17 +153,10 @@ def execute_for_each_node(node: NodeIR, state: dict[str, Any], ctx: ExecutionCon
                     item_start,
                     merge_node.id,
                     item_state,
-                    ctx.project,
+                    ctx,
                     nodes,
                     outgoing,
                     mode,
-                    ctx.model_config,
-                    ctx.runtime_environment,
-                    ctx.skills,
-                    ctx.tools,
-                    ctx.mcp_servers,
-                    ctx.agents,
-                    ctx.agent_depth,
                 )
             except Exception as exc:
                 if item_failure_policy != "collect_errors":
@@ -189,6 +207,7 @@ def execute_for_each_node_events(node: NodeIR, state: dict[str, Any], ctx: Execu
         max_concurrency = min(positive_int(config.get("maxConcurrency"), 3), 12)
         futures = {}
         event_queue: Queue[dict[str, Any]] = Queue()
+        emitted_event_keys: set[tuple[Any, ...]] = set()
         with ThreadPoolExecutor(max_workers=min(max_concurrency, len(items))) as executor:
             for index, item in enumerate(items):
                 futures[
@@ -201,16 +220,9 @@ def execute_for_each_node_events(node: NodeIR, state: dict[str, Any], ctx: Execu
                         index_field,
                         item,
                         index,
-                        ctx.project,
+                        ctx,
                         nodes,
                         outgoing,
-                        ctx.model_config,
-                        ctx.runtime_environment,
-                        ctx.skills,
-                        ctx.tools,
-                        ctx.mcp_servers,
-                        ctx.agents,
-                        ctx.agent_depth,
                         node,
                         event_queue,
                     )
@@ -219,7 +231,9 @@ def execute_for_each_node_events(node: NodeIR, state: dict[str, Any], ctx: Execu
             pending = set(futures)
             while pending:
                 try:
-                    yield event_queue.get(timeout=0.05)
+                    queued_event = event_queue.get(timeout=0.05)
+                    emitted_event_keys.add(_for_each_event_identity(queued_event))
+                    yield queued_event
                 except Empty:
                     pass
                 for future in [item for item in pending if item.done()]:
@@ -229,19 +243,39 @@ def execute_for_each_node_events(node: NodeIR, state: dict[str, Any], ctx: Execu
                         result = future.result()
                     except Exception as exc:
                         if item_failure_policy != "collect_errors":
+                            if isinstance(exc, _ForEachItemError):
+                                for event in exc.events:
+                                    event_key = _for_each_event_identity(event)
+                                    if event_key not in emitted_event_keys:
+                                        emitted_event_keys.add(event_key)
+                                        yield event
                             raise
-                        item_state = dict(state)
-                        item_state[item_field] = item
-                        item_state[index_field] = index
-                        error_payload = runtime_error_payload(node, exc)
+                        if isinstance(exc, _ForEachItemError):
+                            original_exc = exc.original
+                            item_state = dict(exc.item_state)
+                            child_trace = list(exc.child_trace)
+                            events = list(exc.events)
+                            error_payload = dict(exc.error_payload) if isinstance(exc.error_payload, dict) else _collected_item_error_payload(node, original_exc, item_state, child_trace)
+                        else:
+                            original_exc = exc
+                            item_state = dict(state)
+                            item_state[item_field] = item
+                            item_state[index_field] = index
+                            child_trace = []
+                            events = []
+                            error_payload = runtime_error_payload(node, original_exc)
                         item_state["last_error"] = error_payload
                         item_state.setdefault("item_result", {"ok": False, "error": error_payload})
-                        result = {"index": index, "item": item, "itemState": item_state, "reachedMerge": True, "events": [], "childTrace": [], "error": error_payload}
+                        result = {"index": index, "item": item, "itemState": item_state, "reachedMerge": True, "events": events, "childTrace": child_trace, "error": error_payload}
                     results.append(result)
                     child_trace_items.extend(result.get("childTrace", []))
             while True:
                 try:
-                    yield event_queue.get_nowait()
+                    queued_event = event_queue.get_nowait()
+                    event_key = _for_each_event_identity(queued_event)
+                    if event_key not in emitted_event_keys:
+                        emitted_event_keys.add(event_key)
+                        yield queued_event
                 except Empty:
                     break
         if preserve_order:
@@ -265,16 +299,9 @@ def execute_for_each_node_events(node: NodeIR, state: dict[str, Any], ctx: Execu
                     item_start,
                     merge_node.id,
                     item_state,
-                    ctx.project,
+                    ctx,
                     nodes,
                     outgoing,
-                    ctx.model_config,
-                    ctx.runtime_environment,
-                    ctx.skills,
-                    ctx.tools,
-                    ctx.mcp_servers,
-                    ctx.agents,
-                    ctx.agent_depth,
                     node,
                     index,
                     item,
@@ -350,17 +377,10 @@ def run_for_each_item_job(
     index_field: str,
     item_start: str,
     merge_node_id: str,
-    project: Any,
+    ctx: ExecutionContext,
     nodes: dict[str, NodeIR],
     outgoing: dict[str, list],
     mode: str,
-    model_config: dict[str, Any] | None,
-    runtime_environment: dict[str, Any] | None,
-    skills: dict[str, dict[str, Any]],
-    tools: dict[str, dict[str, Any]],
-    mcp_servers: dict[str, dict[str, Any]],
-    agents: dict[str, dict[str, Any]],
-    agent_depth: int,
 ) -> dict[str, Any]:
     item_state = dict(base_state)
     item_state[item_field] = item
@@ -369,17 +389,10 @@ def run_for_each_item_job(
         item_start,
         merge_node_id,
         item_state,
-        project,
+        ctx,
         nodes,
         outgoing,
         mode,
-        model_config,
-        runtime_environment,
-        skills,
-        tools,
-        mcp_servers,
-        agents,
-        agent_depth,
     )
     return {"index": index, "item": item, "itemState": item_state, "reachedMerge": reached_merge}
 
@@ -392,16 +405,9 @@ def collect_for_each_item_events(
     index_field: str,
     item: Any,
     index: int,
-    project: Any,
+    ctx: ExecutionContext,
     nodes: dict[str, NodeIR],
     outgoing: dict[str, list],
-    model_config: dict[str, Any] | None,
-    runtime_environment: dict[str, Any] | None,
-    skills: dict[str, dict[str, Any]],
-    tools: dict[str, dict[str, Any]],
-    mcp_servers: dict[str, dict[str, Any]],
-    agents: dict[str, dict[str, Any]],
-    agent_depth: int,
     parent_node: NodeIR,
     event_queue: Queue[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -413,16 +419,9 @@ def collect_for_each_item_events(
         start_node_id,
         merge_node_id,
         item_state,
-        project,
+        ctx,
         nodes,
         outgoing,
-        model_config,
-        runtime_environment,
-        skills,
-        tools,
-        mcp_servers,
-        agents,
-        agent_depth,
         parent_node,
         index,
         item,
@@ -438,28 +437,55 @@ def collect_for_each_item_events(
         except StopIteration as stop:
             reached_merge = bool(stop.value)
             break
+        except Exception as exc:
+            error_payload = _collected_item_error_payload(parent_node, exc, item_state, child_trace)
+            raise _ForEachItemError(exc, item_state, child_trace, events, error_payload) from exc
     return {"index": index, "item": item, "itemState": item_state, "reachedMerge": reached_merge, "events": events, "childTrace": child_trace}
+
+
+def _collected_item_error_payload(parent_node: NodeIR, exc: Exception, item_state: dict[str, Any], child_trace: list[dict[str, Any]]) -> dict[str, Any]:
+    state_error = item_state.get("last_error")
+    if isinstance(state_error, dict):
+        return dict(state_error)
+    for trace_item in reversed(child_trace):
+        output_delta = trace_item.get("outputDelta") if isinstance(trace_item, dict) else None
+        if isinstance(output_delta, dict) and isinstance(output_delta.get("last_error"), dict):
+            return dict(output_delta["last_error"])
+    return runtime_error_payload(parent_node, exc)
+
+
+def _for_each_event_identity(event: dict[str, Any]) -> tuple[Any, ...]:
+    trace_item = event.get("traceItem")
+    if isinstance(trace_item, dict):
+        return (
+            event.get("event"),
+            trace_item.get("nodeId"),
+            trace_item.get("parentNodeId"),
+            trace_item.get("iterationIndex"),
+            trace_item.get("sourceNodeId"),
+        )
+    return (
+        event.get("event"),
+        event.get("nodeId"),
+        event.get("parentNodeId"),
+        event.get("iterationIndex"),
+        event.get("sourceNodeId"),
+    )
 
 
 def run_for_each_item_chain(
     start_node_id: str,
     merge_node_id: str,
     item_state: dict[str, Any],
-    project: Any,
+    ctx: ExecutionContext,
     nodes: dict[str, NodeIR],
     outgoing: dict[str, list],
     mode: str,
-    model_config: dict[str, Any] | None,
-    runtime_environment: dict[str, Any] | None,
-    skills: dict[str, dict[str, Any]],
-    tools: dict[str, dict[str, Any]],
-    mcp_servers: dict[str, dict[str, Any]],
-    agents: dict[str, dict[str, Any]],
-    agent_depth: int,
 ) -> bool:
     current = start_node_id
     visited = 0
-    while current and current in nodes and visited < engine.MAX_STEPS:
+    max_steps = _max_steps(ctx)
+    while current and current in nodes and visited < max_steps:
         if current == merge_node_id:
             return True
         visited += 1
@@ -467,7 +493,7 @@ def run_for_each_item_chain(
         if child.type in {NodeType.FOR_EACH, NodeType.MERGE}:
             raise RuntimeError(f"ForEach v1 不支持嵌套或提前执行 {child.type} 节点。")
         try:
-            delta, _detail, _trace_meta = engine._execute_node_with_policy(child, project, item_state, mode, model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+            delta, _detail, _trace_meta = _execute_child_with_policy(ctx, child, item_state, mode)
             item_state.update(delta)
         except Exception as exc:
             error_target = error_execution_target(child, outgoing)
@@ -479,8 +505,8 @@ def run_for_each_item_chain(
         if child.type == NodeType.DIRECT_REPLY:
             return False
         current = next_execution_target(child, nodes, outgoing, item_state)
-    if visited >= engine.MAX_STEPS:
-        raise RuntimeError(f"ForEach 子链路超过 {engine.MAX_STEPS} 步，可能存在循环。")
+    if visited >= max_steps:
+        raise RuntimeError(f"ForEach 子链路超过 {max_steps} 步，可能存在循环。")
     return False
 
 
@@ -488,16 +514,9 @@ def run_for_each_item_chain_events(
     start_node_id: str,
     merge_node_id: str,
     item_state: dict[str, Any],
-    project: Any,
+    ctx: ExecutionContext,
     nodes: dict[str, NodeIR],
     outgoing: dict[str, list],
-    model_config: dict[str, Any] | None,
-    runtime_environment: dict[str, Any] | None,
-    skills: dict[str, dict[str, Any]],
-    tools: dict[str, dict[str, Any]],
-    mcp_servers: dict[str, dict[str, Any]],
-    agents: dict[str, dict[str, Any]],
-    agent_depth: int,
     parent_node: NodeIR,
     iteration_index: int,
     iteration_item: Any,
@@ -505,7 +524,8 @@ def run_for_each_item_chain_events(
 ) -> bool:
     current = start_node_id
     visited = 0
-    while current and current in nodes and visited < engine.MAX_STEPS:
+    max_steps = _max_steps(ctx)
+    while current and current in nodes and visited < max_steps:
         if current == merge_node_id:
             return True
         visited += 1
@@ -531,16 +551,22 @@ def run_for_each_item_chain_events(
         handled_error_target: str | None = None
         trace_meta: dict[str, Any] = {}
         try:
-            delta, detail, trace_meta = engine._execute_node_with_policy(child, project, item_state, "live", model_config, runtime_environment, skills, tools, mcp_servers, agents, agent_depth)
+            delta, detail, trace_meta = _execute_child_with_policy(ctx, child, item_state, "live")
             item_state.update(delta)
             status = "ok"
         except Exception as exc:
             handled_error_target = error_execution_target(child, outgoing)
-            trace_meta = engine._trace_meta_from_exception(exc)
+            trace_meta = _trace_meta_from_exception(ctx, exc)
             delta = {"last_error": runtime_error_payload(child, exc)}
             item_state.update(delta)
             detail = f"{format_error(exc)}；已转入 error 分支。" if handled_error_target else format_error(exc)
-            status = "error"
+            status = "ok" if handled_error_target else "error"
+            if handled_error_target:
+                trace_meta["handledError"] = True
+                trace_meta["errorTarget"] = handled_error_target
+            elif str(parent_node.config.get("itemFailurePolicy") or "fail_fast").strip().lower() == "collect_errors":
+                trace_meta["nonFatal"] = True
+                trace_meta["handledByParent"] = "for_each_collect_errors"
         trace_item = {
             "nodeId": child.id,
             "type": str(child.type),
@@ -564,8 +590,8 @@ def run_for_each_item_chain_events(
         if child.type == NodeType.DIRECT_REPLY:
             return False
         current = handled_error_target or next_execution_target(child, nodes, outgoing, item_state)
-    if visited >= engine.MAX_STEPS:
-        raise RuntimeError(f"ForEach 子链路超过 {engine.MAX_STEPS} 步，可能存在循环。")
+    if visited >= max_steps:
+        raise RuntimeError(f"ForEach 子链路超过 {max_steps} 步，可能存在循环。")
     return False
 
 

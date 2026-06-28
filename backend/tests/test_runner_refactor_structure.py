@@ -69,3 +69,13 @@ def test_preview_facade_does_not_define_node_executors():
     assert "def _execute_live_" not in source
     assert "def _execute_dry_node" not in source
     assert "def _invoke_registered_tool" not in source
+
+
+def test_engine_facade_does_not_define_graph_walk_or_node_executors():
+    engine_path = Path(__file__).parents[1] / "app" / "runner" / "engine.py"
+    source = engine_path.read_text(encoding="utf-8")
+    assert "def _walk_project" not in source
+    assert "def walk_project" not in source
+    assert "def _resume_project" not in source
+    assert "def _execute_live_node" not in source
+    assert "def execute_live_node" not in source

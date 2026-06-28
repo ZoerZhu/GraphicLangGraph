@@ -5,9 +5,10 @@ from typing import Any
 
 from app.ir.schemas import NodeIR, ProjectIR
 
-from .. import engine
 from ..common import compact_state, render_template
 from ..context import ExecutionContext
+from ..graph_runtime import human_approval_actions
+from ..policy import HumanApprovalPause
 
 
 def execute_human_approval(node: NodeIR, project: ProjectIR, state: dict[str, Any]):
@@ -17,7 +18,7 @@ def execute_human_approval(node: NodeIR, project: ProjectIR, state: dict[str, An
     outgoing: dict[str, list] = {}
     for edge in project.edges:
         outgoing.setdefault(edge.source, []).append(edge)
-    available_actions = engine._human_approval_actions(node, outgoing)
+    available_actions = human_approval_actions(node, outgoing)
     fallback = str(config.get("fallback", "rejected") or "rejected").strip() or "rejected"
     provided_action = str(state.get(action_field) or "").strip()
     if provided_action:
@@ -42,7 +43,7 @@ def execute_human_approval(node: NodeIR, project: ProjectIR, state: dict[str, An
         "outputField": output_field,
         "state": compact_state(state),
     }
-    raise engine.HumanApprovalPause(node, state, approval)
+    raise HumanApprovalPause(node, state, approval)
 
 
 def execute_live(node: NodeIR, state: dict[str, Any], ctx: ExecutionContext):

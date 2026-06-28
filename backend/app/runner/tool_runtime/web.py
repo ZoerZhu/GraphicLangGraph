@@ -8,8 +8,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
-from .. import engine
 from ..common import compact_value, positive_int
+from .runtime import assert_network_allowed, host_allowed, runtime_max_http_bytes
 
 
 def web_search(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
@@ -185,7 +185,7 @@ def fetch_url(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
     if not url:
         raise RuntimeError("fetch_url 需要 url 参数。")
     assert_network_allowed(url, runtime)
-    max_bytes = engine._runtime_max_http_bytes(runtime)
+    max_bytes = runtime_max_http_bytes(runtime)
     response = httpx.get(url, timeout=15, follow_redirects=True)
     response.raise_for_status()
     body = response.content[: max_bytes + 1]
@@ -205,11 +205,3 @@ def fetch_url(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
         "truncated": truncated,
         "text": text,
     }
-
-
-def assert_network_allowed(url: str, runtime: dict[str, Any], extra_allowed_hosts: set[str] | None = None) -> None:
-    return engine._assert_network_allowed(url, runtime, extra_allowed_hosts)
-
-
-def host_allowed(host: str, allowed_hosts: set[str]) -> bool:
-    return engine._host_allowed(host, allowed_hosts)

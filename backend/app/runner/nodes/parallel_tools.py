@@ -7,7 +7,6 @@ from typing import Any
 
 from app.ir.schemas import NodeIR, NodeType
 
-from .. import engine
 from ..common import compact_state, compact_value, format_error, positive_int, render_template, state_value_to_text, truthy
 from ..context import ExecutionContext
 from ..model_runtime import effective_model_config, resolve_node_model
@@ -133,6 +132,7 @@ def _run_parallel_slot(ctx: ExecutionContext, plan: dict[str, Any], state: dict[
 def execute_parallel_tools_events(ctx: ExecutionContext, node: NodeIR, state: dict[str, Any]):
     plan = _parallel_tools_plan(ctx, node, state)
     slots = plan["slots"]
+    child_trace_items: list[dict[str, Any]] = []
     for slot in slots:
         if slot.get("nodeId"):
             yield {
@@ -154,12 +154,16 @@ def execute_parallel_tools_events(ctx: ExecutionContext, node: NodeIR, state: di
                 if 0 <= task_index < len(ordered):
                     ordered[task_index] = result
             if slot.get("nodeId"):
-                yield parallel_worker_end_event(slot, slot_result, state)
+                event = parallel_worker_end_event(slot, slot_result, state)
+                trace_item = event.get("traceItem")
+                if isinstance(trace_item, dict):
+                    child_trace_items.append(trace_item)
+                yield event
 
     results = [item for item in ordered if isinstance(item, dict)]
     if results and all(item.get("status") == "error" for item in results):
         raise RuntimeError("Parallel Tools 所有 Worker 均执行失败。")
-    return {plan["outputField"]: results}, f"Parallel Tools 并行执行 {len(slots)} 个 Worker 槽位，完成 {len(results)} 个任务，输出到 state.{plan['outputField']}"
+    return {plan["outputField"]: results}, f"Parallel Tools 并行执行 {len(slots)} 个 Worker 槽位，完成 {len(results)} 个任务，输出到 state.{plan['outputField']}", child_trace_items
 
 
 def run_parallel_tools_node(ctx: ExecutionContext, node: NodeIR, state: dict[str, Any], emit_worker_events: bool):
@@ -276,6 +280,10 @@ def parallel_worker_end_event(slot: dict[str, Any], slot_result: dict[str, Any],
     status = "error" if slot_result.get("status") == "error" else "ok"
     first_error = str((results[0] or {}).get("error") or "") if results else ""
     detail = first_error or f"完成 {len(results)} 个任务"
+    trace_meta: dict[str, Any] = {}
+    if status == "error":
+        trace_meta["nonFatal"] = True
+        trace_meta["handledByParent"] = "parallel_tools"
     return {
         "event": "node_end",
         "traceItem": {
@@ -287,6 +295,7 @@ def parallel_worker_end_event(slot: dict[str, Any], slot_result: dict[str, Any],
             "durationMs": float(slot_result.get("durationMs") or 0),
             "inputState": compact_state({"tasks": [item["task"] for item in slot.get("tasks", [])]}),
             "outputDelta": compact_state({"workerResults": results}),
+            **trace_meta,
         },
         "outputState": compact_state(state),
     }
