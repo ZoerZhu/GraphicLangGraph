@@ -1,10 +1,12 @@
-import json
+﻿import json
 import sys
 from types import SimpleNamespace
 from pathlib import Path
 
 from app.ir.schemas import EdgeIR, EdgeKind, ImportedAgentConfig, MCPServerConfig, NodeIR, NodeType, SkillConfig, StateField, ToolConfig, create_default_project
-from app.runner import preview
+from app.runner import engine, model_runtime, preview
+from app.runner.nodes import task_splitter as task_splitter_node
+from app.runner.tool_runtime import registry as tool_runtime_registry
 
 
 class FakeResponse:
@@ -23,7 +25,7 @@ def test_live_preview_runs_knowledge_qa_chain(monkeypatch, tmp_path: Path):
             return FakeResponse("退款政策")
         return FakeResponse("根据知识库，订单签收后 7 天内可以申请退款。")
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
 
     project = create_default_project("知识库问答")
     project.state.fields.extend(
@@ -100,7 +102,7 @@ def test_live_preview_uses_runtime_model_config(monkeypatch):
         seen["runtime_config"] = runtime_config
         return FakeResponse("使用运行配置生成的回答")
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
 
     project = create_default_project("模型配置运行测试")
     project.nodes.extend(
@@ -161,7 +163,7 @@ def test_live_preview_keeps_explicit_node_model(monkeypatch):
         seen["runtime_config"] = runtime_config
         return FakeResponse("使用节点模型生成的回答")
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
 
     project = create_default_project("节点模型优先测试")
     project.nodes.extend(
@@ -220,7 +222,7 @@ def test_live_preview_injects_selected_skills_into_agent_system_prompt(monkeypat
         seen["messages"] = messages
         return FakeResponse("已按 Skill 输出")
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
 
     project = create_default_project("Skill 注入测试")
     project.skills.append(
@@ -262,7 +264,7 @@ def test_live_preview_injects_skill_package_references(monkeypatch):
         seen["messages"] = messages
         return FakeResponse("已按 Skill 包输出")
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
 
     metadata = {
         "packageMetadata": {"version": "1.0.0", "category": "Frontend"},
@@ -356,7 +358,7 @@ def test_live_preview_mcp_node_calls_configured_tool(monkeypatch):
             "raw": {"items": [{"title": "Result"}]},
         }
 
-    monkeypatch.setattr(preview, "invoke_mcp_tool", fake_invoke)
+    monkeypatch.setattr(engine, "invoke_mcp_tool", fake_invoke)
 
     project = create_default_project("MCP Node 测试")
     project.mcpServers.append(
@@ -403,8 +405,8 @@ def test_live_preview_mcp_node_auto_selects_single_tool(monkeypatch):
         seen["args"] = args
         return {"ok": True, "serverId": server_config["id"], "serverName": server_config["name"], "tool": tool_name, "args": args, "content": "ok", "raw": {}}
 
-    monkeypatch.setattr(preview, "list_mcp_tools", fake_list_tools)
-    monkeypatch.setattr(preview, "invoke_mcp_tool", fake_invoke)
+    monkeypatch.setattr(engine, "list_mcp_tools", fake_list_tools)
+    monkeypatch.setattr(engine, "invoke_mcp_tool", fake_invoke)
 
     project = create_default_project("MCP Auto Single")
     project.mcpServers.append(MCPServerConfig(id="mcp_one", name="One MCP", transport="http", url="https://mcp.example.com/mcp"))
@@ -440,8 +442,8 @@ def test_live_preview_mcp_node_auto_selects_exa_search_and_query(monkeypatch):
         seen["args"] = args
         return {"ok": True, "serverId": server_config["id"], "serverName": server_config["name"], "tool": tool_name, "args": args, "content": "search ok", "raw": {}}
 
-    monkeypatch.setattr(preview, "list_mcp_tools", fake_list_tools)
-    monkeypatch.setattr(preview, "invoke_mcp_tool", fake_invoke)
+    monkeypatch.setattr(engine, "list_mcp_tools", fake_list_tools)
+    monkeypatch.setattr(engine, "invoke_mcp_tool", fake_invoke)
 
     project = create_default_project("MCP Auto Exa")
     project.mcpServers.append(MCPServerConfig(id="mcp_exa", name="Exa MCP", transport="http", url="https://mcp.exa.ai/mcp"))
@@ -482,9 +484,9 @@ def test_live_preview_mcp_node_model_selects_tool_and_args(monkeypatch):
         calls["invoke"].append({"tool": tool_name, "args": args})
         return {"ok": True, "serverId": server_config["id"], "serverName": server_config["name"], "tool": tool_name, "args": args, "content": "ok", "raw": {}}
 
-    monkeypatch.setattr(preview, "list_mcp_tools", fake_list_tools)
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
-    monkeypatch.setattr(preview, "invoke_mcp_tool", fake_invoke)
+    monkeypatch.setattr(engine, "list_mcp_tools", fake_list_tools)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "invoke_mcp_tool", fake_invoke)
 
     project = create_default_project("MCP Model Select")
     project.mcpServers.append(MCPServerConfig(id="mcp_exa", name="Exa MCP", transport="http", url="https://mcp.exa.ai/mcp"))
@@ -519,8 +521,8 @@ def test_live_preview_mcp_node_model_select_invalid_tool_errors(monkeypatch):
     def fake_list_tools(server_config, runtime_environment=None, require_enabled=True):
         return [{"name": "web_search_exa"}]
 
-    monkeypatch.setattr(preview, "list_mcp_tools", fake_list_tools)
-    monkeypatch.setattr(preview, "_call_chat_model", lambda *args, **kwargs: FakeResponse('{"tool":"missing_tool","args":{}}'))
+    monkeypatch.setattr(engine, "list_mcp_tools", fake_list_tools)
+    monkeypatch.setattr(engine, "_call_chat_model", lambda *args, **kwargs: FakeResponse('{"tool":"missing_tool","args":{}}'))
 
     project = create_default_project("MCP Model Invalid")
     project.mcpServers.append(MCPServerConfig(id="mcp_exa", name="Exa MCP", transport="http", url="https://mcp.exa.ai/mcp"))
@@ -544,7 +546,7 @@ def test_live_preview_mcp_node_auto_select_reports_ambiguous_tools(monkeypatch):
     def fake_list_tools(server_config, runtime_environment=None, require_enabled=True):
         return [{"name": "web_fetch_exa"}, {"name": "read_page"}]
 
-    monkeypatch.setattr(preview, "list_mcp_tools", fake_list_tools)
+    monkeypatch.setattr(engine, "list_mcp_tools", fake_list_tools)
 
     project = create_default_project("MCP Auto Ambiguous")
     project.mcpServers.append(MCPServerConfig(id="mcp_exa", name="Exa MCP", transport="http", url="https://mcp.exa.ai/mcp"))
@@ -607,9 +609,9 @@ def test_live_preview_agent_can_call_selected_mcp_tool(monkeypatch):
             )
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "Exa 查询完成"}, ensure_ascii=False))
 
-    monkeypatch.setattr(preview, "list_mcp_tools", fake_list_tools)
-    monkeypatch.setattr(preview, "invoke_mcp_tool", fake_invoke)
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "list_mcp_tools", fake_list_tools)
+    monkeypatch.setattr(engine, "invoke_mcp_tool", fake_invoke)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
 
     project = create_default_project("Agent MCP 测试")
     project.mcpServers.append(
@@ -673,8 +675,8 @@ def test_live_preview_agent_can_call_imported_agent_as_tool(monkeypatch):
             )
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "子 Agent 已处理"}, ensure_ascii=False))
 
-    monkeypatch.setattr(preview, "read_project", fake_read_project)
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "read_project", fake_read_project)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
 
     project = create_default_project("Parent Agent")
     imported = ImportedAgentConfig(id="agent_ref_child", name="Child Agent", projectId="child_agent", role="sub_agent")
@@ -717,7 +719,7 @@ def test_live_preview_agent_ref_executes_bound_project(monkeypatch):
     )
     child_project.edges.append(EdgeIR(id="child_e1", source="start", target="reply"))
 
-    monkeypatch.setattr(preview, "read_project", lambda project_id: child_project)
+    monkeypatch.setattr(engine, "read_project", lambda project_id: child_project)
 
     project = create_default_project("Parent Ref")
     project.nodes.append(
@@ -795,7 +797,7 @@ def echo(query: str, suffix: str = "") -> str:
             )
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "工具调用完成"}))
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
 
     project = create_default_project("Tools Agent 测试")
     project.state.fields.extend(
@@ -873,7 +875,7 @@ def test_tools_agent_task_plan_tool_outputs_splitter_tasks(monkeypatch):
             )
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "任务计划已生成"}, ensure_ascii=False))
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
 
     project = create_default_project("Task Plan Tool")
     project.state.fields.extend(
@@ -1038,7 +1040,7 @@ def test_json_extractor_valid_branch_feeds_task_splitter(monkeypatch):
     def fake_call_chat_model(provider, model, messages, runtime_config=None):
         return FakeResponse(json.dumps({"tasks": [{"title": "分析入口", "goal": "阅读入口文件"}]}, ensure_ascii=False))
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
 
     project = create_default_project("Extractor Tasks")
     project.state.fields.extend(
@@ -1220,7 +1222,7 @@ def test_json_validator_repair_success_overwrites_output(monkeypatch):
         calls.append(messages)
         return FakeResponse(json.dumps({"tasks": [{"goal": "修复后的任务"}]}, ensure_ascii=False))
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
 
     project = create_default_project("Validator Repair")
     project.nodes.append(
@@ -1253,7 +1255,7 @@ def test_json_extractor_non_json_repair_failure_routes_invalid(monkeypatch):
     def fake_call_chat_model(provider, model, messages, runtime_config=None):
         return FakeResponse("still not json")
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
 
     project = create_default_project("Extractor Repair Failure")
     project.nodes.extend(
@@ -1551,7 +1553,7 @@ def test_runtime_policy_retries_node_until_success(monkeypatch):
             raise RuntimeError("temporary failure")
         return FakeHttpResponse()
 
-    monkeypatch.setattr(preview.httpx, "request", fake_request)
+    monkeypatch.setattr(engine.httpx, "request", fake_request)
 
     trace, state = preview.run_project_preview(project, {"messages": "run"}, "live")
 
@@ -1592,7 +1594,7 @@ def test_runtime_policy_timeout_fallback_continues(monkeypatch):
         time.sleep(0.05)
         raise RuntimeError("should be ignored")
 
-    monkeypatch.setattr(preview.httpx, "request", fake_request)
+    monkeypatch.setattr(engine.httpx, "request", fake_request)
 
     trace, state = preview.run_project_preview(project, {"messages": "run"}, "live")
 
@@ -1702,8 +1704,12 @@ def test_parallel_for_each_stream_preserves_child_trace():
     events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ["a", "b"]}, "live"))
     run_end = next(event for event in events if event.get("event") == "run_end")
     child_trace = [item for item in run_end["trace"] if item["nodeId"] == "template"]
+    merge_trace = [item for item in run_end["trace"] if item["nodeId"] == "merge"]
 
     assert sorted(item["iterationIndex"] for item in child_trace) == [0, 1]
+    assert len(merge_trace) == 1
+    assert merge_trace[0]["type"] == "merge"
+    assert merge_trace[0]["outputDelta"]["merged_results"] == ["a", "b"]
     assert run_end["outputState"]["merged_results"] == ["a", "b"]
     assert any(item["nodeId"] == "each" and item.get("parallel") is True for item in run_end["trace"])
 
@@ -1766,7 +1772,7 @@ def test_stream_for_each_parent_timeout_fallback_continues(monkeypatch):
         time.sleep(0.05)
         return FakeHttpResponse()
 
-    monkeypatch.setattr(preview.httpx, "request", fake_request)
+    monkeypatch.setattr(engine.httpx, "request", fake_request)
 
     events = list(preview.iter_project_preview_events(project, {"messages": "run", "items": ["a"]}, "live"))
     run_end = next(event for event in events if event.get("event") == "run_end")
@@ -1841,16 +1847,16 @@ def test_builtin_read_file_respects_runtime_allowed_roots(tmp_path: Path):
         "maxHttpBytes": 1024,
     }
 
-    ok = preview._invoke_registered_tool(tool_config, {"path": str(inside)}, runtime)
-    relative_ok = preview._invoke_registered_tool(tool_config, {"path": "note.txt"}, runtime)
-    blocked = preview._invoke_registered_tool(tool_config, {"path": str(outside)}, runtime)
+    ok = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": str(inside)}, runtime)
+    relative_ok = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "note.txt"}, runtime)
+    blocked = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": str(outside)}, runtime)
     list_config = {
         "id": "builtin_list_directory",
         "name": "list_directory",
         "source": "builtin",
         "schemaJson": json.dumps({"type": "object", "x-graphic": {"kind": "builtin_tool", "builtinId": "list_directory"}}),
     }
-    listed = preview._invoke_registered_tool(list_config, {"path": "."}, runtime)
+    listed = tool_runtime_registry.invoke_registered_tool(list_config, {"path": "."}, runtime)
 
     assert ok["ok"] is True
     assert ok["result"]["content"] == "允许读取"
@@ -1876,7 +1882,7 @@ def test_tools_agent_can_call_builtin_read_file(monkeypatch, tmp_path: Path):
             return FakeResponse(json.dumps({"tool_calls": [{"tool": "read_file", "args": {"path": str(target)}}], "final_answer": ""}))
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "读取完成"}))
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
     project = create_default_project("内置工具测试")
     project.state.fields.extend(
         [
@@ -1911,6 +1917,129 @@ def test_tools_agent_can_call_builtin_read_file(monkeypatch, tmp_path: Path):
     assert state["tools_result_tool_calls"][0]["observation"]["result"]["content"] == "FAQ 内容"
 
 
+def test_agent_can_call_selected_builtin_tool(monkeypatch, tmp_path: Path):
+    docs = tmp_path / "repo"
+    docs.mkdir()
+    target = docs / "README.md"
+    target.write_text("项目验收说明", encoding="utf-8")
+    seen_messages = []
+
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        seen_messages.append(messages)
+        if len(seen_messages) == 1:
+            return FakeResponse(json.dumps({"tool_calls": [{"tool": "read_file", "args": {"path": "README.md"}}], "final_answer": ""}, ensure_ascii=False))
+        return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "已读取项目验收说明"}, ensure_ascii=False))
+
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
+    project = create_default_project("Agent 本地工具")
+    project.state.fields.extend(
+        [
+            StateField(name="agent_result", type="str"),
+            StateField(name="agent_result_tool_calls", type="list"),
+            StateField(name="agent_result_mcp_tool_calls", type="list"),
+            StateField(name="agent_result_agent_tool_calls", type="list"),
+        ]
+    )
+    schema = {"type": "object", "x-graphic": {"kind": "builtin_tool", "builtinId": "read_file"}}
+    project.tools.append(ToolConfig(id="builtin_read_file", name="read_file", description="读取文件", source="builtin", schemaJson=json.dumps(schema)))
+    project.nodes.append(
+        NodeIR(
+            id="agent",
+            type=NodeType.AGENT,
+            label="Agent",
+            config={"toolIdsJson": '["builtin_read_file"]', "outputField": "agent_result", "maxIterations": 2},
+        )
+    )
+    project.edges.append(EdgeIR(id="e1", source="start", target="agent"))
+    runtime = {
+        "allowedRootsJson": json.dumps([str(docs)]),
+        "networkEnabled": True,
+        "allowedHostsJson": "[]",
+        "maxFileBytes": 1024,
+        "maxHttpBytes": 1024,
+    }
+
+    trace, state = preview.run_project_preview(project, {"messages": "读取说明"}, "live", None, runtime)
+
+    assert trace[0]["status"] == "ok"
+    assert state["agent_result"] == "已读取项目验收说明"
+    assert state["agent_result_tool_calls"][0]["tool"] == "read_file"
+    assert state["agent_result_tool_calls"][0]["observation"]["result"]["content"] == "项目验收说明"
+    assert state["agent_result_mcp_tool_calls"] == []
+    assert state["agent_result_agent_tool_calls"] == []
+    assert "可用工具" in seen_messages[0][0][1]
+
+
+def test_for_each_agent_worker_calls_builtin_tool_and_merges(monkeypatch, tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "README.md"
+    target.write_text("真实 Worker 证据", encoding="utf-8")
+    seen_messages = []
+
+    def fake_call_chat_model(provider, model, messages, runtime_config=None):
+        seen_messages.append(messages)
+        if len(seen_messages) % 2 == 1:
+            return FakeResponse(json.dumps({"tool_calls": [{"tool": "read_file", "args": {"path": "README.md"}}], "final_answer": ""}, ensure_ascii=False))
+        return FakeResponse(json.dumps({"tool_calls": [], "final_answer": f"任务 {len(seen_messages) // 2} 已真实检查"}, ensure_ascii=False))
+
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
+    project = create_default_project("ForEach Agent Worker")
+    project.state.fields.extend(
+        [
+            StateField(name="items", type="list"),
+            StateField(name="item_result", type="str"),
+            StateField(name="merged_results", type="list"),
+            StateField(name="merge_result", type="dict"),
+            StateField(name="final_answer", type="str"),
+        ]
+    )
+    schema = {"type": "object", "x-graphic": {"kind": "builtin_tool", "builtinId": "read_file"}}
+    project.tools.append(ToolConfig(id="builtin_read_file", name="read_file", description="读取文件", source="builtin", schemaJson=json.dumps(schema)))
+    project.nodes.extend(
+        [
+            NodeIR(id="each", type=NodeType.FOR_EACH, label="ForEach", config={"itemsField": "items", "itemField": "current_item", "indexField": "current_index"}),
+            NodeIR(
+                id="worker",
+                type=NodeType.AGENT,
+                label="Worker",
+                config={
+                    "systemPrompt": "你是真实 Worker，必须调用工具。",
+                    "userPrompt": "任务：{{ state.current_item.goal }}",
+                    "toolIdsJson": '["builtin_read_file"]',
+                    "outputField": "item_result",
+                    "maxIterations": 2,
+                },
+            ),
+            NodeIR(id="merge", type=NodeType.MERGE, label="Merge", config={"reducersJson": json.dumps([{"target": "merged_results", "source": "item_result", "reducer": "append"}]), "resultField": "merge_result"}),
+            NodeIR(id="reply", type=NodeType.DIRECT_REPLY, label="Reply", config={"template": "{{ state.merged_results }}", "outputField": "final_answer"}),
+        ]
+    )
+    project.edges.extend(
+        [
+            EdgeIR(id="e1", source="start", target="each"),
+            EdgeIR(id="e2", source="each", target="worker", sourceHandle="item"),
+            EdgeIR(id="e3", source="worker", target="merge"),
+            EdgeIR(id="e4", source="merge", target="reply"),
+        ]
+    )
+    runtime = {
+        "allowedRootsJson": json.dumps([str(repo)]),
+        "networkEnabled": True,
+        "allowedHostsJson": "[]",
+        "maxFileBytes": 1024,
+        "maxHttpBytes": 1024,
+    }
+
+    events = list(preview.iter_project_preview_events(project, {"messages": "验收", "items": [{"goal": "检查 A"}, {"goal": "检查 B"}]}, "live", None, runtime))
+    run_end = next(event for event in events if event.get("event") == "run_end")
+    worker_trace = [item for item in run_end["trace"] if item["nodeId"] == "worker"]
+
+    assert sorted(item["iterationIndex"] for item in worker_trace) == [0, 1]
+    assert run_end["outputState"]["merged_results"] == ["任务 1 已真实检查", "任务 2 已真实检查"]
+    assert all(item["outputDelta"]["item_result_tool_calls"][0]["tool"] == "read_file" for item in worker_trace)
+
+
 def test_tools_agent_summarizes_after_last_tool_iteration(monkeypatch, tmp_path: Path):
     docs = tmp_path / "docs"
     docs.mkdir()
@@ -1925,7 +2054,7 @@ def test_tools_agent_summarizes_after_last_tool_iteration(monkeypatch, tmp_path:
         assert "HTML 样式内容" in json.dumps(messages, ensure_ascii=False)
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "已读取 HTML 样式内容"}))
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
     project = create_default_project("最终总结测试")
     project.state.fields.extend([StateField(name="tools_result", type="str"), StateField(name="tools_result_tool_calls", type="list")])
     schema = {"type": "object", "x-graphic": {"kind": "builtin_tool", "builtinId": "read_file"}}
@@ -1987,9 +2116,9 @@ def test_builtin_read_file_chunk_supports_lines_offsets_and_allowed_roots(tmp_pa
         "maxHttpBytes": 1024,
     }
 
-    by_line = preview._invoke_registered_tool(tool_config, {"path": "app.py", "start_line": 2, "end_line": 3}, runtime)
-    by_offset = preview._invoke_registered_tool(tool_config, {"path": "app.py", "offset": 0, "max_chars": 5}, runtime)
-    blocked = preview._invoke_registered_tool(tool_config, {"path": str(outside), "start_line": 1}, runtime)
+    by_line = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "app.py", "start_line": 2, "end_line": 3}, runtime)
+    by_offset = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "app.py", "offset": 0, "max_chars": 5}, runtime)
+    blocked = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": str(outside), "start_line": 1}, runtime)
 
     assert by_line["ok"] is True
     assert by_line["result"]["content"] == "line2 target\nline3\n"
@@ -2028,7 +2157,7 @@ def test_builtin_search_code_supports_text_regex_glob_context_and_skips_binary(t
         "maxHttpBytes": 1024,
     }
 
-    result = preview._invoke_registered_tool(
+    result = tool_runtime_registry.invoke_registered_tool(
         tool_config,
         {"root": ".", "query": r"needle", "regex": True, "file_glob": "*", "context_lines": 1},
         runtime,
@@ -2070,10 +2199,10 @@ def test_builtin_list_code_symbols_supports_python_html_js_css(tmp_path: Path):
         "maxHttpBytes": 1024,
     }
 
-    py_symbols = preview._invoke_registered_tool(tool_config, {"path": "module.py"}, runtime)
-    html_symbols = preview._invoke_registered_tool(tool_config, {"path": "index.html"}, runtime)
-    js_symbols = preview._invoke_registered_tool(tool_config, {"path": "app.tsx"}, runtime)
-    css_symbols = preview._invoke_registered_tool(tool_config, {"path": "style.css"}, runtime)
+    py_symbols = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "module.py"}, runtime)
+    html_symbols = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "index.html"}, runtime)
+    js_symbols = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "app.tsx"}, runtime)
+    css_symbols = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "style.css"}, runtime)
 
     assert py_symbols["ok"] is True
     assert {item["name"] for item in py_symbols["result"]["symbols"]} == {"Service", "Service.run", "helper"}
@@ -2098,7 +2227,7 @@ def test_tools_agent_can_search_then_read_file_chunk(monkeypatch, tmp_path: Path
             return FakeResponse(json.dumps({"tool_calls": [{"tool": "read_file_chunk", "args": {"path": "app.py", "start_line": 1, "end_line": 2}}], "final_answer": ""}))
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "target 返回 ok"}))
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
     project = create_default_project("代码读取 Agent")
     project.state.fields.extend([StateField(name="tools_result", type="str"), StateField(name="tools_result_tool_calls", type="list")])
     for builtin_id, name in [("search_code", "search_code"), ("read_file_chunk", "read_file_chunk")]:
@@ -2162,14 +2291,14 @@ def test_builtin_extract_html_supports_selectors_modes_and_errors(tmp_path: Path
         "maxHttpBytes": 1024,
     }
 
-    html_result = preview._invoke_registered_tool(tool_config, {"path": "index.html", "selector": "main .card", "mode": "html", "max_results": 1}, runtime)
-    text_result = preview._invoke_registered_tool(tool_config, {"path": "index.html", "selector": "#app .hero", "mode": "text"}, runtime)
-    attrs_result = preview._invoke_registered_tool(tool_config, {"path": "index.html", "selector": "section.secondary", "mode": "attributes"}, runtime)
-    empty_result = preview._invoke_registered_tool(tool_config, {"path": "index.html", "selector": ".missing"}, runtime)
-    empty_selector = preview._invoke_registered_tool(tool_config, {"path": "index.html", "selector": ""}, runtime)
-    outside_result = preview._invoke_registered_tool(tool_config, {"path": str(outside), "selector": "main"}, runtime)
-    binary_result = preview._invoke_registered_tool(tool_config, {"path": "image.bin", "selector": "html"}, runtime)
-    truncated_result = preview._invoke_registered_tool(tool_config, {"path": "index.html", "selector": "section", "max_results": 1, "max_chars": 10}, runtime)
+    html_result = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "index.html", "selector": "main .card", "mode": "html", "max_results": 1}, runtime)
+    text_result = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "index.html", "selector": "#app .hero", "mode": "text"}, runtime)
+    attrs_result = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "index.html", "selector": "section.secondary", "mode": "attributes"}, runtime)
+    empty_result = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "index.html", "selector": ".missing"}, runtime)
+    empty_selector = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "index.html", "selector": ""}, runtime)
+    outside_result = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": str(outside), "selector": "main"}, runtime)
+    binary_result = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "image.bin", "selector": "html"}, runtime)
+    truncated_result = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "index.html", "selector": "section", "max_results": 1, "max_chars": 10}, runtime)
 
     assert html_result["ok"] is True
     assert html_result["result"]["count"] == 1
@@ -2224,13 +2353,13 @@ def test_builtin_extract_css_rules_supports_selector_property_query_and_errors(t
         "maxHttpBytes": 1024,
     }
 
-    by_selector = preview._invoke_registered_tool(tool_config, {"path": "style.css", "selector": ".panel"}, runtime)
-    by_property = preview._invoke_registered_tool(tool_config, {"path": "style.css", "property": "margin"}, runtime)
-    by_query = preview._invoke_registered_tool(tool_config, {"path": "style.css", "query": "display: grid"}, runtime)
-    truncated = preview._invoke_registered_tool(tool_config, {"path": "style.css", "property": "color", "max_results": 1}, runtime)
-    missing_filter = preview._invoke_registered_tool(tool_config, {"path": "style.css"}, runtime)
-    outside_result = preview._invoke_registered_tool(tool_config, {"path": str(outside), "selector": ".x"}, runtime)
-    binary_result = preview._invoke_registered_tool(tool_config, {"path": "style.bin", "selector": ".card"}, runtime)
+    by_selector = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "style.css", "selector": ".panel"}, runtime)
+    by_property = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "style.css", "property": "margin"}, runtime)
+    by_query = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "style.css", "query": "display: grid"}, runtime)
+    truncated = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "style.css", "property": "color", "max_results": 1}, runtime)
+    missing_filter = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "style.css"}, runtime)
+    outside_result = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": str(outside), "selector": ".x"}, runtime)
+    binary_result = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "style.bin", "selector": ".card"}, runtime)
 
     assert by_selector["ok"] is True
     rule = by_selector["result"]["rules"][0]
@@ -2264,7 +2393,7 @@ def test_tools_agent_can_extract_html_then_css_rules(monkeypatch, tmp_path: Path
             return FakeResponse(json.dumps({"tool_calls": [{"tool": "extract_css_rules", "args": {"path": "style.css", "selector": ".hero"}}], "final_answer": ""}))
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "hero 使用 grid 布局"}))
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
     project = create_default_project("HTML CSS Agent")
     project.state.fields.extend([StateField(name="tools_result", type="str"), StateField(name="tools_result_tool_calls", type="list")])
     for builtin_id, name in [("extract_html", "extract_html"), ("extract_css_rules", "extract_css_rules")]:
@@ -2375,12 +2504,12 @@ main > section.primary {
         "schemaJson": json.dumps({"type": "object", "x-graphic": {"kind": "builtin_tool", "builtinId": "resolve_asset_references"}}),
     }
 
-    text_result = preview._invoke_registered_tool(html_by_text_tool, {"path": "index.html", "query": "Welcome Home", "mode": "text"}, runtime)
-    regex_result = preview._invoke_registered_tool(html_by_text_tool, {"path": "index.html", "query": "Welcome\\s+Home", "regex": True, "mode": "attributes"}, runtime)
-    css_result = preview._invoke_registered_tool(css_for_html_tool, {"path": "style.css", "html_path": "index.html", "selector": "#hero"}, runtime)
-    structure_result = preview._invoke_registered_tool(structure_tool, {"path": "index.html"}, runtime)
-    html_assets = preview._invoke_registered_tool(assets_tool, {"path": "index.html"}, runtime)
-    css_assets = preview._invoke_registered_tool(assets_tool, {"path": "style.css", "language": "css"}, runtime)
+    text_result = tool_runtime_registry.invoke_registered_tool(html_by_text_tool, {"path": "index.html", "query": "Welcome Home", "mode": "text"}, runtime)
+    regex_result = tool_runtime_registry.invoke_registered_tool(html_by_text_tool, {"path": "index.html", "query": "Welcome\\s+Home", "regex": True, "mode": "attributes"}, runtime)
+    css_result = tool_runtime_registry.invoke_registered_tool(css_for_html_tool, {"path": "style.css", "html_path": "index.html", "selector": "#hero"}, runtime)
+    structure_result = tool_runtime_registry.invoke_registered_tool(structure_tool, {"path": "index.html"}, runtime)
+    html_assets = tool_runtime_registry.invoke_registered_tool(assets_tool, {"path": "index.html"}, runtime)
+    css_assets = tool_runtime_registry.invoke_registered_tool(assets_tool, {"path": "style.css", "language": "css"}, runtime)
 
     assert text_result["ok"] is True
     assert text_result["result"]["matches"][0]["tag"] == "h1"
@@ -2419,7 +2548,7 @@ def test_tools_agent_prompt_mentions_phase5_page_tools(monkeypatch, tmp_path: Pa
         seen_messages.append(messages)
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "ok"}))
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
     project = create_default_project("页面分析 Agent")
     project.state.fields.append(StateField(name="tools_result", type="str"))
     for builtin_id, name in [
@@ -2484,7 +2613,7 @@ def test_phase6_tools_agent_records_recommended_next_tools_for_truncated_html(mo
             return FakeResponse(json.dumps({"tool_calls": [{"tool": "read_file", "args": {"path": "index.html"}}], "final_answer": ""}))
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "已读取截断结果并给出下一步建议"}))
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
     project = create_default_project("Phase6 Tools 策略")
     project.state.fields.extend([StateField(name="tools_result", type="str"), StateField(name="tools_result_tool_calls", type="list")])
     builtin_ids = [
@@ -2558,9 +2687,9 @@ def test_phase6_tool_error_classification(tmp_path: Path):
         "maxHttpBytes": 1024,
     }
 
-    missing_arg = preview._invoke_registered_tool(read_file_tool, {}, runtime)
-    outside_result = preview._invoke_registered_tool(read_file_tool, {"path": str(outside)}, runtime)
-    network_result = preview._invoke_registered_tool(web_search_tool, {"query": "test"}, runtime)
+    missing_arg = tool_runtime_registry.invoke_registered_tool(read_file_tool, {}, runtime)
+    outside_result = tool_runtime_registry.invoke_registered_tool(read_file_tool, {"path": str(outside)}, runtime)
+    network_result = tool_runtime_registry.invoke_registered_tool(web_search_tool, {"query": "test"}, runtime)
 
     assert missing_arg["ok"] is False
     assert missing_arg["errorType"] == "tool_args"
@@ -2582,8 +2711,8 @@ def test_task_splitter_parses_markdown_json_and_fallback():
         "task_plan": '```json\n{"tasks":[{"title":"入口","goal":"分析入口","targetFiles":["frontend/src/App.tsx"]},{"goal":"分析后端"},{"goal":"超出限制"}]}\n```',
     }
 
-    delta, detail = preview._execute_live_task_splitter(splitter, state)
-    fallback_delta, _detail = preview._execute_live_task_splitter(splitter, {"messages": "兜底问题", "task_plan": "not json"})
+    delta, detail = task_splitter_node.execute_live_task_splitter(splitter, state)
+    fallback_delta, _detail = task_splitter_node.execute_live_task_splitter(splitter, {"messages": "兜底问题", "task_plan": "not json"})
 
     assert "2 个 Worker 任务" in detail
     assert [item["id"] for item in delta["worker_tasks"]] == ["task_1", "task_2"]
@@ -2608,7 +2737,7 @@ def test_parallel_tools_stream_runs_explicit_worker_nodes(monkeypatch, tmp_path:
         )
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": payload}, ensure_ascii=False))
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
     project = create_default_project("并行代码阅读")
     project.state.fields.extend([StateField(name="worker_tasks", type="list"), StateField(name="worker_results", type="list"), StateField(name="final_answer", type="str")])
     project.tools.append(
@@ -2719,13 +2848,13 @@ def test_builtin_extract_code_symbol_supports_structured_languages_and_errors(tm
         "maxHttpBytes": 1024,
     }
 
-    method = preview._invoke_registered_tool(tool_config, {"path": "module.py", "symbol": "Service.run", "kind": "method", "include_context": True}, runtime)
-    ambiguous = preview._invoke_registered_tool(tool_config, {"path": "module.py", "symbol": "run", "kind": "method"}, runtime)
-    component = preview._invoke_registered_tool(tool_config, {"path": "app.tsx", "symbol": "Card", "kind": "component"}, runtime)
-    html = preview._invoke_registered_tool(tool_config, {"path": "index.html", "symbol": "#hero", "kind": "html"}, runtime)
-    css = preview._invoke_registered_tool(tool_config, {"path": "style.css", "symbol": ".card", "kind": "css"}, runtime)
-    missing = preview._invoke_registered_tool(tool_config, {"path": "module.py", "symbol": "missing"}, runtime)
-    outside_result = preview._invoke_registered_tool(tool_config, {"path": str(outside), "symbol": "secret"}, runtime)
+    method = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "module.py", "symbol": "Service.run", "kind": "method", "include_context": True}, runtime)
+    ambiguous = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "module.py", "symbol": "run", "kind": "method"}, runtime)
+    component = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "app.tsx", "symbol": "Card", "kind": "component"}, runtime)
+    html = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "index.html", "symbol": "#hero", "kind": "html"}, runtime)
+    css = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "style.css", "symbol": ".card", "kind": "css"}, runtime)
+    missing = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "module.py", "symbol": "missing"}, runtime)
+    outside_result = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": str(outside), "symbol": "secret"}, runtime)
 
     assert method["ok"] is True
     assert method["result"]["symbol"] == "Service.run"
@@ -2771,8 +2900,8 @@ def test_builtin_chunk_code_semantic_returns_symbol_chunks(tmp_path: Path):
         "maxHttpBytes": 1024,
     }
 
-    result = preview._invoke_registered_tool(tool_config, {"path": "app.tsx", "max_chars": 80}, runtime)
-    with_content = preview._invoke_registered_tool(tool_config, {"path": "app.tsx", "include_content": True, "max_chunks": 1}, runtime)
+    result = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "app.tsx", "max_chars": 80}, runtime)
+    with_content = tool_runtime_registry.invoke_registered_tool(tool_config, {"path": "app.tsx", "include_content": True, "max_chunks": 1}, runtime)
 
     assert result["ok"] is True
     names = {item["name"] for item in result["result"]["chunks"]}
@@ -2879,17 +3008,17 @@ $brand: red;
         "schemaJson": json.dumps({"type": "object", "x-graphic": {"kind": "builtin_tool", "builtinId": "chunk_code_semantic"}}),
     }
 
-    vue_symbols = preview._invoke_registered_tool(list_tool, {"path": "Component.vue"}, runtime)
-    svelte_symbols = preview._invoke_registered_tool(list_tool, {"path": "Widget.svelte"}, runtime)
-    scss_symbols = preview._invoke_registered_tool(list_tool, {"path": "style.scss"}, runtime)
-    less_symbols = preview._invoke_registered_tool(list_tool, {"path": "theme.less"}, runtime)
-    markdown_symbols = preview._invoke_registered_tool(list_tool, {"path": "README.md"}, runtime)
-    json_symbols = preview._invoke_registered_tool(list_tool, {"path": "package.json"}, runtime)
-    yaml_symbols = preview._invoke_registered_tool(list_tool, {"path": "config.yaml"}, runtime)
-    vue_style = preview._invoke_registered_tool(extract_tool, {"path": "Component.vue", "symbol": ".card__title", "kind": "style_rule"}, runtime)
-    markdown_usage = preview._invoke_registered_tool(extract_tool, {"path": "README.md", "symbol": "Usage", "kind": "heading"}, runtime)
-    json_scripts = preview._invoke_registered_tool(extract_tool, {"path": "package.json", "symbol": "scripts", "kind": "data_key"}, runtime)
-    vue_chunks = preview._invoke_registered_tool(chunk_tool, {"path": "Component.vue", "max_chunks": 10}, runtime)
+    vue_symbols = tool_runtime_registry.invoke_registered_tool(list_tool, {"path": "Component.vue"}, runtime)
+    svelte_symbols = tool_runtime_registry.invoke_registered_tool(list_tool, {"path": "Widget.svelte"}, runtime)
+    scss_symbols = tool_runtime_registry.invoke_registered_tool(list_tool, {"path": "style.scss"}, runtime)
+    less_symbols = tool_runtime_registry.invoke_registered_tool(list_tool, {"path": "theme.less"}, runtime)
+    markdown_symbols = tool_runtime_registry.invoke_registered_tool(list_tool, {"path": "README.md"}, runtime)
+    json_symbols = tool_runtime_registry.invoke_registered_tool(list_tool, {"path": "package.json"}, runtime)
+    yaml_symbols = tool_runtime_registry.invoke_registered_tool(list_tool, {"path": "config.yaml"}, runtime)
+    vue_style = tool_runtime_registry.invoke_registered_tool(extract_tool, {"path": "Component.vue", "symbol": ".card__title", "kind": "style_rule"}, runtime)
+    markdown_usage = tool_runtime_registry.invoke_registered_tool(extract_tool, {"path": "README.md", "symbol": "Usage", "kind": "heading"}, runtime)
+    json_scripts = tool_runtime_registry.invoke_registered_tool(extract_tool, {"path": "package.json", "symbol": "scripts", "kind": "data_key"}, runtime)
+    vue_chunks = tool_runtime_registry.invoke_registered_tool(chunk_tool, {"path": "Component.vue", "max_chunks": 10}, runtime)
 
     assert vue_symbols["ok"] is True
     vue_names = {item["name"] for item in vue_symbols["result"]["symbols"]}
@@ -2933,7 +3062,7 @@ def test_tools_agent_can_chunk_then_extract_code_symbol(monkeypatch, tmp_path: P
             return FakeResponse(json.dumps({"tool_calls": [{"tool": "extract_code_symbol", "args": {"path": "app.py", "symbol": "target", "kind": "function"}}], "final_answer": ""}))
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "target 返回 ok"}))
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
     project = create_default_project("结构化代码 Agent")
     project.state.fields.extend([StateField(name="tools_result", type="str"), StateField(name="tools_result_tool_calls", type="list")])
     for builtin_id, name in [("chunk_code_semantic", "chunk_code_semantic"), ("extract_code_symbol", "extract_code_symbol")]:
@@ -2991,7 +3120,7 @@ def test_builtin_web_search_normalizes_duckduckgo_response(monkeypatch):
         seen["kwargs"] = kwargs
         return FakeHttpResponse()
 
-    monkeypatch.setattr(preview.httpx, "get", fake_get)
+    monkeypatch.setattr(engine.httpx, "get", fake_get)
     tool_config = {
         "id": "builtin_web_search",
         "name": "web_search",
@@ -3006,7 +3135,7 @@ def test_builtin_web_search_normalizes_duckduckgo_response(monkeypatch):
         "maxHttpBytes": 1024,
     }
 
-    result = preview._invoke_registered_tool(tool_config, {"query": "life", "max_results": 1, "mode": "auto"}, runtime)
+    result = tool_runtime_registry.invoke_registered_tool(tool_config, {"query": "life", "max_results": 1, "mode": "auto"}, runtime)
 
     assert result["ok"] is True
     assert "format=json" in seen["url"]
@@ -3065,7 +3194,7 @@ def test_builtin_web_search_falls_back_to_duckduckgo_html_serp(monkeypatch):
             return FakeInstantAnswerResponse()
         return FakeSerpResponse()
 
-    monkeypatch.setattr(preview.httpx, "get", fake_get)
+    monkeypatch.setattr(engine.httpx, "get", fake_get)
     tool_config = {
         "id": "builtin_web_search",
         "name": "web_search",
@@ -3080,7 +3209,7 @@ def test_builtin_web_search_falls_back_to_duckduckgo_html_serp(monkeypatch):
         "maxHttpBytes": 1024,
     }
 
-    result = preview._invoke_registered_tool(tool_config, {"query": "claude 5 fable", "max_results": 2, "mode": "auto"}, runtime)
+    result = tool_runtime_registry.invoke_registered_tool(tool_config, {"query": "claude 5 fable", "max_results": 2, "mode": "auto"}, runtime)
 
     assert result["ok"] is True
     assert any("api.duckduckgo.com" in url for url in seen_urls)
@@ -3119,7 +3248,7 @@ def test_builtin_web_search_defaults_to_duckduckgo_html_serp(monkeypatch):
             raise AssertionError("default web_search should not call Instant Answer")
         return FakeSerpResponse()
 
-    monkeypatch.setattr(preview.httpx, "get", fake_get)
+    monkeypatch.setattr(engine.httpx, "get", fake_get)
     tool_config = {
         "id": "builtin_web_search",
         "name": "web_search",
@@ -3134,7 +3263,7 @@ def test_builtin_web_search_defaults_to_duckduckgo_html_serp(monkeypatch):
         "maxHttpBytes": 1024,
     }
 
-    result = preview._invoke_registered_tool(tool_config, {"query": "claude 5 fable", "max_results": 2}, runtime)
+    result = tool_runtime_registry.invoke_registered_tool(tool_config, {"query": "claude 5 fable", "max_results": 2}, runtime)
 
     assert result["ok"] is True
     assert seen_urls and all("html.duckduckgo.com" in url for url in seen_urls)
@@ -3182,8 +3311,8 @@ def test_tools_agent_uses_node_openai_compatible_config_and_nested_registry(monk
             return FakeResponse(json.dumps({"tool_calls": [{"tool": "web_search", "args": {"query": "claude 5 fable", "mode": "auto"}}], "final_answer": ""}))
         return FakeResponse(json.dumps({"tool_calls": [], "final_answer": "搜索完成"}))
 
-    monkeypatch.setattr(preview.httpx, "get", fake_get)
-    monkeypatch.setattr(preview, "_call_openai_compatible", fake_call_openai_compatible)
+    monkeypatch.setattr(engine.httpx, "get", fake_get)
+    monkeypatch.setattr(engine, "_call_openai_compatible", fake_call_openai_compatible)
 
     project = create_default_project("嵌套工具注册表")
     project.state.fields.extend([StateField(name="tools_result", type="str"), StateField(name="tools_result_tool_calls", type="list")])
@@ -3231,7 +3360,7 @@ def test_tools_agent_uses_node_openai_compatible_config_and_nested_registry(monk
 
 
 def test_model_config_normalization_ignores_invalid_list_value():
-    assert preview._normalize_model_config([]) is None
+    assert model_runtime.normalize_model_config([]) is None
 
 
 def test_openai_compatible_base_url_can_run_without_configured_key(monkeypatch):
@@ -3247,7 +3376,7 @@ def test_openai_compatible_base_url_can_run_without_configured_key(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "langchain_openai", SimpleNamespace(ChatOpenAI=FakeChatOpenAI))
 
-    response = preview._call_chat_model(
+    response = model_runtime.call_chat_model(
         "mimo",
         "mimo-v2.5-pro",
         [("user", "你好")],
@@ -3271,7 +3400,7 @@ def test_openai_compatible_ignores_invalid_api_key_env(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "langchain_openai", SimpleNamespace(ChatOpenAI=FakeChatOpenAI))
 
-    response = preview._call_chat_model(
+    response = model_runtime.call_chat_model(
         "mimo",
         "mimo-v2.5-pro",
         [("user", "你好")],
@@ -3338,7 +3467,7 @@ def test_live_preview_runs_chroma_retriever_with_sidecar_embedding(monkeypatch, 
         return [0.1] * 1024
 
     monkeypatch.setitem(sys.modules, "chromadb", SimpleNamespace(PersistentClient=FakeClient))
-    monkeypatch.setattr(preview, "_call_openai_compatible_embedding", fake_embedding)
+    monkeypatch.setattr(engine, "_call_openai_compatible_embedding", fake_embedding)
 
     project = create_default_project("Chroma 知识库")
     project.state.fields.append(StateField(name="retrieved_context", type="str"))
@@ -3399,7 +3528,7 @@ def test_live_preview_runs_customer_support_order_and_refund_paths(monkeypatch):
             return FakeResponse("您的订单 A20260614001 已发货，顺丰单号 SF1234567890，预计明天 18:00 前送达。")
         return FakeResponse("退款申请已收到，已根据审批结果继续处理。")
 
-    monkeypatch.setattr(preview, "_call_chat_model", fake_call_chat_model)
+    monkeypatch.setattr(engine, "_call_chat_model", fake_call_chat_model)
     project = _customer_support_project()
 
     trace, state = preview.run_project_preview(

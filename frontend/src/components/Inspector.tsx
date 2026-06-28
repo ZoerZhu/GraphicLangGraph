@@ -36,7 +36,10 @@ export function Inspector() {
     () => project?.nodes.find((item) => item.id === selectedNodeId) ?? null,
     [project?.nodes, selectedNodeId],
   );
-  const availableTools = useMemo(() => mergeById([...(project?.tools ?? []), ...workspaceTools]), [project?.tools, workspaceTools]);
+  const availableTools = useMemo(
+    () => mergeById([...(project?.tools ?? []), ...workspaceTools, ...toolSnapshotsFromNodes(project?.nodes ?? [])]),
+    [project?.tools, project?.nodes, workspaceTools],
+  );
   const availableSkills = useMemo(
     () => mergeById([...(project?.skills ?? []), ...workspaceSkills]).filter((skill) => skill.enabled),
     [project?.skills, workspaceSkills],
@@ -69,7 +72,7 @@ export function Inspector() {
   );
   const availableRagKnowledgeBases = useMemo(() => workspaceRagKnowledgeBases.filter((item) => item.enabled), [workspaceRagKnowledgeBases]);
   const detectedStateFields = useMemo(() => detectStateFieldsFromNodes(project?.nodes ?? []), [project?.nodes]);
-  const resourceInspector = Boolean(node && ["agent", "tool", "parallel_tools", "mcp_node"].includes(node.type));
+  const resourceInspector = Boolean(node && ["agent", "tool", "parallel_tools", "mcp_node", "agent_ref"].includes(node.type));
 
   function updateToolSelection(targetNode: NodeIR, directIds: string[], groupIds: string[]) {
     const availableIds = new Set(availableTools.map((tool) => tool.id));
@@ -116,17 +119,21 @@ export function Inspector() {
     });
   }
 
-  function updateAgentSelection(targetNode: NodeIR, directIds: string[]) {
+  function updateAgentRefSelection(targetNode: NodeIR, directIds: string[]) {
     const availableIds = new Set(availableAgentResources.map((agent) => agent.id));
     const ids = uniqueStrings(directIds).filter((id) => availableIds.has(id));
-    const selectedAgents = availableAgentResources.filter((agent) => ids.includes(agent.id));
-    if (project) {
-      updateImportedAgents(mergeAgentResources(project.importedAgents ?? [], selectedAgents));
+    const selectedId = ids[ids.length - 1] ?? "";
+    const selectedAgent = availableAgentResources.find((agent) => agent.id === selectedId);
+    if (project && selectedAgent) {
+      updateImportedAgents(mergeAgentResources(project.importedAgents ?? [], [selectedAgent]));
     }
     updateNodeConfig(targetNode.id, {
-      agentIdsJson: JSON.stringify(ids),
-      agentRegistryJson: JSON.stringify(selectedAgents),
+      agentId: selectedAgent?.id ?? "",
+      agentProjectId: selectedAgent?.projectId || selectedAgent?.id || "",
+      agentName: selectedAgent?.name ?? "未选择 Agent",
+      agentRegistryJson: selectedAgent ? JSON.stringify([selectedAgent]) : "[]",
     });
+    updateNode(targetNode.id, { label: selectedAgent?.name ?? "Agent Ref" });
   }
 
   async function refreshMcpToolsForNode(targetNode: NodeIR) {
@@ -281,6 +288,18 @@ export function Inspector() {
           left={
             <>
               <ResourceSelectionRail
+                title="Tool 配置"
+                itemLabel="Tool"
+                groups={availableToolGroups}
+                items={availableTools}
+                selectedGroupIds={parseStringList(node.config.toolGroupIdsJson)}
+                selectedDirectIds={directResourceIdsFromConfig(node.config, "toolIdsJson", "toolDirectIdsJson", "toolGroupIdsJson", availableToolGroups)}
+                emptyText="还没有可用 Tool。请先在管理页 Tools 中导入、安装或新增。"
+                onChange={(directIds, groupIds) => updateToolSelection(node, directIds, groupIds)}
+                renderItemMeta={(tool) => `${tool.source || "tool"} · ${tool.description || "未填写描述"}`}
+                renderItemExtra={(tool) => <ToolUsageTags tool={tool} />}
+              />
+              <ResourceSelectionRail
                 title="Skill 配置"
                 itemLabel="Skill"
                 groups={availableSkillGroups}
@@ -302,17 +321,6 @@ export function Inspector() {
                 onChange={(directIds) => updateMcpSelection(node, directIds)}
                 renderItemMeta={(server) => `${server.transport || "stdio"} · ${server.command || server.url || "未配置入口"}`}
               />
-              <ResourceSelectionRail
-                title="Agent 接入"
-                itemLabel="Agent"
-                groups={[]}
-                items={availableAgentResources}
-                selectedGroupIds={[]}
-                selectedDirectIds={parseStringList(node.config.agentIdsJson)}
-                emptyText="还没有可接入 Agent。请先在 Agent 管理中创建 Agent。"
-                onChange={(directIds) => updateAgentSelection(node, directIds)}
-                renderItemMeta={(agent) => `${agent.role || "sub_agent"} · ${agent.projectId || "未绑定项目"}`}
-              />
             </>
           }
         >
@@ -331,11 +339,11 @@ export function Inspector() {
               onChange={(event) => updateNodeConfig(node.id, { systemPrompt: event.target.value })}
             />
           </Field>
-          <Field label="可用工具 ID（逗号分隔）">
+          <Field label="兼容工具备注（可选）">
             <input
               value={String(node.config.tools ?? "")}
               onChange={(event) => updateNodeConfig(node.id, { tools: event.target.value })}
-              placeholder="get_order,refund_policy"
+              placeholder="旧版备注字段；真实工具请在左侧 Tool 配置中选择"
             />
           </Field>
           <Field label="用户输入">
@@ -1387,27 +1395,21 @@ export function Inspector() {
         );
       })()}
       {node.type === "agent_ref" && (
-        <>
-          <Field label="绑定 Agent">
-            <select
-              value={String(node.config.agentProjectId ?? "")}
-              onChange={(event) => {
-                const agent = availableAgents.find((item) => item.id === event.target.value);
-                updateNodeConfig(node.id, {
-                  agentProjectId: agent?.id ?? "",
-                  agentName: agent?.name ?? "未选择 Agent",
-                });
-                if (agent) updateNode(node.id, { label: agent.name });
-              }}
-            >
-              <option value="">未选择</option>
-              {availableAgents.map((agent) => (
-                <option key={agent.id} value={agent.id}>
-                  {agent.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+        <InspectorSplit
+          left={
+            <ResourceSelectionRail
+              title="Agent 配置"
+              itemLabel="Agent"
+              groups={[]}
+              items={availableAgentResources}
+              selectedGroupIds={[]}
+              selectedDirectIds={agentRefSelectedResourceIds(node.config, availableAgentResources)}
+              emptyText="还没有可引用 Agent。请先在 Agent 管理中创建 Agent。"
+              onChange={(directIds) => updateAgentRefSelection(node, directIds)}
+              renderItemMeta={(agent) => `${agent.role || "sub_agent"} · ${agent.projectId || "未绑定项目"}`}
+            />
+          }
+        >
           <Field label="通信协议">
             <select value={String(node.config.protocol ?? "handoff")} onChange={(event) => updateNodeConfig(node.id, { protocol: event.target.value })}>
               <option value="handoff">handoff</option>
@@ -1429,7 +1431,7 @@ export function Inspector() {
               onChange={(event) => updateNodeConfig(node.id, { outputField: event.target.value })}
             />
           </Field>
-        </>
+        </InspectorSplit>
       )}
       {isRuntimePolicyNode(node.type) ? <RuntimePolicyFields node={node} updateNodeConfig={updateNodeConfig} /> : null}
       </div>
@@ -1524,7 +1526,7 @@ function DataShapingPreviewControls({
     <section className="config-preview">
       <div className="config-table__head">
         <span>数据预览</span>
-        <span className="history-record__actions">
+        <span className="config-table__actions">
           <button type="button" onClick={onRefresh}>
             <RefreshCw size={14} />
             刷新字段
@@ -1589,6 +1591,20 @@ function PathDatalist({ id, paths }: { id: string; paths: DataShapingPath[] }) {
         </option>
       ))}
     </datalist>
+  );
+}
+
+function toolSnapshotsFromNodes(nodes: NodeIR[]): ToolConfig[] {
+  return nodes.flatMap((node) =>
+    parseObjectList(node.config.toolRegistryJson)
+      .map((tool) => ({
+        id: String(tool.id || tool.name || "").trim(),
+        name: String(tool.name || tool.id || "").trim(),
+        description: String(tool.description || ""),
+        source: String(tool.source || "builtin"),
+        schemaJson: String(tool.schemaJson || "{}"),
+      }))
+      .filter((tool) => tool.id && tool.name),
   );
 }
 
@@ -1743,7 +1759,7 @@ function ReducersEditor({
     <div className="config-table">
       <div className="config-table__head">
         <span>Merge Reducers</span>
-        <span className="history-record__actions">
+        <span className="config-table__actions">
           {onRefresh ? (
             <button type="button" onClick={onRefresh}>
               <RefreshCw size={14} />
@@ -2787,6 +2803,13 @@ function mergeAgentResources(importedAgents: ImportedAgentConfig[], globalAgents
     }
   }
   return Array.from(byProjectId.values()).concat(Array.from(byId.values()).filter((agent) => !agent.projectId));
+}
+
+function agentRefSelectedResourceIds(config: Record<string, unknown>, agents: ImportedAgentConfig[]) {
+  const directId = String(config.agentId ?? "").trim();
+  const projectId = String(config.agentProjectId ?? "").trim();
+  const selected = agents.find((agent) => (directId && agent.id === directId) || (projectId && agent.projectId === projectId) || (projectId && agent.id === projectId));
+  return selected ? [selected.id] : [];
 }
 
 function buildModelConfigOptions(configs: ModelConfig[]): ModelConfigOption[] {

@@ -96,6 +96,8 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         systemPrompt: "你是一个可靠的业务 Agent，请基于上下文完成任务。",
         userPrompt: "",
         tools: "",
+        toolIdsJson: "[]",
+        toolRegistryJson: "[]",
         skillIdsJson: "[]",
         agentIdsJson: "[]",
         agentRegistryJson: "[]",

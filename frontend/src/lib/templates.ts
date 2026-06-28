@@ -110,6 +110,51 @@ export const EXA_WEBSEARCH_MCP_SERVER: MCPServerConfig = {
   description: "Exa remote MCP web search server",
 };
 
+const TASK_PLAN_SCHEMA_FIELDS_JSON = JSON.stringify(
+  [
+    { name: "tasks", type: "array", required: true, description: "任务数组" },
+  ],
+  null,
+  2,
+);
+
+const FLOW_CONTROL_WORKER_TOOL_IDS = [
+  "builtin_list_directory",
+  "builtin_search_code",
+  "builtin_read_file_chunk",
+  "builtin_read_file",
+  "builtin_list_code_symbols",
+  "builtin_run_whitelisted_command",
+];
+
+const FLOW_CONTROL_WORKER_TOOLS = [
+  builtinToolSnapshot("builtin_list_directory", "list_directory", "列出运行环境允许目录内的文件和文件夹。"),
+  builtinToolSnapshot("builtin_search_code", "search_code", "在运行环境允许目录内按关键词或正则搜索代码文本。"),
+  builtinToolSnapshot("builtin_read_file_chunk", "read_file_chunk", "按行号或字符 offset 分片读取文本文件。"),
+  builtinToolSnapshot("builtin_read_file", "read_file", "读取运行环境允许目录内的文本文件。"),
+  builtinToolSnapshot("builtin_list_code_symbols", "list_code_symbols", "列出代码文件中的函数、类、方法、组件等符号。"),
+  builtinToolSnapshot("builtin_run_whitelisted_command", "run_whitelisted_command", "运行运行环境命令白名单允许的验证命令。"),
+];
+
+const FLOW_CONTROL_WORKER_SYSTEM_PROMPT = [
+  "你是真实项目验收 Worker，只处理 state.current_item 指定的一个子任务。",
+  "必须至少调用一次可用工具读取、搜索、分析项目或运行白名单验证命令，不能只复述任务。",
+  "从 state.messages 中识别项目路径；如果没有明确路径，使用 . 作为根目录。",
+  "优先使用 list_directory 了解目录，再用 search_code/read_file_chunk/list_code_symbols 定位证据。",
+  "验收 Workflow 节点时优先搜索精确代码锚点：NodeType.MERGE、_execute_merge_node、reducersJson、DIRECT_REPLY、_execute_live_task_splitter、json_extractor、data-shaping。",
+  "如果普通关键词没有命中，必须换用精确锚点继续搜索；不能仅凭第一次搜索失败就判定未实现。",
+  "结论必须区分工作流 runtime/codegen 的 Merge 节点与 workspace 配置导入里的同名 merge helper。",
+  "只有需要验证构建或测试时才调用 run_whitelisted_command，命令必须属于运行环境白名单。",
+  "最终回答用中文，包含：检查项、已执行工具、关键证据、结论、风险或后续建议。",
+].join("\n");
+
+const FLOW_CONTROL_WORKER_USER_PROMPT = [
+  "原始验收目标：{{ state.messages }}",
+  "当前任务索引：{{ state.current_index }}",
+  "当前任务 JSON：{{ state.current_item }}",
+  "请真实完成当前任务并返回可被 Merge 聚合的简洁验收结果。",
+].join("\n");
+
 export const PROJECT_TEMPLATES: ProjectTemplate[] = [
   {
     id: "knowledge_qa",
@@ -391,7 +436,7 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
         inputText: "{{ state.messages }}",
         instruction: "把用户目标拆成 2-6 个可并行执行的子任务。每个任务至少提供 title 或 goal；如涉及代码，补充 targetFiles 和 suggestedTools。",
         schemaPreset: "task_plan_v1",
-        schemaFieldsJson: "[]",
+        schemaFieldsJson: TASK_PLAN_SCHEMA_FIELDS_JSON,
         repairEnabled: true,
         repairInstruction: "修复为 {\"tasks\":[...]}，每个任务至少包含 title 或 goal。",
         outputField: "task_plan",
@@ -452,7 +497,7 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
     requiresModel: true,
     requiresNetwork: false,
     expectedOutputFields: ["task_plan", "task_plan_validation", "worker_tasks", "merged_results", "final_answer"],
-    expectedTraceTypes: ["json_extractor", "json_validator", "task_splitter", "for_each", "merge", "direct_reply"],
+    expectedTraceTypes: ["json_extractor", "json_validator", "task_splitter", "for_each", "agent", "merge", "direct_reply"],
     sampleInput: {
       messages: "请把这次验收拆成三个任务：检查数据输入、处理每个任务、汇总结果。",
     },
@@ -477,7 +522,7 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
         inputText: "{{ state.messages }}",
         instruction: "把用户目标拆成 2-6 个顺序可处理的子任务。每个任务至少提供 title 或 goal；如涉及代码，补充 targetFiles 和 suggestedTools。",
         schemaPreset: "task_plan_v1",
-        schemaFieldsJson: "[]",
+        schemaFieldsJson: TASK_PLAN_SCHEMA_FIELDS_JSON,
         repairEnabled: true,
         repairInstruction: "修复为 {\"tasks\":[...]}，每个任务至少包含 title 或 goal。",
         outputField: "task_plan",
@@ -491,7 +536,7 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
         outputField: "task_plan",
         validationField: "task_plan_validation",
         schemaPreset: "task_plan_v1",
-        schemaFieldsJson: "[]",
+        schemaFieldsJson: TASK_PLAN_SCHEMA_FIELDS_JSON,
         repairEnabled: false,
       }, [{ id: "in", type: "control", label: "输入" }], [
         { id: "valid", type: "condition", label: "valid" },
@@ -517,15 +562,22 @@ export const PROJECT_TEMPLATES: ProjectTemplate[] = [
         { id: "item", type: "control", label: "item" },
         { id: "error", type: "control", label: "error" },
       ]),
-      node("worker_placeholder_fc", "template", "Worker Placeholder", 1400, 220, {
-        inputMappingsJson: JSON.stringify([{ name: "task", sourceType: "state", source: "current_item", valueType: "auto" }], null, 2),
-        template: "任务 {{ state.current_index }} 已处理：{{ state.current_item }}",
-        outputType: "text",
+      node("worker_placeholder_fc", "agent", "真实 Agent Worker", 1400, 220, {
+        provider: "openai",
+        model: "gpt-4.1-mini",
+        systemPrompt: FLOW_CONTROL_WORKER_SYSTEM_PROMPT,
+        userPrompt: FLOW_CONTROL_WORKER_USER_PROMPT,
+        toolIdsJson: JSON.stringify(FLOW_CONTROL_WORKER_TOOL_IDS),
+        toolRegistryJson: JSON.stringify(FLOW_CONTROL_WORKER_TOOLS, null, 2),
+        maxIterations: 8,
         outputField: "item_result",
         retryPolicyJson: JSON.stringify({ enabled: true, maxRetries: 1, backoffMs: 100, retryOnErrorTypes: [] }, null, 2),
         errorPolicy: "route_error",
         nodeTimeoutSec: 0,
-      }),
+      }, [{ id: "in", type: "control", label: "输入" }], [
+        { id: "out", type: "control", label: "输出" },
+        { id: "error", type: "control", label: "error" },
+      ]),
       node("item_error_handler_fc", "error_handler", "单项错误处理", 1400, 420, {
         errorField: "last_error",
         template: "任务 {{ state.current_index }} 处理失败：{{ state.last_error }}",
@@ -819,4 +871,14 @@ function edge(
   label?: string,
 ): EdgeIR {
   return { id, source, sourceHandle, target, targetHandle: "in", kind, label };
+}
+
+function builtinToolSnapshot(id: string, name: string, description: string) {
+  return {
+    id,
+    name,
+    description,
+    source: "builtin",
+    schemaJson: "{}",
+  };
 }

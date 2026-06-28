@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { Bot, ChevronDown, ChevronRight, Database, PanelLeftClose, PanelLeftOpen, Plug, Server } from "lucide-react";
 import { NODE_CATALOG } from "../lib/nodeCatalog";
 import { useProjectStore } from "../store/projectStore";
-import type { NodeType, RagKnowledgeBaseConfig, SkillConfig } from "../types";
+import type { ImportedAgentConfig, NodeType, ProjectListItem, RagKnowledgeBaseConfig, SkillConfig } from "../types";
 
 interface DragPayload {
   type: NodeType;
@@ -41,6 +41,10 @@ export function NodePalette() {
   const availableAgents = useMemo(
     () => projects.filter((item) => item.kind === "agent" && item.id !== project?.project.id),
     [project?.project.id, projects],
+  );
+  const availableAgentResources = useMemo(
+    () => mergeAgentResources(project?.importedAgents ?? [], availableAgents),
+    [availableAgents, project?.importedAgents],
   );
 
   function toggleGroup(key: GroupKey) {
@@ -299,25 +303,27 @@ export function NodePalette() {
         {project?.project.kind === "agents" && (
           <>
             <PaletteGroup
-              title="Agent Ref"
-              description="展开选择历史 Agent 作为通信节点"
+              title="历史 Agent"
+              description="展开选择已完成 Agent 作为节点"
               icon={<Bot size={18} />}
-              count={availableAgents.length}
+              count={availableAgentResources.length}
               open={openGroups.agents}
               onClick={() => toggleGroup("agents")}
             />
             {openGroups.agents && (
               <ConfiguredList
                 emptyText="还没有可引用的单 Agent。先在管理页 Agent 视图创建。"
-                items={availableAgents}
+                items={availableAgentResources}
                 render={(agent) => {
                   const key = `agent_${agent.id}`;
                   const payload: DragPayload = {
                     type: "agent_ref",
                     label: agent.name,
                     configPatch: {
-                      agentProjectId: agent.id,
+                      agentId: agent.id,
+                      agentProjectId: agent.projectId || agent.id,
                       agentName: agent.name,
+                      agentRegistryJson: JSON.stringify([agent]),
                       protocol: "handoff",
                     },
                   };
@@ -340,7 +346,7 @@ export function NodePalette() {
                       </span>
                       <span>
                         <strong>{agent.name}</strong>
-                        <small>{agent.nodeCount} 节点 · {agent.edgeCount} 连线</small>
+                        <small>{agent.role || "sub_agent"} · {agent.projectId || "未绑定项目"}</small>
                       </span>
                     </PaletteButton>
                   );
@@ -449,6 +455,41 @@ function mergeById<T extends { id: string }>(items: T[]): T[] {
     map.set(item.id, item);
   }
   return Array.from(map.values());
+}
+
+function mergeAgentResources(importedAgents: ImportedAgentConfig[], globalAgents: ProjectListItem[]): ImportedAgentConfig[] {
+  const byProjectId = new Map<string, ImportedAgentConfig>();
+  const byId = new Map<string, ImportedAgentConfig>();
+
+  function add(agent: ImportedAgentConfig) {
+    const projectId = String(agent.projectId ?? "").trim();
+    const id = String(agent.id ?? "").trim();
+    if (projectId && byProjectId.has(projectId)) return;
+    if (!projectId && id && byId.has(id)) return;
+    const normalized: ImportedAgentConfig = {
+      id: id || projectId,
+      name: agent.name || "导入的 Agent",
+      projectId,
+      role: agent.role || "sub_agent",
+      description: agent.description || "",
+    };
+    if (projectId) byProjectId.set(projectId, normalized);
+    if (normalized.id) byId.set(normalized.id, normalized);
+  }
+
+  for (const agent of importedAgents) {
+    add(agent);
+  }
+  for (const item of globalAgents) {
+    add({
+      id: item.id,
+      name: item.name,
+      projectId: item.id,
+      role: "sub_agent",
+      description: item.description || `${item.nodeCount} 节点 · ${item.edgeCount} 连线`,
+    });
+  }
+  return Array.from(byProjectId.values()).concat(Array.from(byId.values()).filter((agent) => !agent.projectId));
 }
 
 function toFieldName(value: string) {

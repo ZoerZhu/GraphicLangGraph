@@ -71,7 +71,7 @@ export function AgentNode({ id, data, selected }: { id: string; data: AgentNodeD
   const selectNode = useProjectStore((state) => state.selectNode);
   const runActive = useProjectStore((state) => state.runActive);
   const summary = withRuntimePolicySummary(nodeSummary(data.nodeType, data.config), data.nodeType, data.config);
-  const selectedTools = data.nodeType === "tool" || data.nodeType === "parallel_tools" ? selectedToolNames(data.config) : [];
+  const selectedTools = ["agent", "tool", "parallel_tools"].includes(data.nodeType) ? selectedToolNames(data.config) : [];
   const runtime = data.runtime ?? null;
   const [runtimeOpen, setRuntimeOpen] = useState(false);
   const hasRuntimeOutput = Boolean(runtime && Object.keys(runtime.outputDelta).length);
@@ -295,7 +295,7 @@ function nodeSummary(type: NodeType, config: Record<string, unknown>) {
     case "agent":
       return [
         { label: "模型", value: text(config.model, "gpt-4.1-mini") },
-        { label: "工具", value: text(config.tools, "未绑定") },
+        { label: "工具", value: selectedToolNames(config).length ? `${selectedToolNames(config).length} 个` : text(config.tools, "未绑定") },
         { label: "Skills", value: skillSummary(config.skillIdsJson) },
       ];
     case "tool":
