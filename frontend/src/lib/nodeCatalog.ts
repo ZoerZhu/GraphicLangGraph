@@ -278,6 +278,7 @@ export function defaultConfig(type: NodeType): Record<string, unknown> {
         method: "GET",
         url: "https://api.example.com/items/{{ state.item_id }}",
         body: "",
+        headersJson: "{}",
         authSecret: "",
         mockEnabled: false,
         mockResponseJson: "{\n  \"status\": \"ok\"\n}",

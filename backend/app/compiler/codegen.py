@@ -3543,13 +3543,14 @@ def _node_function(node: NodeIR, project: ProjectIR) -> str:
         url = json.dumps(str(node.config.get("url", "")))
         body = json.dumps(str(node.config.get("body", "")))
         auth_secret = json.dumps(str(node.config.get("authSecret", "")))
+        headers_json = json.dumps(str(node.config.get("headersJson", "") or ""))
         mock_enabled = bool(node.config.get("mockEnabled", False))
         mock_response = json.dumps(str(node.config.get("mockResponseJson", "")))
         output_field = py_name(str(node.config.get("outputField", f"{function_name}_response")))
         return f'''def {function_name}(state: AgentState) -> dict[str, Any]:
     if {mock_enabled!r} or {mock_response}.strip():
         return {{"{output_field}": _render_json_template({mock_response}, state)}}
-    headers = {{}}
+    headers = _render_http_headers({headers_json}, state)
     token_key = {auth_secret}
     if token_key:
         headers["Authorization"] = f"Bearer {{env(token_key)}}"
@@ -5341,6 +5342,22 @@ def _render_json_template(template: str, state: AgentState) -> Any:
         return json.loads(rendered)
     except ValueError:
         return rendered
+
+
+def _render_http_headers(headers_json: str, state: AgentState) -> dict[str, str]:
+    text = str(headers_json or "").strip()
+    if not text:
+        return {}
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("HTTP Headers JSON must be an object.")
+    headers: dict[str, str] = {}
+    for key, value in parsed.items():
+        name = str(key).strip()
+        rendered = render_template(str(value), state).strip()
+        if name and rendered:
+            headers[name] = rendered
+    return headers
 '''
 
 

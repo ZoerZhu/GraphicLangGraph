@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -22,7 +23,7 @@ def execute_http_node(node: NodeIR, state: dict[str, Any]):
     url = render_template(str(config.get("url", "")), state).strip()
     if not url:
         raise RuntimeError("HTTP 节点缺少 URL。")
-    headers: dict[str, str] = {}
+    headers = render_headers(config.get("headersJson"), state)
     auth_secret = str(config.get("authSecret", "")).strip()
     if auth_secret:
         token = os.getenv(auth_secret, "").strip()
@@ -43,6 +44,25 @@ def execute_http_node(node: NodeIR, state: dict[str, Any]):
     except ValueError:
         value = response.text
     return {output_field: value}, f"真实 HTTP {method} {url}，写入 state.{output_field}"
+
+
+def render_headers(value: Any, state: dict[str, Any]) -> dict[str, str]:
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"HTTP Headers JSON 格式错误：{exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("HTTP Headers JSON 必须是 JSON object。")
+    headers: dict[str, str] = {}
+    for key, raw in parsed.items():
+        name = str(key).strip()
+        rendered = render_template(str(raw), state).strip()
+        if name and rendered:
+            headers[name] = rendered
+    return headers
 
 
 def execute_live(node: NodeIR, state: dict[str, Any], ctx: ExecutionContext):

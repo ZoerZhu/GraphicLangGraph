@@ -662,6 +662,10 @@ button.icon-only {
   overflow: visible;
 }
 
+.connection-overlay.is-runtime {
+  z-index: 9;
+}
+
 .connection-overlay__path {
   fill: none;
   stroke: #0a0a0a;
@@ -677,8 +681,48 @@ button.icon-only {
   filter: none;
 }
 
+.connection-overlay__path.is-runtime-idle,
+.connection-overlay__path.is-runtime-queued {
+  stroke: rgba(10, 10, 10, 0.18);
+  stroke-width: 1.7;
+  filter: none;
+}
+
+.connection-overlay__path.is-runtime-running {
+  stroke: #0a0a0a;
+  stroke-width: 2.6;
+  stroke-dasharray: 8 5;
+  filter: drop-shadow(0 6px 12px rgba(0, 0, 0, 0.18));
+  animation: runtime-edge-dash 720ms linear infinite;
+}
+
+.connection-overlay__path.is-runtime-ok {
+  stroke: #18a957;
+  stroke-width: 2.8;
+  filter: drop-shadow(0 6px 12px rgba(24, 169, 87, 0.18));
+}
+
+.connection-overlay__path.is-runtime-error {
+  stroke: #dc2626;
+  stroke-width: 2.8;
+  filter: drop-shadow(0 6px 12px rgba(220, 38, 38, 0.18));
+}
+
+.connection-overlay__path.is-runtime-skipped {
+  stroke: rgba(10, 10, 10, 0.28);
+  stroke-width: 1.7;
+  stroke-dasharray: 4 6;
+  filter: none;
+}
+
 #connection-arrow path {
   fill: #0a0a0a;
+}
+
+@keyframes runtime-edge-dash {
+  to {
+    stroke-dashoffset: -13;
+  }
 }
 
 .agent-node-frame {

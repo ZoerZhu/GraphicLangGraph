@@ -11,7 +11,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toReactFlowEdges, toReactFlowNodes, useProjectStore } from "../store/projectStore";
-import type { EdgeIR, NodeType, ProjectIR } from "../types";
+import type { EdgeIR, NodeRuntimeState, NodeRuntimeStatus, NodeType, ProjectIR } from "../types";
 import { AgentNode } from "./AgentNode";
 import { FloatingPanel } from "./FloatingPanel";
 
@@ -35,6 +35,7 @@ const MINI_LAYER_COLORS = [
   "rgba(102, 93, 118, 0.54)",
   "rgba(88, 112, 116, 0.54)",
 ];
+const EMPTY_RUNTIME_NODES: Record<string, NodeRuntimeState> = {};
 
 export function Canvas() {
   return (
@@ -73,6 +74,20 @@ function CanvasInner() {
     });
   }, [setCanvasCenter, viewport.x, viewport.y, viewport.zoom]);
 
+  const activeRuntimeNodes = runActive ? runtimeNodes : EMPTY_RUNTIME_NODES;
+  const nodes = useMemo(
+    () =>
+      project
+        ? toReactFlowNodes(project, activeRuntimeNodes).map((node) => ({
+            ...node,
+            selected: node.id === selectedNodeId,
+          }))
+        : [],
+    [activeRuntimeNodes, project, selectedNodeId],
+  );
+  const edges = useMemo(() => (project ? toReactFlowEdges(project, activeRuntimeNodes) : []), [activeRuntimeNodes, project]);
+  const overlayEdges = useMemo(() => (project ? toConnectionOverlayEdges(project, activeRuntimeNodes) : []), [activeRuntimeNodes, project]);
+
   const handleDrop = useCallback(
     (event: React.DragEvent) => {
       event.preventDefault();
@@ -89,11 +104,6 @@ function CanvasInner() {
     return <main className="canvas-shell">正在连接后端...</main>;
   }
 
-  const nodes = toReactFlowNodes(project, runActive ? runtimeNodes : {}).map((node) => ({
-    ...node,
-    selected: node.id === selectedNodeId,
-  }));
-
   return (
     <main
       className="canvas-shell"
@@ -103,7 +113,7 @@ function CanvasInner() {
     >
       <ReactFlow
         nodes={nodes}
-        edges={toReactFlowEdges(project, runActive ? runtimeNodes : {})}
+        edges={edges}
         nodeTypes={nodeTypes}
         onNodesChange={runActive ? undefined : onNodesChange}
         onEdgesChange={runActive ? undefined : onEdgesChange}
@@ -138,7 +148,7 @@ function CanvasInner() {
         <Background gap={18} size={1} color="#d8d8dc" />
         {miniMapOpen ? <CanvasMiniMap project={project} selectedNodeId={selectedNodeId} /> : null}
       </ReactFlow>
-      {!runActive ? <ConnectionOverlay edges={project.edges} /> : null}
+      <ConnectionOverlay edges={overlayEdges} runtimeNodes={activeRuntimeNodes} runtimeActive={runActive} />
     </main>
   );
 }
@@ -443,13 +453,24 @@ function renderMiniMapIcon(
 interface OverlayLine {
   id: string;
   kind: EdgeIR["kind"];
+  runtimeStatus: OverlayRuntimeStatus;
   x1: number;
   y1: number;
   x2: number;
   y2: number;
 }
 
-function ConnectionOverlay({ edges }: { edges: EdgeIR[] }) {
+type OverlayRuntimeStatus = NodeRuntimeStatus | "idle";
+
+function ConnectionOverlay({
+  edges,
+  runtimeNodes,
+  runtimeActive,
+}: {
+  edges: EdgeIR[];
+  runtimeNodes: Record<string, NodeRuntimeState>;
+  runtimeActive: boolean;
+}) {
   const [lines, setLines] = useState<OverlayLine[]>([]);
 
   useEffect(() => {
@@ -472,6 +493,7 @@ function ConnectionOverlay({ edges }: { edges: EdgeIR[] }) {
           return {
             id: edge.id,
             kind: edge.kind,
+            runtimeStatus: runtimeActive ? edgeRuntimeStatus(edge, runtimeNodes) : "idle",
             x1: source.x - canvasRect.left,
             y1: source.y - canvasRect.top,
             x2: target.x - canvasRect.left,
@@ -491,10 +513,10 @@ function ConnectionOverlay({ edges }: { edges: EdgeIR[] }) {
       window.clearInterval(interval);
       window.removeEventListener("resize", updateLines);
     };
-  }, [edges]);
+  }, [edges, runtimeActive, runtimeNodes]);
 
   return (
-    <svg className="connection-overlay" aria-hidden="true">
+    <svg className={`connection-overlay ${runtimeActive ? "is-runtime" : ""}`} aria-hidden="true">
       <defs>
         <marker id="connection-arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
           <path d="M0,0 L0,6 L9,3 z" />
@@ -503,13 +525,59 @@ function ConnectionOverlay({ edges }: { edges: EdgeIR[] }) {
       {lines.map((line) => (
         <path
           key={line.id}
-          className={`connection-overlay__path ${line.kind === "worker" ? "is-worker-edge" : ""}`}
+          className={`connection-overlay__path ${line.kind === "worker" ? "is-worker-edge" : ""} ${runtimeActive ? `is-runtime-${line.runtimeStatus}` : ""}`}
           d={smoothPath(line.x1, line.y1, line.x2, line.y2)}
           markerEnd="url(#connection-arrow)"
         />
       ))}
     </svg>
   );
+}
+
+function toConnectionOverlayEdges(project: ProjectIR, runtimeNodes: Record<string, NodeRuntimeState>): EdgeIR[] {
+  const edges = [...project.edges];
+  const nextTargets = new Map<string, EdgeIR>();
+  for (const edge of project.edges) {
+    if (!nextTargets.has(edge.source)) nextTargets.set(edge.source, edge);
+  }
+  for (const [id, runtime] of Object.entries(runtimeNodes)) {
+    if (!runtime.virtual || !runtime.parentNodeId) continue;
+    edges.push({
+      id: `${runtime.parentNodeId}->${id}`,
+      source: runtime.parentNodeId,
+      sourceHandle: null,
+      target: id,
+      targetHandle: null,
+      kind: "worker",
+      label: null,
+    });
+    const targetEdge = nextTargets.get(runtime.parentNodeId);
+    if (targetEdge) {
+      edges.push({
+        id: `${id}->${targetEdge.target}`,
+        source: id,
+        sourceHandle: null,
+        target: targetEdge.target,
+        targetHandle: targetEdge.targetHandle ?? null,
+        kind: "worker",
+        label: null,
+      });
+    }
+  }
+  return edges;
+}
+
+function edgeRuntimeStatus(edge: EdgeIR, runtimeNodes: Record<string, NodeRuntimeState>): OverlayRuntimeStatus {
+  const source = runtimeNodes[edge.source];
+  const target = runtimeNodes[edge.target];
+  const sourceVisited = Boolean(source && source.status !== "queued" && source.status !== "idle");
+  if (!sourceVisited) return target?.status === "running" ? "running" : "idle";
+  if (target?.status === "running" || target?.status === "ok" || target?.status === "error" || target?.status === "skipped") {
+    return target.status;
+  }
+  if (source?.status === "ok" && target?.status === "queued") return "queued";
+  if (source?.status === "skipped") return "skipped";
+  return target?.status ?? source?.status ?? "idle";
 }
 
 function findPoint(nodeId: string, direction: "source" | "target", handleId?: string | null) {

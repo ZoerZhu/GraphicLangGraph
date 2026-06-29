@@ -1129,6 +1129,15 @@ export function Inspector() {
               placeholder="ORDER_API_TOKEN"
             />
           </Field>
+          <Field label="Headers JSON">
+            <textarea
+              className="code-area"
+              rows={4}
+              value={String(node.config.headersJson ?? "{}")}
+              onChange={(event) => updateNodeConfig(node.id, { headersJson: event.target.value })}
+              placeholder={'{ "Authorization": "Bearer {{ state.login_result.data.token }}" }'}
+            />
+          </Field>
           <Field label="预览 Mock 响应">
             <label className="checkbox-row">
               <input
